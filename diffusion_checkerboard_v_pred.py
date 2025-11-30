@@ -281,7 +281,6 @@ def run_experiment():
                     v_norms = torch.norm(layer.rn_rope.orthogonal.vs, dim=1)
                     print(f"Layer {i} reflection norms: {v_norms.cpu().numpy()}")
                     print(f"  Active (>0.5): {(v_norms > 0.5).sum().item()}/{len(v_norms)}")
-                    print()
             
     print("Sampling with V-Prediction...")
     model.eval()

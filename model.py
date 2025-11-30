@@ -39,6 +39,32 @@ class HouseholderOrthogonal(nn.Module):
         Q = self.get_matrix()
         return x @ Q.t() if inverse else x @ Q
 
+class FourierScaleDecoder(nn.Module):
+    """
+    Decodes the 'Scale' (Magnitude) directly from the Physics (Fourier Features).
+    This implements the 'Adaptive Layer Norm' behavior at the output.
+    
+    scale = exp(MLP(fourier_features))
+    """
+    def __init__(self, fourier_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(fourier_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+        # Initialize to output 0, so exp(0) = 1.0 (Unit Scale start)
+        with torch.no_grad():
+            self.net[-1].weight.zero_()
+            self.net[-1].bias.zero_()
+
+    def forward(self, fourier_features):
+        # fourier_features: [B, F_Dim] -> scale: [B, Out_Dim]
+        log_scale = self.net(fourier_features)
+        return torch.exp(log_scale)
+
+
 class SpatialBuffer(nn.Module):
     def __init__(self, grid_size=8, head_dim=64, device='cuda'):
         super().__init__()
@@ -112,13 +138,13 @@ class GatedAttentionBlock(nn.Module):
         self.head_dim = dim // num_heads
         self.is_global = is_global
         
-        self.norm1 = nn.RMSNorm(dim)
+        self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.rn_rope = RnRoPE(self.head_dim, spatial_buffer)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.gate_proj = nn.Linear(dim, dim)
         
-        self.norm2 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
         self.mlp_gate = nn.Linear(dim, dim * 8)
         self.mlp_out = nn.Linear(dim * 4, dim)
 
@@ -146,15 +172,20 @@ class GatedAttentionBlock(nn.Module):
         x = resid + self.mlp_out(val * F.gelu(g))
         return x
 
+
+
 class HybridGemmaDiT(nn.Module):
     def __init__(self, mode='factorized', embed_dim=256, depth=8):
         super().__init__()
         self.mode = mode
         
         self.patch_in = nn.Linear(20, embed_dim)
-        self.spin_encoder = FourierFeatures(num_bands=4)
-        self.spatial = SpatialBuffer(grid_size=8, head_dim=embed_dim//4)
         
+        # Fourier Features used for Input AND Output Scale Decoding
+        self.fourier_dim = 8 # 4 bands * 2
+        self.spin_encoder = FourierFeatures(num_bands=4)
+        
+        self.spatial = SpatialBuffer(grid_size=8, head_dim=embed_dim//4)
         self.mask_local = get_sliding_window_mask(self.spatial.dist_matrix, 2.5)
         self.mask_global = get_global_mask()
         
@@ -163,34 +194,58 @@ class HybridGemmaDiT(nn.Module):
             for i in range(depth)
         ])
         
-        self.norm_final = nn.RMSNorm(embed_dim)
+        self.norm_final = nn.RMSNorm(embed_dim, elementwise_affine=False)
+        
+        # Output Config
+        self.patch_dim = 12
+        self.output_head = nn.Linear(embed_dim, self.patch_dim)
         
         if mode == 'factorized':
-            self.head = nn.Linear(embed_dim, embed_dim + 1)
+            # Factorized Mode: Output = Direction * Scale
+            # Scale is synthesized directly from Fourier features
+            self.scale_decoder = FourierScaleDecoder(
+                fourier_dim=self.fourier_dim,
+                hidden_dim=embed_dim,
+                output_dim=self.patch_dim
+            )
+            # Passthrough Lambda head (Scalar prediction)
+            self.lambda_head = nn.Linear(embed_dim, 1)
         else:
-            self.head = nn.Linear(embed_dim, embed_dim)
-            
-        self.patch_out = nn.Linear(embed_dim, 12)
+            self.scale_decoder = None
+            self.lambda_head = None
 
     def forward(self, z_t, logsnr):
         B = z_t.shape[0]
         patches = z_t.unfold(2, 2, 2).unfold(3, 2, 2).permute(0, 2, 3, 1, 4, 5).reshape(B, 64, 12)
-        spins = self.spin_encoder(logsnr).unsqueeze(1).expand(-1, 64, -1)
         
-        x = self.patch_in(torch.cat([patches, spins], dim=-1))
+        # 1. Encode Physics (Spins)
+        spins = self.spin_encoder(logsnr) # [B, 8]
+        spins_expanded = spins.unsqueeze(1).expand(-1, 64, -1)
         
+        # 2. Input Embedding
+        x = self.patch_in(torch.cat([patches, spins_expanded], dim=-1))
+        
+        # 3. Transformer
         for layer in self.layers:
             mask = self.mask_global if layer.is_global else self.mask_local
             x = layer(x, mask)
             
         x = self.norm_final(x)
-        out = self.head(x)
+        
+        # 4. Decode
+        # Predict Direction (Normalized Pattern)
+        z_pred = self.output_head(x)
+        l_pred = None
         
         if self.mode == 'factorized':
-            z_pred = self.patch_out(out[:, :, :-1])
-            l_pred = out[:, :, -1].mean(dim=1)
-        else:
-            z_pred = self.patch_out(out)
-            l_pred = None
+            # Decode Scale from Physics (Fourier Features)
+            scale = self.scale_decoder(spins) # [B, 12]
+            scale = scale.unsqueeze(1) # Broadcast over tokens [B, 1, 12]
+            
+            # Apply Scale (Modulation)
+            z_pred = z_pred * scale
+            
+            # Predict Lambda (Passthrough)
+            l_pred = self.lambda_head(x.mean(dim=1)).squeeze(-1)
             
         return z_pred.view(B, 8, 8, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, 3, 16, 16), l_pred
