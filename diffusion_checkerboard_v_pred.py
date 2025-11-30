@@ -221,21 +221,22 @@ def run_experiment():
     # Separate Householder learning rate
     householder_params = [p for n,p in model.named_parameters() if 'orthogonal.vs' in n]
     other_params = [p for n,p in model.named_parameters() if 'orthogonal.vs' not in n]
-    opt = torch.optim.AdamW([
-        {'params': other_params, 'lr': 5e-4, 'weight_decay': 0.1},
-        {'params': householder_params, 'lr': 0.1, 'weight_decay': 0.0}  # HIGH LR, no decay
-    ])
+    # Option B: Don't schedule Householder
+    opt_main = torch.optim.AdamW(other_params, lr=5e-4, weight_decay=0.1)
+    opt_house = torch.optim.AdamW(householder_params, lr=0.1, weight_decay=0.0)
     # Learning rate schedule with warmup + decay
     from torch.optim.lr_scheduler import OneCycleLR
-    scheduler = OneCycleLR(opt, max_lr=1e-3, total_steps=1000, 
+    scheduler_main = OneCycleLR(opt_main, max_lr=1e-3, total_steps=10001, 
                         pct_start=0.1, div_factor=10, final_div_factor=100)
-
+    scheduler_house = OneCycleLR(opt_house, max_lr=1e-1, total_steps=10001, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
         
     BATCH_SIZE = 1024
     print(f"Training Hybrid Gemma (V-Prediction) | Batch Size: {BATCH_SIZE}...")
     
-    for i in range(1001):
-        opt.zero_grad()
+    for i in range(10001):
+        opt_main.zero_grad()
+        opt_house.zero_grad()
         
         x0 = generate_rotated_checkerboards(BATCH_SIZE, device)
         t = torch.rand(BATCH_SIZE, device=device).clamp(0.001, 0.999)
@@ -255,7 +256,10 @@ def run_experiment():
         loss = F.mse_loss(v_pred, v_true)
         
         loss.backward()
-        opt.step()
+        opt_main.step()
+        opt_house.step()
+        scheduler_main.step()
+        scheduler_house.step()
         
         if i % 100 == 0:
             print(f"Step {i}: Loss {loss.item():.5f}")
@@ -263,7 +267,8 @@ def run_experiment():
             house_grad_norms = [p.grad.norm().item() for n,p in model.named_parameters() 
                                 if 'orthogonal.vs' in n]
             print(f"Householder gradient norms: {house_grad_norms}")
-            print(f"Current LRs: {[group['lr'] for group in opt.param_groups]}")
+            #print(f"Current LRs: {[group['lr'] for group in opt.param_groups]}")
+            #two opts this time
             with torch.no_grad():
                 for i, layer in enumerate(model.layers):
                     Q = layer.rn_rope.orthogonal.get_matrix()
