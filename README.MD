@@ -1,0 +1,22 @@
+
+## Setup and Installation
+
+This project uses `uv` for fast and reliable dependency management.
+
+1.  **Install `uv`**:
+    If you don't have `uv` installed, follow the official instructions. For most systems:
+    ```bash
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+
+2.  **Create a Virtual Environment**:
+    From the project's root directory, create and activate a virtual environment:
+    ```bash
+    # Create the virtual environment in a .venv folder
+    uv venv --seed
+
+    # Activate it (on Linux/macOS)
+    source .venv/bin/activate
+    # On Windows (Powershell):
+    # .venv\Scripts\Activate.ps1
+    ```
