@@ -20,3 +20,6 @@ This project uses `uv` for fast and reliable dependency management.
     # On Windows (Powershell):
     # .venv\Scripts\Activate.ps1
     ```
+
+3.  **Dependency solve that thang!**:
+    `uv sync --extra cuda`
