@@ -102,12 +102,12 @@ class GatedAttentionBlock(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.is_global = is_global
-        self.norm1 = nn.RMSNorm(dim)
+        self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.rn_rope = RnRoPE(self.head_dim, spatial_buffer)
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.gate_proj = nn.Linear(dim, dim)
-        self.norm2 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
         self.mlp_gate = nn.Linear(dim, dim * 4 * 2) 
         self.mlp_out = nn.Linear(dim * 4, dim)
     def forward(self, x, block_mask):
@@ -216,10 +216,21 @@ def run_experiment():
     device = torch.device('cuda')
     
     # Init V-Prediction Model
-    model = HybridGemmaDiT('v_pred', depth=8).to(device)
+    model = HybridGemmaDiT('v_pred', depth=4).to(device)
     model = torch.compile(model)
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-4)
-    
+    # Separate Householder learning rate
+    householder_params = [p for n,p in model.named_parameters() if 'orthogonal.vs' in n]
+    other_params = [p for n,p in model.named_parameters() if 'orthogonal.vs' not in n]
+    opt = torch.optim.AdamW([
+        {'params': other_params, 'lr': 5e-4, 'weight_decay': 0.1},
+        {'params': householder_params, 'lr': 0.1, 'weight_decay': 0.0}  # HIGH LR, no decay
+    ])
+    # Learning rate schedule with warmup + decay
+    from torch.optim.lr_scheduler import OneCycleLR
+    scheduler = OneCycleLR(opt, max_lr=1e-3, total_steps=1000, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
+
+        
     BATCH_SIZE = 1024
     print(f"Training Hybrid Gemma (V-Prediction) | Batch Size: {BATCH_SIZE}...")
     
@@ -248,6 +259,24 @@ def run_experiment():
         
         if i % 100 == 0:
             print(f"Step {i}: Loss {loss.item():.5f}")
+            # Add after loss.backward():
+            house_grad_norms = [p.grad.norm().item() for n,p in model.named_parameters() 
+                                if 'orthogonal.vs' in n]
+            print(f"Householder gradient norms: {house_grad_norms}")
+            print(f"Current LRs: {[group['lr'] for group in opt.param_groups]}")
+            with torch.no_grad():
+                for i, layer in enumerate(model.layers):
+                    Q = layer.rn_rope.orthogonal.get_matrix()
+                    
+                    # Singular values tell you dimensionality
+                    U, S, V = torch.svd(Q)
+                    print(f"Layer {i} singular values (top 10): {S[:10].cpu().numpy()}")
+                    
+                    # Reflection vector norms tell you which are active
+                    v_norms = torch.norm(layer.rn_rope.orthogonal.vs, dim=1)
+                    print(f"Layer {i} reflection norms: {v_norms.cpu().numpy()}")
+                    print(f"  Active (>0.5): {(v_norms > 0.5).sum().item()}/{len(v_norms)}")
+                    print()
             
     print("Sampling with V-Prediction...")
     model.eval()
