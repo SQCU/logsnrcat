@@ -1,44 +1,40 @@
-#dataset.py
-
 import torch
 import math
 
-class RotatedCheckerboardDataset:
-    def __init__(self, batch_size, device='cuda'):
-        self.batch_size = batch_size
+class CheckerboardIterator:
+    def __init__(self, device='cuda'):
         self.device = device
         
-        # Pre-compute grid for speed
-        linspace = torch.linspace(-8, 8, 16, device=device)
-        self.y, self.x = torch.meshgrid(linspace, linspace, indexing='ij')
-        self.x_flat = self.x.flatten().unsqueeze(0).expand(batch_size, -1)
-        self.y_flat = self.y.flatten().unsqueeze(0).expand(batch_size, -1)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        # Random Rotation
-        theta = torch.rand(self.batch_size, 1, device=self.device) * 2 * math.pi
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
+    def generate_batch(self, batch_size, resolution, num_tiles=4):
+        """
+        Args:
+            num_tiles: Number of tiles across (fixed at 4 for 4×4 checkerboard)
+        """
+        # Scale tile size with resolution to maintain constant tile count
+        tile_scale = resolution / num_tiles  # 16/4=4.0, 32/4=8.0
         
-        # Rotate Coordinates
-        x_rot = self.x_flat * cos_t + self.y_flat * sin_t
-        y_rot = -self.x_flat * sin_t + self.y_flat * cos_t
+        # Map to [-num_tiles/2, num_tiles/2] in tile-space
+        half_tiles = num_tiles / 2.0
+        linspace = torch.linspace(-half_tiles, half_tiles, resolution, device=self.device)
+        y, x = torch.meshgrid(linspace, linspace, indexing='ij')
         
-        # Hard Aliased Checkerboard Logic (Scale 4.0)
-        scale = 4.0
-        # Adding epsilon to avoid boundary flickering
-        x_idx = torch.floor(x_rot / scale + 0.01)
-        y_idx = torch.floor(y_rot / scale + 0.01)
+        x_flat = x.flatten().unsqueeze(0).expand(batch_size, -1)
+        y_flat = y.flatten().unsqueeze(0).expand(batch_size, -1)
         
-        pat = ((x_idx + y_idx) % 2).view(self.batch_size, 16, 16)
+        theta = torch.rand(batch_size, 1, device=self.device) * 2 * math.pi
+        cos_t = torch.cos(theta); sin_t = torch.sin(theta)
         
-        # Random Colors
-        c1 = torch.rand(self.batch_size, 3, 1, 1, device=self.device)
-        c2 = torch.rand(self.batch_size, 3, 1, 1, device=self.device)
+        x_rot = x_flat * cos_t + y_flat * sin_t
+        y_rot = -x_flat * sin_t + y_flat * cos_t
         
+        # Now tile_scale is in tile-space units (1.0 = one tile)
+        x_idx = torch.floor(x_rot + 0.01)
+        y_idx = torch.floor(y_rot + 0.01)
+        
+        pat = ((x_idx + y_idx) % 2).view(batch_size, resolution, resolution)
+        
+        c1 = torch.rand(batch_size, 3, 1, 1, device=self.device)
+        c2 = torch.rand(batch_size, 3, 1, 1, device=self.device)
         mask = pat.unsqueeze(1)
-        img = c1 * (1 - mask) + c2 * mask
-        return img
+        
+        return c1 * (1 - mask) + c2 * mask

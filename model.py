@@ -65,29 +65,83 @@ class FourierScaleDecoder(nn.Module):
         return torch.exp(log_scale)
 
 
-class SpatialBuffer(nn.Module):
-    def __init__(self, grid_size=8, head_dim=64, device='cuda'):
+class DynamicSpatialBuffer(nn.Module):
+    """
+    Handles RoPE and Distance Matrices for variable sized grids.
+    Caches the maximum supported resolution (e.g. 32x32 input -> 16x16 patches).
+    """
+    def __init__(self, max_grid_size=16, head_dim=64, device='cuda'):
         super().__init__()
-        self.grid_size = grid_size
-        y = torch.arange(grid_size, device=device)
-        x = torch.arange(grid_size, device=device)
+        self.max_grid_size = max_grid_size
+        
+        # 1. Precompute Max Grid
+        y = torch.arange(max_grid_size, device=device)
+        x = torch.arange(max_grid_size, device=device)
         grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
+        
+        # [MaxTokens, 2]
         self.coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
         
+        # 2. Max Distance Matrix
         d = torch.cdist(self.coords, self.coords, p=2)
         self.register_buffer('dist_matrix', d)
         
+        # 3. RoPE Frequencies
         self.dim_half = head_dim // 2
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.dim_half, 2, device=device).float() / self.dim_half))
         self.register_buffer('inv_freq', inv_freq)
 
-    def get_rope(self, B):
-        y_pos, x_pos = self.coords[:, 0], self.coords[:, 1]
+    def get_rope(self, B, grid_size):
+        """Returns RoPE cos/sin sliced to current grid size."""
+        num_tokens = grid_size * grid_size
+        
+        # We need to slice the coords corresponding to a square grid of size `grid_size`.
+        # Our coords are flattened [0,0], [0,1]... [0, 15], [1,0]...
+        # A smaller grid (e.g. 8x8) is NOT just the first 64 elements of the 16x16 flattened array.
+        # It's a subset. BUT, since RoPE is translation invariant (relative), 
+        # we can just take the first N*N coords if we assume the crop is top-left, 
+        # OR we can generate on fly. 
+        # Generating on fly is safer for correctness and fast enough.
+        
+        # fast path: if grid_size matches max, use cached flat coords
+        if grid_size == self.max_grid_size:
+            active_coords = self.coords
+        else:
+            # Re-generate coords for smaller grid to ensure contiguous layout
+            y = torch.arange(grid_size, device=self.inv_freq.device)
+            grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
+            active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
+            
+        y_pos, x_pos = active_coords[:, 0], active_coords[:, 1]
+        
         freqs_y = torch.einsum('i, j -> i j', y_pos, self.inv_freq)
         freqs_x = torch.einsum('i, j -> i j', x_pos, self.inv_freq)
         freqs = torch.cat([freqs_y, freqs_x], dim=-1)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[None], emb.sin()[None]
+
+    def get_mask(self, grid_size, radius=2.5):
+        """Generates sliding window mask for current grid size."""
+        num_tokens = grid_size * grid_size
+        
+        # Same logic: Generate coords for this specific grid size
+        if grid_size == self.max_grid_size:
+            d = self.dist_matrix
+        else:
+            y = torch.arange(grid_size, device=self.dist_matrix.device)
+            grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
+            active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
+            d = torch.cdist(active_coords, active_coords, p=2)
+            
+        valid_mask = d < radius
+        
+        # Create Block Mask
+        def mask_mod(b, h, q_idx, kv_idx):
+            q_safe = q_idx.clamp(0, num_tokens - 1)
+            k_safe = kv_idx.clamp(0, num_tokens - 1)
+            return valid_mask[q_safe, k_safe] & (q_idx < num_tokens) & (kv_idx < num_tokens)
+
+        return create_block_mask(mask_mod, B=1, H=1, Q_LEN=num_tokens, KV_LEN=num_tokens)
 
 class RnRoPE(nn.Module):
     def __init__(self, head_dim, spatial_buffer):
@@ -95,15 +149,17 @@ class RnRoPE(nn.Module):
         self.buffer = spatial_buffer
         self.orthogonal = HouseholderOrthogonal(head_dim, num_reflections=head_dim//2)
         
-    def forward(self, q, k):
+    def forward(self, q, k, grid_size):
         q = self.orthogonal(q, inverse=True)
         k = self.orthogonal(k, inverse=True)
         
         B = q.shape[0]
-        cos, sin = self.buffer.get_rope(B)
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+        cos, sin = self.buffer.get_rope(B, grid_size)
         
-        # Standard Rotary Apply
+        # Broadcast over heads
+        cos = cos.unsqueeze(1) 
+        sin = sin.unsqueeze(1)
+        
         q1, q2 = q.chunk(2, dim=-1); k1, k2 = k.chunk(2, dim=-1)
         rq = torch.cat((-q2, q1), dim=-1); rk = torch.cat((-k2, k1), dim=-1)
         q_rot = (q * cos) + (rq * sin)
@@ -124,12 +180,13 @@ def get_sliding_window_mask(dist_matrix, radius=2.5):
         return valid_mask[q_safe, k_safe] & (q_idx < Q_LEN) & (kv_idx < KV_LEN)
     return create_block_mask(mask_mod, B=1, H=1, Q_LEN=Q_LEN, KV_LEN=KV_LEN)
 
-def get_global_mask():
-    def mask_mod(b, h, q_idx, kv_idx):
-        return q_idx > -1
-    return create_block_mask(mask_mod, B=1, H=1, Q_LEN=64, KV_LEN=64)
 
+def get_global_mask(seq_len):
+    def mask_mod(b, h, q_idx, kv_idx):
+        return (q_idx < seq_len) & (kv_idx < seq_len)
+    return create_block_mask(mask_mod, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len)
 # --- Network ---
+
 
 class GatedAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads, spatial_buffer, is_global=False):
@@ -148,7 +205,7 @@ class GatedAttentionBlock(nn.Module):
         self.mlp_gate = nn.Linear(dim, dim * 8)
         self.mlp_out = nn.Linear(dim * 4, dim)
 
-    def forward(self, x, block_mask):
+    def forward(self, x, block_mask, grid_size):
         B, S, D = x.shape
         resid = x
         x = self.norm1(x)
@@ -158,7 +215,7 @@ class GatedAttentionBlock(nn.Module):
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         
-        q, k = self.rn_rope(q, k)
+        q, k = self.rn_rope(q, k, grid_size)
         
         attn = flex_attention(q, k, v, block_mask=block_mask)
         attn = attn.transpose(1, 2).contiguous().view(B, S, D)
@@ -172,22 +229,20 @@ class GatedAttentionBlock(nn.Module):
         x = resid + self.mlp_out(val * F.gelu(g))
         return x
 
-
-
 class HybridGemmaDiT(nn.Module):
     def __init__(self, mode='factorized', embed_dim=256, depth=8):
         super().__init__()
         self.mode = mode
         
         self.patch_in = nn.Linear(20, embed_dim)
-        
-        # Fourier Features used for Input AND Output Scale Decoding
-        self.fourier_dim = 8 # 4 bands * 2
+        self.fourier_dim = 8
         self.spin_encoder = FourierFeatures(num_bands=4)
         
-        self.spatial = SpatialBuffer(grid_size=8, head_dim=embed_dim//4)
-        self.mask_local = get_sliding_window_mask(self.spatial.dist_matrix, 2.5)
-        self.mask_global = get_global_mask()
+        # Max grid 16 (for 32x32 input)
+        self.spatial = DynamicSpatialBuffer(max_grid_size=16, head_dim=embed_dim//4)
+        
+        # Cache for recently used masks to avoid re-compiling every step
+        self.mask_cache = {} 
         
         self.layers = nn.ModuleList([
             GatedAttentionBlock(embed_dim, 4, self.spatial, is_global=((i+1)%4==0))
@@ -195,57 +250,55 @@ class HybridGemmaDiT(nn.Module):
         ])
         
         self.norm_final = nn.RMSNorm(embed_dim, elementwise_affine=False)
-        
-        # Output Config
         self.patch_dim = 12
         self.output_head = nn.Linear(embed_dim, self.patch_dim)
         
         if mode == 'factorized':
-            # Factorized Mode: Output = Direction * Scale
-            # Scale is synthesized directly from Fourier features
-            self.scale_decoder = FourierScaleDecoder(
-                fourier_dim=self.fourier_dim,
-                hidden_dim=embed_dim,
-                output_dim=self.patch_dim
-            )
-            # Passthrough Lambda head (Scalar prediction)
+            self.scale_decoder = FourierScaleDecoder(self.fourier_dim, embed_dim, self.patch_dim)
             self.lambda_head = nn.Linear(embed_dim, 1)
         else:
             self.scale_decoder = None
             self.lambda_head = None
 
+    def get_masks(self, grid_size):
+        if grid_size in self.mask_cache:
+            return self.mask_cache[grid_size]
+        
+        mask_local = self.spatial.get_mask(grid_size, radius=2.5)
+        mask_global = get_global_mask(grid_size * grid_size)
+        
+        self.mask_cache[grid_size] = (mask_local, mask_global)
+        return mask_local, mask_global
+
     def forward(self, z_t, logsnr):
-        B = z_t.shape[0]
-        patches = z_t.unfold(2, 2, 2).unfold(3, 2, 2).permute(0, 2, 3, 1, 4, 5).reshape(B, 64, 12)
+        B, C, H, W = z_t.shape
+        # H, W must be divisible by 2 (patch size)
+        grid_h, grid_w = H // 2, W // 2
         
-        # 1. Encode Physics (Spins)
-        spins = self.spin_encoder(logsnr) # [B, 8]
-        spins_expanded = spins.unsqueeze(1).expand(-1, 64, -1)
+        # Assume square for now as per dataset
+        grid_size = grid_h 
+        num_tokens = grid_size * grid_size
         
-        # 2. Input Embedding
+        patches = z_t.unfold(2, 2, 2).unfold(3, 2, 2).permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, 12)
+        
+        spins = self.spin_encoder(logsnr)
+        spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
+        
         x = self.patch_in(torch.cat([patches, spins_expanded], dim=-1))
         
-        # 3. Transformer
+        mask_local, mask_global = self.get_masks(grid_size)
+        
         for layer in self.layers:
-            mask = self.mask_global if layer.is_global else self.mask_local
-            x = layer(x, mask)
+            mask = mask_global if layer.is_global else mask_local
+            x = layer(x, mask, grid_size)
             
         x = self.norm_final(x)
-        
-        # 4. Decode
-        # Predict Direction (Normalized Pattern)
         z_pred = self.output_head(x)
         l_pred = None
         
         if self.mode == 'factorized':
-            # Decode Scale from Physics (Fourier Features)
-            scale = self.scale_decoder(spins) # [B, 12]
-            scale = scale.unsqueeze(1) # Broadcast over tokens [B, 1, 12]
-            
-            # Apply Scale (Modulation)
+            scale = self.scale_decoder(spins).unsqueeze(1)
             z_pred = z_pred * scale
-            
-            # Predict Lambda (Passthrough)
             l_pred = self.lambda_head(x.mean(dim=1)).squeeze(-1)
             
-        return z_pred.view(B, 8, 8, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, 3, 16, 16), l_pred
+        return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred

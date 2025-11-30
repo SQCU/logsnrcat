@@ -1,14 +1,10 @@
-#diffusion_utils.py
-
 import torch
 import math
 
 def get_schedule(t):
-    """Linear LogSNR Schedule: +20 to -20."""
     return 20.0 - 40.0 * t
 
 def get_alpha_sigma(logsnr):
-    """VP Schedule derived from LogSNR."""
     alpha = torch.sqrt(torch.sigmoid(logsnr))
     sigma = torch.sqrt(torch.sigmoid(-logsnr))
     return alpha, sigma
@@ -24,3 +20,18 @@ class FourierFeatures(torch.nn.Module):
         if x.dim() == 1: x = x.unsqueeze(-1)
         args = x * self.freqs
         return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+class BucketManager:
+    """
+    Manages alternating between different resolution buckets.
+    """
+    def __init__(self, buckets):
+        # buckets: list of (resolution, batch_size) tuples
+        # e.g. [(16, 1024), (32, 256)]
+        self.buckets = buckets
+        self.current_idx = 0
+        
+    def next_bucket(self):
+        bucket = self.buckets[self.current_idx]
+        self.current_idx = (self.current_idx + 1) % len(self.buckets)
+        return bucket

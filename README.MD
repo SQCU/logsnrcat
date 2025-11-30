@@ -23,3 +23,6 @@ This project uses `uv` for fast and reliable dependency management.
 
 3.  **Dependency solve that thang!**:
     `uv sync --extra cuda`
+
+4.  **run it!**:
+    `python bench_v_pred.py`
