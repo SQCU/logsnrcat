@@ -307,27 +307,33 @@ def run_experiment():
     torch.set_float32_matmul_precision('high')
     device = torch.device('cuda')
     
-    # Must compile for FlexAttention
+    # Init Model
+    # Depth 8 means: SWA, SWA, SWA, Global, SWA, SWA, SWA, Global
     model = HybridGemmaDiT('factorized', depth=8).to(device)
     model = torch.compile(model)
     
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4)
     
-    print("Training Hybrid Gemma (3:1 SWA/Global) with Rn-RoPE & Gated Attn...")
+    # Lowered batch size to prevent OOM
+    BATCH_SIZE = 1024
+    print(f"Training Hybrid Gemma (3:1 SWA/Global) | Batch Size: {BATCH_SIZE}...")
     
     for i in range(1001):
         opt.zero_grad()
         
-        x0 = generate_rotated_checkerboards(2048, device)
-        t = torch.rand(2048, device=device).clamp(0.001, 0.999)
+        # Updated to use BATCH_SIZE variable
+        x0 = generate_rotated_checkerboards(BATCH_SIZE, device)
+        t = torch.rand(BATCH_SIZE, device=device).clamp(0.001, 0.999)
         logsnr = get_schedule(t)
         alpha, sigma = get_alpha_sigma(logsnr)
         
         eps = torch.randn_like(x0)
         z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
         
+        # Forward
         raw, l_pred = model(z_t, logsnr)
         
+        # Factorized Loss
         sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1, 1, 1, 1)
         loss = F.mse_loss(raw * sigma_p, eps)
         
@@ -337,6 +343,7 @@ def run_experiment():
         if i % 100 == 0:
             print(f"Step {i}: Loss {loss.item():.5f}")
             
+    # Sample
     print("Sampling...")
     model.eval()
     with torch.no_grad():
