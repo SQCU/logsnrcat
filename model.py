@@ -180,6 +180,70 @@ class SigmoidMoE(nn.Module):
         
         return out, aux_loss
 
+class ContextualPatchEmbedder(nn.Module):
+    """
+    Implements the 'Look at the Ring' logic via Overlapping Patches.
+    
+    Standard 2x2 patch: Sees 4 pixels.
+    Contextual 4x4 patch: Sees 16 pixels (4 center + 12 neighbor ring).
+    Stride 2: Maintains the same latent grid size (16x16 -> 8x8 latents).
+    """
+    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=256, context_size=4):
+        super().__init__()
+        self.context_size = context_size
+        self.stride = 2
+        # Padding needed to maintain grid size with kernel > stride
+        # For Kernel 4, Stride 2: We need 1px padding on all sides.
+        self.padding = 1 
+        
+        patch_flat_dim = (context_size ** 2) * input_dim
+        
+        # Non-Linear Projection (SwiGLU-style)
+        self.net = nn.Sequential(
+            nn.Linear(patch_flat_dim + 8, hidden_dim), # +8 for Fourier Spins
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim)
+        )
+
+    def forward(self, x, spins):
+        # x: [B, C, H, W]
+        # Pad to handle the "Ring" context at image edges
+        x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        
+        # Unfold with Overlap
+        # Kernel=4, Stride=2
+        patches = x_pad.unfold(2, self.context_size, self.stride).unfold(3, self.context_size, self.stride)
+        # [B, C, GridH, GridW, K, K]
+        
+        B, C, GH, GW, K, _ = patches.shape
+        num_tokens = GH * GW
+        
+        # Flatten patches: [B, NumTokens, C*K*K]
+        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, -1)
+        
+        # Expand spins to match
+        spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
+        
+        # Concatenate and Project
+        out = self.net(torch.cat([patches, spins_expanded], dim=-1))
+        return out
+
+class NonLinearOutputHead(nn.Module):
+    """
+    Decodes latents back to 2x2 patches (Non-overlapping) using an MLP.
+    We don't use overlap here to keep reconstruction sharp/simple.
+    """
+    def __init__(self, embed_dim, output_dim=12): # 12 = 3ch * 2 * 2
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
 # --- Blocks ---
 
 class FourierScaleDecoder(nn.Module):
@@ -277,7 +341,16 @@ class HybridGemmaDiT(nn.Module):
     def __init__(self, mode='factorized', embed_dim=256, depth=8, ffn_type='swiglu'):
         super().__init__()
         self.mode = mode
-        self.patch_in = nn.Linear(20, embed_dim)
+        
+        # 1. UPGRADE: Contextual Embedder
+        # Input dim becomes 4*4*3 = 48 (plus 8 spins) -> 56
+        self.patch_in = ContextualPatchEmbedder(
+            input_dim=3, 
+            hidden_dim=embed_dim, 
+            embed_dim=embed_dim, 
+            context_size=4 # The "Ring"
+        )
+        
         self.fourier_dim = 8
         self.spin_encoder = FourierFeatures(num_bands=4)
         self.spatial = DynamicSpatialBuffer(max_grid_size=16, head_dim=embed_dim//4)
@@ -293,8 +366,10 @@ class HybridGemmaDiT(nn.Module):
         ])
         
         self.norm_final = nn.RMSNorm(embed_dim, elementwise_affine=False)
-        self.patch_dim = 12
-        self.output_head = nn.Linear(embed_dim, self.patch_dim)
+        self.patch_dim = 12 # Output is still 2x2 (3*4)
+        
+        # 2. UPGRADE: Non-Linear Output
+        self.output_head = NonLinearOutputHead(embed_dim, self.patch_dim)
         
         if mode == 'factorized':
             self.scale_decoder = FourierScaleDecoder(self.fourier_dim, embed_dim, self.patch_dim)
@@ -314,13 +389,11 @@ class HybridGemmaDiT(nn.Module):
         B, C, H, W = z_t.shape
         grid_h, grid_w = H // 2, W // 2
         grid_size = grid_h 
-        num_tokens = grid_size * grid_size
         
-        patches = z_t.unfold(2, 2, 2).unfold(3, 2, 2).permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, 12)
         spins = self.spin_encoder(logsnr)
-        spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
         
-        x = self.patch_in(torch.cat([patches, spins_expanded], dim=-1))
+        # Contextual Embedding handles the unfold/cat internally
+        x = self.patch_in(z_t, spins)
         
         mask_local, mask_global = self.get_masks(grid_size)
         

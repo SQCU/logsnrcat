@@ -115,9 +115,9 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None, is_mo
     
     # Buckets: (Resolution, BatchSize)
     # for depth:4 a3w8
-    #buckets = [(16, 256), (32, 64)]
+    buckets = [(16, 256), (32, 64)]
     # for depth:8 a3w8
-    buckets = [(16, 128), (32, 32)]
+    #buckets = [(16, 128), (32, 32)]
     manager = BucketManager(buckets)
     
     history = []
