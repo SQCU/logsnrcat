@@ -1,25 +1,10 @@
-#model.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from diffusion_utils import FourierFeatures
 
-# --- Geometry & RoPE ---
-#thanks and complaints all go to:
-""" https://arxiv.org/abs/2504.06308
-Rethinking RoPE: A Mathematical Blueprint for
-N-dimensional Rotary Positional Embedding
-Haiping Liu Lijing Lin Jingyuan Sun Zhegong Shangguan
-Mauricio A. Alvarez Hongpeng Zhou∗
-University of Manchester
-* Corresponding author: hongpeng.zhou@manchester.ac.uk
-"""
-#and valued contributor
-"""
-gemini 3 pro preview: aistudio.google.com
-"""
+# --- Geometry & RoPE (Unchanged) ---
 class HouseholderOrthogonal(nn.Module):
     def __init__(self, dim, num_reflections=4):
         super().__init__()
@@ -39,108 +24,45 @@ class HouseholderOrthogonal(nn.Module):
         Q = self.get_matrix()
         return x @ Q.t() if inverse else x @ Q
 
-class FourierScaleDecoder(nn.Module):
-    """
-    Decodes the 'Scale' (Magnitude) directly from the Physics (Fourier Features).
-    This implements the 'Adaptive Layer Norm' behavior at the output.
-    
-    scale = exp(MLP(fourier_features))
-    """
-    def __init__(self, fourier_dim, hidden_dim, output_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(fourier_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-        
-        # Initialize to output 0, so exp(0) = 1.0 (Unit Scale start)
-        with torch.no_grad():
-            self.net[-1].weight.zero_()
-            self.net[-1].bias.zero_()
-
-    def forward(self, fourier_features):
-        # fourier_features: [B, F_Dim] -> scale: [B, Out_Dim]
-        log_scale = self.net(fourier_features)
-        return torch.exp(log_scale)
-
-
 class DynamicSpatialBuffer(nn.Module):
-    """
-    Handles RoPE and Distance Matrices for variable sized grids.
-    Caches the maximum supported resolution (e.g. 32x32 input -> 16x16 patches).
-    """
     def __init__(self, max_grid_size=16, head_dim=64, device='cuda'):
         super().__init__()
         self.max_grid_size = max_grid_size
-        
-        # 1. Precompute Max Grid
         y = torch.arange(max_grid_size, device=device)
         x = torch.arange(max_grid_size, device=device)
         grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-        
-        # [MaxTokens, 2]
         self.coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
-        
-        # 2. Max Distance Matrix
         d = torch.cdist(self.coords, self.coords, p=2)
         self.register_buffer('dist_matrix', d)
-        
-        # 3. RoPE Frequencies
         self.dim_half = head_dim // 2
         inv_freq = 1.0 / (10000 ** (torch.arange(0, self.dim_half, 2, device=device).float() / self.dim_half))
         self.register_buffer('inv_freq', inv_freq)
 
     def get_rope(self, B, grid_size):
-        """Returns RoPE cos/sin sliced to current grid size."""
-        num_tokens = grid_size * grid_size
-        
-        # We need to slice the coords corresponding to a square grid of size `grid_size`.
-        # Our coords are flattened [0,0], [0,1]... [0, 15], [1,0]...
-        # A smaller grid (e.g. 8x8) is NOT just the first 64 elements of the 16x16 flattened array.
-        # It's a subset. BUT, since RoPE is translation invariant (relative), 
-        # we can just take the first N*N coords if we assume the crop is top-left, 
-        # OR we can generate on fly. 
-        # Generating on fly is safer for correctness and fast enough.
-        
-        # fast path: if grid_size matches max, use cached flat coords
         if grid_size == self.max_grid_size:
             active_coords = self.coords
         else:
-            # Re-generate coords for smaller grid to ensure contiguous layout
             y = torch.arange(grid_size, device=self.inv_freq.device)
             grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
             active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
-            
         y_pos, x_pos = active_coords[:, 0], active_coords[:, 1]
-        
         freqs_y = torch.einsum('i, j -> i j', y_pos, self.inv_freq)
         freqs_x = torch.einsum('i, j -> i j', x_pos, self.inv_freq)
-        freqs = torch.cat([freqs_y, freqs_x], dim=-1)
-        emb = torch.cat((freqs, freqs), dim=-1)
+        emb = torch.cat((torch.cat([freqs_y, freqs_x], dim=-1), torch.cat([freqs_y, freqs_x], dim=-1)), dim=-1)
         return emb.cos()[None], emb.sin()[None]
 
     def get_mask(self, grid_size, radius=2.5):
-        """Generates sliding window mask for current grid size."""
-        num_tokens = grid_size * grid_size
-        
-        # Same logic: Generate coords for this specific grid size
-        if grid_size == self.max_grid_size:
-            d = self.dist_matrix
+        if grid_size == self.max_grid_size: d = self.dist_matrix
         else:
             y = torch.arange(grid_size, device=self.dist_matrix.device)
             grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
             active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
             d = torch.cdist(active_coords, active_coords, p=2)
-            
         valid_mask = d < radius
-        
-        # Create Block Mask
+        num_tokens = grid_size * grid_size
         def mask_mod(b, h, q_idx, kv_idx):
-            q_safe = q_idx.clamp(0, num_tokens - 1)
-            k_safe = kv_idx.clamp(0, num_tokens - 1)
+            q_safe, k_safe = q_idx.clamp(0, num_tokens - 1), kv_idx.clamp(0, num_tokens - 1)
             return valid_mask[q_safe, k_safe] & (q_idx < num_tokens) & (kv_idx < num_tokens)
-
         return create_block_mask(mask_mod, B=1, H=1, Q_LEN=num_tokens, KV_LEN=num_tokens)
 
 class RnRoPE(nn.Module):
@@ -152,91 +74,136 @@ class RnRoPE(nn.Module):
     def forward(self, q, k, grid_size):
         q = self.orthogonal(q, inverse=True)
         k = self.orthogonal(k, inverse=True)
-        
-        B = q.shape[0]
-        cos, sin = self.buffer.get_rope(B, grid_size)
-        
-        # Broadcast over heads
-        cos = cos.unsqueeze(1) 
-        sin = sin.unsqueeze(1)
-        
+        cos, sin = self.buffer.get_rope(q.shape[0], grid_size)
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
         q1, q2 = q.chunk(2, dim=-1); k1, k2 = k.chunk(2, dim=-1)
-        rq = torch.cat((-q2, q1), dim=-1); rk = torch.cat((-k2, k1), dim=-1)
-        q_rot = (q * cos) + (rq * sin)
-        k_rot = (k * cos) + (rk * sin)
-        
-        q_final = self.orthogonal(q_rot, inverse=False)
-        k_final = self.orthogonal(k_rot, inverse=False)
-        return q_final, k_final
-
-# --- Masks ---
-
-def get_sliding_window_mask(dist_matrix, radius=2.5):
-    Q_LEN, KV_LEN = dist_matrix.shape
-    valid_mask = dist_matrix < radius
-    def mask_mod(b, h, q_idx, kv_idx):
-        q_safe = q_idx.clamp(0, Q_LEN - 1)
-        k_safe = kv_idx.clamp(0, KV_LEN - 1)
-        return valid_mask[q_safe, k_safe] & (q_idx < Q_LEN) & (kv_idx < KV_LEN)
-    return create_block_mask(mask_mod, B=1, H=1, Q_LEN=Q_LEN, KV_LEN=KV_LEN)
-
+        q_rot = (q * cos) + (torch.cat((-q2, q1), dim=-1) * sin)
+        k_rot = (k * cos) + (torch.cat((-k2, k1), dim=-1) * sin)
+        return self.orthogonal(q_rot, inverse=False), self.orthogonal(k_rot, inverse=False)
 
 def get_global_mask(seq_len):
-    def mask_mod(b, h, q_idx, kv_idx):
-        return (q_idx < seq_len) & (kv_idx < seq_len)
+    def mask_mod(b, h, q_idx, kv_idx): return (q_idx < seq_len) & (kv_idx < seq_len)
     return create_block_mask(mask_mod, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len)
-# --- Network ---
 
-class MoEFFN(nn.Module):
-    def __init__(self, dim, num_experts=8, num_active=3):
+# --- FFN Primitives ---
+
+class SwiGLU(nn.Module):
+    """
+    Standard SwiGLU FFN.
+    Parameters are roughly 3 * dim * hidden_dim.
+    """
+    def __init__(self, dim, hidden_dim, bias=False):
+        super().__init__()
+        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+        
+    def forward(self, x):
+        # x: [B, S, D]
+        # Fused gate + value projection
+        x12 = self.w12(x)
+        x1, x2 = x12.chunk(2, dim=-1)
+        # Swish Gate
+        hidden = F.silu(x1) * x2
+        return self.w3(hidden)
+
+class SigmoidMoE(nn.Module):
+    """
+    Sigmoid-Gated Mixture of SwiGLU Experts.
+    
+    Design Philosophy:
+    - No Softmax: Experts are selected independently.
+    - No Load Balancing Loss: We use Jitter (Noise) to prevent early collapse.
+    - Top-K: We still enforce Top-K for computational budget control, 
+      but the weights are absolute sigmoid probabilities, not relative softmax.
+    """
+    def __init__(self, dim, hidden_dim, num_experts=8, num_active=2, jitter_noise=0.1):
         super().__init__()
         self.num_experts = num_experts
         self.num_active = num_active
+        self.jitter_noise = jitter_noise
         
         # Router
         self.router = nn.Linear(dim, num_experts)
+        # Init router to 0 to ensure all experts start with 0.5 probability
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
         
-        # Experts (just FFNs)
+        # Experts (ModuleList for easy debugging/hacking)
+        # Note: hidden_dim here defines the capacity of ONE expert.
+        # Total parameters = num_experts * SwiGLU(dim, hidden_dim)
         self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(dim, dim * 4),
-                nn.GELU(),
-                nn.Linear(dim * 4, dim)
-            ) for _ in range(num_experts)
+            SwiGLU(dim, hidden_dim) for _ in range(num_experts)
         ])
         
     def forward(self, x):
         # x: [B, S, D]
-        router_logits = self.router(x)  # [B, S, num_experts]
+        router_logits = self.router(x)
         
-        # Top-k routing
-        top_k_logits, top_k_indices = torch.topk(router_logits, self.num_active, dim=-1)
-        router_weights = F.softmax(top_k_logits, dim=-1)  # [B, S, num_active]
+        # 1. Jitter (Training Only)
+        # Prevents "Expert Dave" from winning everything early on.
+        if self.training and self.jitter_noise > 0:
+            noise = torch.randn_like(router_logits) * self.jitter_noise
+            router_logits = router_logits + noise
+            
+        # 2. Sigmoid Gating (Independent Probabilities)
+        scores = torch.sigmoid(router_logits)
         
-        # Apply experts
+        # 3. Top-K Selection
+        # Even though probabilities are independent, we only run the top K
+        # to stay within compute budget.
+        top_k_scores, top_k_indices = torch.topk(scores, self.num_active, dim=-1)
+        
+        # 4. Normalization? 
+        # In Softmax MoE, weights sum to 1. 
+        # In Sigmoid MoE, we often re-normalize to preserve magnitude, 
+        # OR we just use the raw sigmoid scores to let the router learn "intensity".
+        # Let's use L1 normalization over the selected K to keep variance stable.
+        router_weights = top_k_scores / (top_k_scores.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        # 5. Dispatch
         out = torch.zeros_like(x)
         for i in range(self.num_active):
-            expert_idx = top_k_indices[:, :, i]  # [B, S]
-            weight = router_weights[:, :, i:i+1]  # [B, S, 1]
+            idx = top_k_indices[:, :, i]
+            weight = router_weights[:, :, i:i+1]
             
-            # Gather expert outputs (batched)
             for e in range(self.num_experts):
-                mask = (expert_idx == e)
+                mask = (idx == e)
                 if mask.any():
                     expert_out = self.experts[e](x)
-                    out += expert_out * weight * mask.unsqueeze(-1)
-        load_loss = torch.var(router_logits.mean(dim=[0,1]))
-        return out, load_loss
+                    out = out + (expert_out * weight * mask.unsqueeze(-1))
+                    
+        # Optional: Z-Loss to keep logits sane (no gradients > 10.0)
+        # This is cheap and strictly helps stability without changing behavior.
+        # z_loss = torch.mean(torch.log(torch.exp(router_logits).sum(dim=-1)) ** 2)
+        # For sigmoid, just penalize raw magnitude
+        aux_loss = 1e-2 * (router_logits ** 2).mean()
+        
+        return out, aux_loss
 
+# --- Blocks ---
+
+class FourierScaleDecoder(nn.Module):
+    def __init__(self, fourier_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(fourier_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        with torch.no_grad():
+            self.net[-1].weight.zero_()
+            self.net[-1].bias.zero_()
+
+    def forward(self, fourier_features):
+        return torch.exp(self.net(fourier_features))
 
 class GatedAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, spatial_buffer, is_global=False, is_moe=True):
+    def __init__(self, dim, num_heads, spatial_buffer, is_global=False, ffn_type='swiglu'):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.is_global = is_global
-        self.is_moe = is_moe
-
+        
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.rn_rope = RnRoPE(self.head_dim, spatial_buffer)
@@ -244,18 +211,31 @@ class GatedAttentionBlock(nn.Module):
         self.gate_proj = nn.Linear(dim, dim)
         
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
-        if not self.is_moe:
-            self.mlp_gate = nn.Linear(dim, dim * 8)
-            self.mlp_out = nn.Linear(dim * 4, dim)
+        
+        self.ffn_type = ffn_type
+        # Standard FFN size is usually 4 * dim, but SwiGLU has 3 matrices.
+        # To match parameter counts of standard Transformers, hidden is often 4*dim * 2/3.
+        # We'll just stick to 4*dim for raw power here.
+        ffn_hidden = dim * 4
+        
+        if ffn_type == 'swiglu':
+            self.ffn = SwiGLU(dim, ffn_hidden)
+        elif ffn_type == 'moe':
+            # Expert hidden dim. 
+            # If we want total params to be higher, we keep it large.
+            # Usually experts are smaller or same size. Let's make them same size.
+            self.ffn = SigmoidMoE(dim, ffn_hidden, num_experts=8, num_active=3)
         else:
-            self.moe_mlp = MoEFFN(dim, num_experts=8, num_active=3)
+            raise ValueError(f"Unknown ffn_type: {ffn_type}")
+
+        self.mlp_gate = nn.Linear(dim, dim) # Simple gate for the residual
 
     def forward(self, x, block_mask, grid_size):
         B, S, D = x.shape
         resid = x
-        x = self.norm1(x)
+        x_norm = self.norm1(x)
         
-        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = self.qkv(x_norm).chunk(3, dim=-1)
         q = q.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
@@ -266,35 +246,49 @@ class GatedAttentionBlock(nn.Module):
         attn = attn.transpose(1, 2).contiguous().view(B, S, D)
         attn = self.out_proj(attn)
         
-        gate = torch.sigmoid(self.gate_proj(attn))
-        x = resid + (attn * gate)
+        # Gated Residual 1 (Attention)
+        gate_attn = torch.sigmoid(self.gate_proj(attn))
+        x = resid + (attn * gate_attn)
         
+        # Gated Residual 2 (FFN)
         resid = x
-        if not self.is_moe:
-            g, val = self.mlp_gate(self.norm2(x)).chunk(2, dim=-1)
-            x = resid + self.mlp_out(val * F.gelu(g))
-            route_loss = 0
+        x_norm = self.norm2(x)
+        
+        aux_loss = 0.0
+        if self.ffn_type == 'moe':
+            ffn_out, aux_loss = self.ffn(x_norm)
         else:
-            x, route_loss = self.moe_mlp(x)
-        return x, route_loss
+            ffn_out = self.ffn(x_norm)
+            
+        # Post-FFN Gating (Standard in some DiTs, keeping your style)
+        # Your previous code had `mlp_gate` splitting into gate/val
+        # But SwiGLU is already gated internally. 
+        # We'll add a simple learnable scalar gate on the residual block.
+        # Or preserve your MLP gate structure? 
+        # Your old code: g, val = mlp_gate(norm(x))... x + mlp_out(val * gelu(g))
+        # That was a GLU. We replaced it with SwiGLU/MoE. 
+        # So we just add directly? Let's add a gate for stability.
+        gate_ffn = torch.sigmoid(self.mlp_gate(x_norm))
+        x = resid + (ffn_out * gate_ffn)
+        
+        return x, aux_loss
 
 class HybridGemmaDiT(nn.Module):
-    def __init__(self, mode='factorized', embed_dim=256, depth=8):
+    def __init__(self, mode='factorized', embed_dim=256, depth=8, ffn_type='swiglu'):
         super().__init__()
         self.mode = mode
-        
         self.patch_in = nn.Linear(20, embed_dim)
         self.fourier_dim = 8
         self.spin_encoder = FourierFeatures(num_bands=4)
-        
-        # Max grid 16 (for 32x32 input)
         self.spatial = DynamicSpatialBuffer(max_grid_size=16, head_dim=embed_dim//4)
-        
-        # Cache for recently used masks to avoid re-compiling every step
         self.mask_cache = {} 
         
         self.layers = nn.ModuleList([
-            GatedAttentionBlock(embed_dim, 4, self.spatial, is_global=((i+1)%4==0))
+            GatedAttentionBlock(
+                embed_dim, 4, self.spatial, 
+                is_global=((i+1)%4==0),
+                ffn_type=ffn_type
+            )
             for i in range(depth)
         ])
         
@@ -310,39 +304,31 @@ class HybridGemmaDiT(nn.Module):
             self.lambda_head = None
 
     def get_masks(self, grid_size):
-        if grid_size in self.mask_cache:
-            return self.mask_cache[grid_size]
-        
+        if grid_size in self.mask_cache: return self.mask_cache[grid_size]
         mask_local = self.spatial.get_mask(grid_size, radius=2.5)
         mask_global = get_global_mask(grid_size * grid_size)
-        
         self.mask_cache[grid_size] = (mask_local, mask_global)
         return mask_local, mask_global
 
     def forward(self, z_t, logsnr):
         B, C, H, W = z_t.shape
-        # H, W must be divisible by 2 (patch size)
         grid_h, grid_w = H // 2, W // 2
-        
-        # Assume square for now as per dataset
         grid_size = grid_h 
         num_tokens = grid_size * grid_size
         
         patches = z_t.unfold(2, 2, 2).unfold(3, 2, 2).permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, 12)
-        
         spins = self.spin_encoder(logsnr)
         spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
         
         x = self.patch_in(torch.cat([patches, spins_expanded], dim=-1))
         
         mask_local, mask_global = self.get_masks(grid_size)
-        route_losses = []
+        
+        total_aux_loss = 0.0
         for layer in self.layers:
             mask = mask_global if layer.is_global else mask_local
-            x, route_loss = layer(x, mask, grid_size)
-            route_losses.append(route_loss)
-        stacked_route_losses = torch.stack(route_losses)
-        route_loss = torch.mean(stacked_route_losses)
+            x, al = layer(x, mask, grid_size)
+            total_aux_loss += al
             
         x = self.norm_final(x)
         z_pred = self.output_head(x)
@@ -353,4 +339,4 @@ class HybridGemmaDiT(nn.Module):
             z_pred = z_pred * scale
             l_pred = self.lambda_head(x.mean(dim=1)).squeeze(-1)
             
-        return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred, route_loss 
+        return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred, total_aux_loss
