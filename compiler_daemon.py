@@ -13,7 +13,7 @@ import time
 CACHE_DIR = os.path.expanduser("~/.torch_cas_cache")
 INFO_FILE = os.path.join(CACHE_DIR, "daemon_connection.json")
 # Use all cores. Since these are processes, they truly run in parallel.
-WORKER_COUNT = max(1, multiprocessing.cpu_count())
+WORKER_COUNT = max(1, int((multiprocessing.cpu_count()/2) -1))  #confusion between thread and core in apis
 
 logging.basicConfig(
     level=logging.INFO, 

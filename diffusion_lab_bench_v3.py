@@ -1,7 +1,8 @@
 # diffusion_lab_bench_v3.py
 #literally evil monkey patch
 import inductor_cas_client
-inductor_cas_client.install_cas_client() # Auto-discovers port, might even be 54321
+# Hook the ZMQ compiler backend immediately
+inductor_cas_client.install_cas_client() 
 
 import torch
 import torch.nn as nn
@@ -11,27 +12,25 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 from typing import Literal, List, Dict
-
-    
-# --- Performance Tuning ---
-# Force Inductor to use all cores for compilation
-import torch._inductor.config
-# logic: use physical cores (usually half of logical on hyperthreaded cpus) or default to 16
 import multiprocessing
-torch._inductor.config.compile_threads = max(7, (multiprocessing.cpu_count() // 2) -1)
-#torch._inductor.config.compile_threads = 7
-# Set to your physical core count
 
-# Import internal dependencies
+# --- Configuration ---
+# Threads: The Daemon handles the heavy lifting, but we still need threads 
+# for the Inductor frontend (tracing/graphing)
+import torch._inductor.config
+torch._inductor.config.compile_threads = max(4, (multiprocessing.cpu_count() // 2) - 1)
+
 from diffusion_utils import get_schedule, get_alpha_sigma
 from model import HybridGemmaDiT, DynamicSpatialBuffer
 
-# --- Configuration ---
 RESOLUTIONS = [16, 32, 64] 
 TARGETS = ['v', 'x0', 'epsilon']
 MODES = ['naive', 'factorized']
-STEPS_PER_SWEEP = 50  # Higher resolution sweep since it runs faster now
-BATCH_SIZE = {16: 64, 32: 32, 64: 8} # Fit in VRAM
+
+# We trade granularity in T for statistical depth per T
+STEPS_PER_SWEEP = 25 
+BATCHES_PER_STEP = 8  # The "Multi-Pass" factor
+BATCH_SIZE = {16: 64, 32: 32, 64: 8} 
 
 def get_target_tensor(target_name, x0, eps, v_true):
     if target_name == 'x0': return x0
@@ -42,7 +41,7 @@ def get_target_tensor(target_name, x0, eps, v_true):
 class ModelPatcher:
     @staticmethod
     def patch_resolution(model, resolution, device='cuda'):
-        # Unwrap if compiled
+        # Unwrap if previously compiled
         if hasattr(model, '_orig_mod'):
             real_model = model._orig_mod
         else:
@@ -58,117 +57,122 @@ class ModelPatcher:
         return real_model
 
 def compute_kurtosis(t):
-    """Computes Kurtosis of a tensor in a single pass."""
+    """Computes Kurtosis of a tensor."""
     x = t.detach().flatten().float()
     if x.numel() < 2: return 0.0
-    
-    # We need robust variance, so standard calc:
     std = x.std()
     if std < 1e-9: return 0.0
-    
-    # 4th moment
     x_norm = (x - x.mean()) / std
     kurt = (x_norm ** 4).mean().item()
     return kurt
 
-def run_physics_sweep():
+def run_population_sweep():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_float32_matmul_precision('high')
     
     results = []
-    print(f"--- Diffusion Lab Bench v4: Spatial Stats & Kurtosis ---")
+    print(f"--- Diffusion Lab Bench v5: Population Stability (Multi-Pass) ---")
     
     for mode in MODES:
-        print(f"\n> Initializing Model Mode: {mode.upper()}")
+        print(f"\n> Mode: {mode.upper()}")
         
-        # Fresh Model Init
+        # Fresh Init
         base_model = HybridGemmaDiT(mode=mode, embed_dim=256, depth=4).to(device)
         base_model.train() 
         
         for res in RESOLUTIONS:
-            # Patch & Compile
             ModelPatcher.patch_resolution(base_model, res, device)
             print(f"  [Compiling] Resolution {res}x{res}...")
+            # The CAS Daemon makes this fast on the 2nd run
             model = torch.compile(base_model)
             
             bs = BATCH_SIZE[res]
             
             for target_name in TARGETS:
-                # Sweep schedule
-                # We want density at the singularities
-                t_mid = torch.linspace(0.05, 0.95, STEPS_PER_SWEEP-8, device=device)
-                t_ends = torch.tensor([0.001, 0.005, 0.01, 0.02, 0.98, 0.99, 0.995, 0.999], device=device)
+                # Distribution of T
+                t_mid = torch.linspace(0.05, 0.95, STEPS_PER_SWEEP-6, device=device)
+                t_ends = torch.tensor([0.001, 0.01, 0.02, 0.98, 0.99, 0.999], device=device)
                 timesteps = torch.cat([t_ends, t_mid]).sort().values
                 
                 pbar = tqdm(timesteps, desc=f"    {target_name.upper()}", leave=False)
                 
                 for t_val in pbar:
-                    # 1. Generate Data
-                    x0 = torch.randn(bs, 3, res, res, device=device)
-                    eps = torch.randn_like(x0)
                     
-                    t_batch = torch.full((bs,), t_val, device=device)
-                    logsnr = get_schedule(t_batch)
-                    alpha, sigma = get_alpha_sigma(logsnr)
-                    alpha, sigma = alpha.view(-1,1,1,1), sigma.view(-1,1,1,1)
+                    # Accumulators for Population Statistics
+                    pop_loss = []
+                    pop_grad_norm = []
+                    pop_grad_kurt = []
                     
-                    z_t = alpha * x0 + sigma * eps
-                    v_true = alpha * eps - sigma * x0
-                    
-                    # 2. Forward
-                    model.zero_grad()
-                    raw, l_pred = model(z_t, logsnr)
-                    
-                    # 3. Prediction Interpretation
-                    if mode == 'factorized':
-                        sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1, 1, 1, 1)
-                        pred = raw * sigma_p
-                    else:
-                        pred = raw
+                    # --- The Multi-Pass Loop ---
+                    for _ in range(BATCHES_PER_STEP):
+                        # 1. Physics
+                        x0 = torch.randn(bs, 3, res, res, device=device)
+                        eps = torch.randn_like(x0)
                         
-                    target_tensor = get_target_tensor(target_name, x0, eps, v_true)
-                    
-                    # 4. Spatial/Batch Statistics (The "Image" Stats)
-                    # Squared Error per pixel
-                    error_sq = (pred - target_tensor) ** 2 
-                    
-                    # Mean Loss (Scalar)
-                    loss_mean = error_sq.mean()
-                    
-                    # Loss Spatial Variance (Scalar)
-                    # How much does the error vary across the batch/pixels?
-                    # High std = Model fails on specific features/samples
-                    loss_std = error_sq.std() 
-                    
-                    # Backward for Gradients
-                    loss_mean.backward()
-                    
-                    # 5. Gradient Statistics (The "Weight" Stats)
-                    if hasattr(model, '_orig_mod'):
-                        w_grad = model._orig_mod.patch_in.weight.grad
-                    else:
-                        w_grad = model.patch_in.weight.grad
+                        t_batch = torch.full((bs,), t_val, device=device)
+                        logsnr = get_schedule(t_batch)
+                        alpha, sigma = get_alpha_sigma(logsnr)
+                        alpha, sigma = alpha.view(-1,1,1,1), sigma.view(-1,1,1,1)
                         
-                    grad_norm = w_grad.norm().item()
-                    grad_kurt = compute_kurtosis(w_grad)
+                        z_t = alpha * x0 + sigma * eps
+                        v_true = alpha * eps - sigma * x0
+                        
+                        # 2. Forward
+                        model.zero_grad()
+                        raw, l_pred = model(z_t, logsnr)
+                        
+                        # 3. Interpret Prediction
+                        if mode == 'factorized':
+                            sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1, 1, 1, 1)
+                            pred = raw * sigma_p
+                        else:
+                            pred = raw
+                        
+                        target_tensor = get_target_tensor(target_name, x0, eps, v_true)
+                        
+                        # 4. Loss
+                        loss = F.mse_loss(pred, target_tensor)
+                        loss.backward()
+                        
+                        # 5. Capture Stats
+                        pop_loss.append(loss.item())
+                        
+                        if hasattr(model, '_orig_mod'):
+                            w = model._orig_mod.patch_in.weight.grad
+                        else:
+                            w = model.patch_in.weight.grad
+                            
+                        pop_grad_norm.append(w.norm().item())
+                        pop_grad_kurt.append(compute_kurtosis(w))
                     
+                    # --- Aggregate Population Stats ---
                     results.append({
                         'mode': mode,
                         'res': res,
                         'target': target_name,
                         't': t_val.item(),
-                        'loss_mean': loss_mean.item(),
-                        'loss_std': loss_std.item(),
-                        'grad_norm': grad_norm,
-                        'grad_kurt': grad_kurt
+                        # Loss
+                        'loss_mean': np.mean(pop_loss),
+                        'loss_std': np.std(pop_loss),
+                        # Grad Norm
+                        'grad_norm_mean': np.mean(pop_grad_norm),
+                        'grad_norm_std': np.std(pop_grad_norm),
+                        # Grad Kurtosis
+                        'grad_kurt_mean': np.mean(pop_grad_kurt),
+                        'grad_kurt_std': np.std(pop_grad_kurt),
                     })
     
     return pd.DataFrame(results)
 
-def plot_metric(df, metric_mean, metric_std, title, filename):
-    """Generic plotter for Mean +/- Std lines"""
+def plot_population_stability(df, metric_base, title, filename):
+    """
+    Plots Mean line with Shaded region representing +/- 1 Std Dev of the population.
+    """
     fig, axes = plt.subplots(3, 2, figsize=(16, 12), sharex=True)
     colors = {16: 'tab:red', 32: 'tab:green', 64: 'tab:blue'}
+    
+    mean_col = f"{metric_base}_mean"
+    std_col = f"{metric_base}_std"
     
     for r, target in enumerate(TARGETS):
         for c, mode in enumerate(MODES):
@@ -179,62 +183,58 @@ def plot_metric(df, metric_mean, metric_std, title, filename):
                          (df['res'] == res)].sort_values('t')
                 
                 t = sub['t'].values
-                mu = sub[metric_mean].values
+                mu = sub[mean_col].values
+                sigma = sub[std_col].values
                 
-                # If a std column is provided, use it for shading
-                # If not (e.g. Kurtosis), just plot the line
+                # Plot Mean
                 ax.plot(t, mu, color=colors[res], label=f'{res}px', linewidth=1.5)
                 
-                if metric_std is not None:
-                    sigma = sub[metric_std].values
-                    # For log scale plots, clamp bottom
-                    lower = np.maximum(mu - sigma, 1e-8) 
-                    upper = mu + sigma
-                    ax.fill_between(t, lower, upper, color=colors[res], alpha=0.15)
+                # Plot Population Variance
+                lower = np.maximum(mu - sigma, 1e-8)
+                upper = mu + sigma
+                ax.fill_between(t, lower, upper, color=colors[res], alpha=0.15)
                 
             ax.set_title(f"{mode.title()} - {target.upper()}")
             
-            # Heuristics for scaling
-            if "loss" in metric_mean:
+            # Scales
+            if "loss" in metric_base or "norm" in metric_base:
                 ax.set_yscale('log')
-            elif "norm" in metric_mean:
-                ax.set_yscale('log')
-            # Kurtosis is usually linear scale or log if crazy spikes
-            elif "kurt" in metric_mean:
-                ax.set_yscale('linear') 
-                
+            
             ax.grid(True, alpha=0.3)
             
             if r == 2: ax.set_xlabel("Timestep (t)")
             if c == 0: ax.set_ylabel(title)
-            if r == 0 and c == 0: ax.legend()
+            if r == 0 and c == 0: ax.legend(loc='upper right')
             
-    plt.suptitle(f"Figure: {title} vs Timestep", fontsize=16)
+    plt.suptitle(f"Figure: {title} vs Timestep (Population Stability)", fontsize=16)
     plt.tight_layout()
     plt.savefig(filename)
     print(f"Saved {filename}")
 
 if __name__ == "__main__":
-    df = run_physics_sweep()
+    df = run_population_sweep()
     
     print("\nplotting...")
     
-    # 1. Loss Stability (Spatial Variance)
-    plot_metric(df, 'loss_mean', 'loss_std', 
-                r"MSE Loss (Mean $\pm$ Spatial Std)", "fig_loss_stability.png")
+    # 1. Loss Stability
+    plot_population_stability(df, 'loss', 
+                              r"MSE Loss (Mean $\pm$ Pop Std)", 
+                              "fig_pop_loss.png")
     
-    # 2. Gradient Norm
-    plot_metric(df, 'grad_norm', None, 
-                "Gradient Norm", "fig_grad_norm.png")
+    # 2. Gradient Stability
+    plot_population_stability(df, 'grad_norm', 
+                              r"Gradient Norm (Mean $\pm$ Pop Std)", 
+                              "fig_pop_grad_norm.png")
     
-    # 3. Gradient Kurtosis
-    plot_metric(df, 'grad_kurt', None, 
-                "Gradient Kurtosis", "fig_grad_kurtosis.png")
+    # 3. Kurtosis Stability
+    plot_population_stability(df, 'grad_kurt', 
+                              r"Gradient Kurtosis (Mean $\pm$ Pop Std)", 
+                              "fig_pop_kurtosis.png")
     
-    print("\n=== SUMMARY: Resolution Scaling Factor (Mean Gradient Norm) ===")
+    print("\n=== SUMMARY: Resolution Scaling (Mean Gradient Norm) ===")
     for mode in MODES:
         for target in TARGETS:
             sub = df[(df['mode']==mode) & (df['target']==target)]
-            g16 = sub[sub['res']==16]['grad_norm'].mean()
-            g64 = sub[sub['res']==64]['grad_norm'].mean()
+            g16 = sub[sub['res']==16]['grad_norm_mean'].mean()
+            g64 = sub[sub['res']==64]['grad_norm_mean'].mean()
             print(f"[{mode}-{target}] 16->64px Scaling: {g64/g16:.2f}x")

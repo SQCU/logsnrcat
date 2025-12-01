@@ -187,14 +187,56 @@ def get_global_mask(seq_len):
     return create_block_mask(mask_mod, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len)
 # --- Network ---
 
+class MoEFFN(nn.Module):
+    def __init__(self, dim, num_experts=8, num_active=3):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_active = num_active
+        
+        # Router
+        self.router = nn.Linear(dim, num_experts)
+        
+        # Experts (just FFNs)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim * 4),
+                nn.GELU(),
+                nn.Linear(dim * 4, dim)
+            ) for _ in range(num_experts)
+        ])
+        
+    def forward(self, x):
+        # x: [B, S, D]
+        router_logits = self.router(x)  # [B, S, num_experts]
+        
+        # Top-k routing
+        top_k_logits, top_k_indices = torch.topk(router_logits, self.num_active, dim=-1)
+        router_weights = F.softmax(top_k_logits, dim=-1)  # [B, S, num_active]
+        
+        # Apply experts
+        out = torch.zeros_like(x)
+        for i in range(self.num_active):
+            expert_idx = top_k_indices[:, :, i]  # [B, S]
+            weight = router_weights[:, :, i:i+1]  # [B, S, 1]
+            
+            # Gather expert outputs (batched)
+            for e in range(self.num_experts):
+                mask = (expert_idx == e)
+                if mask.any():
+                    expert_out = self.experts[e](x)
+                    out += expert_out * weight * mask.unsqueeze(-1)
+        load_loss = torch.var(router_logits.mean(dim=[0,1]))
+        return out, load_loss
+
 
 class GatedAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, spatial_buffer, is_global=False):
+    def __init__(self, dim, num_heads, spatial_buffer, is_global=False, is_moe=True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.is_global = is_global
-        
+        self.is_moe = is_moe
+
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.rn_rope = RnRoPE(self.head_dim, spatial_buffer)
@@ -202,8 +244,11 @@ class GatedAttentionBlock(nn.Module):
         self.gate_proj = nn.Linear(dim, dim)
         
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.mlp_gate = nn.Linear(dim, dim * 8)
-        self.mlp_out = nn.Linear(dim * 4, dim)
+        if not self.is_moe:
+            self.mlp_gate = nn.Linear(dim, dim * 8)
+            self.mlp_out = nn.Linear(dim * 4, dim)
+        else:
+            self.moe_mlp = MoEFFN(dim, num_experts=8, num_active=3)
 
     def forward(self, x, block_mask, grid_size):
         B, S, D = x.shape
@@ -225,9 +270,13 @@ class GatedAttentionBlock(nn.Module):
         x = resid + (attn * gate)
         
         resid = x
-        g, val = self.mlp_gate(self.norm2(x)).chunk(2, dim=-1)
-        x = resid + self.mlp_out(val * F.gelu(g))
-        return x
+        if not self.is_moe:
+            g, val = self.mlp_gate(self.norm2(x)).chunk(2, dim=-1)
+            x = resid + self.mlp_out(val * F.gelu(g))
+            route_loss = 0
+        else:
+            x, route_loss = self.moe_mlp(x)
+        return x, route_loss
 
 class HybridGemmaDiT(nn.Module):
     def __init__(self, mode='factorized', embed_dim=256, depth=8):
@@ -287,10 +336,13 @@ class HybridGemmaDiT(nn.Module):
         x = self.patch_in(torch.cat([patches, spins_expanded], dim=-1))
         
         mask_local, mask_global = self.get_masks(grid_size)
-        
+        route_losses = []
         for layer in self.layers:
             mask = mask_global if layer.is_global else mask_local
-            x = layer(x, mask, grid_size)
+            x, route_loss = layer(x, mask, grid_size)
+            route_losses.append(route_loss)
+        stacked_route_losses = torch.stack(route_losses)
+        route_loss = torch.mean(stacked_route_losses)
             
         x = self.norm_final(x)
         z_pred = self.output_head(x)
@@ -301,4 +353,4 @@ class HybridGemmaDiT(nn.Module):
             z_pred = z_pred * scale
             l_pred = self.lambda_head(x.mean(dim=1)).squeeze(-1)
             
-        return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred
+        return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred, route_loss 

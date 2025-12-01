@@ -1,4 +1,7 @@
 # bench_multires_cl.py
+import inductor_cas_client
+# Hook the ZMQ compiler backend immediately
+inductor_cas_client.install_cas_client() 
 import torch
 import torch.nn.functional as F
 import pandas as pd
@@ -75,9 +78,9 @@ def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     plt.tight_layout()
     return fig
 
-def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
+def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None, is_moe=True):
     device = torch.device('cuda')
-    print(f"\n--- Training: {mode.upper()} | embed_dim={embed_dim} depth={depth} ---")
+    print(f"\n--- Training: {mode.upper()} | embed_dim={embed_dim} depth={depth} is_moe={is_moe}---")
     
     # Init Model
     model = HybridGemmaDiT(mode, embed_dim=embed_dim, depth=depth).to(device)
@@ -111,7 +114,7 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
     iterator = CheckerboardIterator(device)
     
     # Buckets: (Resolution, BatchSize)
-    buckets = [(16, 1024), (32, 256)]
+    buckets = [(16, 256), (32, 64)]
     manager = BucketManager(buckets)
     
     history = []
@@ -121,6 +124,7 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
         opt_main.zero_grad()
         opt_house.zero_grad()
         opt_interface.zero_grad()
+        aux_loss = None
         
         res, bs = manager.next_bucket()
         x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
@@ -135,7 +139,7 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
         v_true = alpha * eps - sigma * x0
         
         # Forward
-        raw, l_pred = model(z_t, logsnr)
+        raw, l_pred, route_loss = model(z_t, logsnr)
         
         # Reconstruction
         if mode == 'factorized':
@@ -143,9 +147,14 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
             v_pred = raw * sigma_p
         else:
             v_pred = raw
-            
         loss = F.mse_loss(v_pred, v_true)
-        loss.backward()
+        if is_moe:
+            aux_loss = 0.01*route_loss
+        if aux_loss is not None:
+            total_loss = loss + aux_loss
+        else:
+            total_loss = loss
+        total_loss.backward()
         opt_main.step()
         opt_house.step()
         opt_interface.step()
@@ -169,7 +178,7 @@ def sample_viz(model, res, num_samples=8):
         t = ts[i]; t_n = ts[i+1]
         logsnr = get_schedule(torch.full((num_samples,), t, device='cuda'))
         
-        raw, l_pred = model(z, logsnr)
+        raw, l_pred, _ = model(z, logsnr)
         
         if model.mode == 'factorized':
             sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1,1,1,1)
