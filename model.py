@@ -4,7 +4,20 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from diffusion_utils import FourierFeatures
 
-# --- Geometry & RoPE (Unchanged) ---
+# --- Geometry & RoPE ---
+#thanks and complaints all go to:
+""" https://arxiv.org/abs/2504.06308
+Rethinking RoPE: A Mathematical Blueprint for
+N-dimensional Rotary Positional Embedding
+Haiping Liu Lijing Lin Jingyuan Sun Zhegong Shangguan
+Mauricio A. Alvarez Hongpeng Zhou∗
+University of Manchester
+* Corresponding author: hongpeng.zhou@manchester.ac.uk
+"""
+#and valued contributor
+"""
+gemini 3 pro preview: aistudio.google.com
+"""
 class HouseholderOrthogonal(nn.Module):
     def __init__(self, dim, num_reflections=4):
         super().__init__()
