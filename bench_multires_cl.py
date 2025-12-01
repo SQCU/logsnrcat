@@ -83,18 +83,30 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
     model = HybridGemmaDiT(mode, embed_dim=embed_dim, depth=depth).to(device)
     model = torch.compile(model)
         
+    # Group A: Geometry (Householder) -> Low LR
+    # These define the coordinate system. Stability is key.
     householder_params = [p for n,p in model.named_parameters() if 'orthogonal.vs' in n]
-    other_params = [p for n,p in model.named_parameters() if 'orthogonal.vs' not in n]
+    # Group B: Interface (Embed/Unembed/Decoders) -> High LR
+    # These map raw pixels/noise to the latent space. They need to move fast early on.
+    interface_names = ['patch_in', 'patch_out', 'scale_decoder', 'lambda_head', 'output_head']
+    params_interface = [p for n,p in model.named_parameters() 
+                        if any(x in n for x in interface_names) and 'orthogonal' not in n]
+    # Group C: Backbone (Transformers) -> Medium LR
+    # Everything else (MLPs, QKV projections, ~~Norms~~ these better not have params)
+    other_params = [p for n,p in model.named_parameters() 
+                       if not any(x in n for x in interface_names) and 'orthogonal' not in n]
     # Option B: Don't schedule Householder
     opt_main = torch.optim.AdamW(other_params, lr=5e-4, weight_decay=0.1)
-    opt_house = torch.optim.AdamW(householder_params, lr=0.1, weight_decay=0.0)
+    opt_house = torch.optim.AdamW(householder_params, lr=1e-4, weight_decay=0.0)
+    opt_interface = torch.optim.AdamW(params_interface, lr=0.1, weight_decay=0.0)
     # Learning rate schedule with warmup + decay
     from torch.optim.lr_scheduler import OneCycleLR
-    scheduler_main = OneCycleLR(opt_main, max_lr=1e-3, total_steps=steps, 
+    scheduler_main = OneCycleLR(opt_main, max_lr=1e-4, total_steps=steps, 
                         pct_start=0.1, div_factor=10, final_div_factor=100)
-    scheduler_house = OneCycleLR(opt_house, max_lr=1e-2, total_steps=steps, 
+    scheduler_house = OneCycleLR(opt_house, max_lr=1e-4, total_steps=steps, 
                         pct_start=0.1, div_factor=10, final_div_factor=100)
-    
+    scheduler_interface = OneCycleLR(opt_interface, max_lr=1e-2, total_steps=steps, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
     # Init Data
     iterator = CheckerboardIterator(device)
     
@@ -108,6 +120,7 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
     for i in pbar:
         opt_main.zero_grad()
         opt_house.zero_grad()
+        opt_interface.zero_grad()
         
         res, bs = manager.next_bucket()
         x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
@@ -135,9 +148,10 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
         loss.backward()
         opt_main.step()
         opt_house.step()
+        opt_interface.step()
         scheduler_main.step()
         scheduler_house.step()
-        
+        scheduler_interface.step()
         history.append({'step': i, 'res': res, 'loss': loss.item()})
         
         if i % 100 == 0:
@@ -237,8 +251,8 @@ if __name__ == "__main__":
     logger.save_figure(dataset_fig, "dataset_groundtruth")
     
     # 1. Run training
-    df_naive, model_naive = train_multires('naive', steps=3000, embed_dim=256, depth=8, logger=logger)
-    df_fact, model_fact = train_multires('factorized', steps=3000, embed_dim=256, depth=8, logger=logger)
+    df_naive, model_naive = train_multires('naive', steps=3000, embed_dim=256, depth=4, logger=logger)
+    df_fact, model_fact = train_multires('factorized', steps=3000, embed_dim=256, depth=4, logger=logger)
     
     # 2. Plot loss curves
     print("\n📈 Plotting loss curves...")
