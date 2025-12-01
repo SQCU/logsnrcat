@@ -28,3 +28,12 @@ This project uses `uv` for fast and reliable dependency management.
     ~~`python bench_v_pred.py`~~
     better logging, less interactive repl:
     `python bench_multires_cl.py`
+
+    `python diffusion_lab_bench_v3`
+    to concretely measure gradient 
+
+    `python compiler_daemon.py`
+    for crimes against torch
+
+    `python bench_backbone_hit_that_griddy.py`
+    ???

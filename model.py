@@ -180,66 +180,59 @@ class SigmoidMoE(nn.Module):
         
         return out, aux_loss
 
+
 class ContextualPatchEmbedder(nn.Module):
-    """
-    Implements the 'Look at the Ring' logic via Overlapping Patches.
-    
-    Standard 2x2 patch: Sees 4 pixels.
-    Contextual 4x4 patch: Sees 16 pixels (4 center + 12 neighbor ring).
-    Stride 2: Maintains the same latent grid size (16x16 -> 8x8 latents).
-    """
-    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=256, context_size=4):
+    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=256, context_size=4, mlp_depth=1):
         super().__init__()
         self.context_size = context_size
         self.stride = 2
-        # Padding needed to maintain grid size with kernel > stride
-        # For Kernel 4, Stride 2: We need 1px padding on all sides.
         self.padding = 1 
         
         patch_flat_dim = (context_size ** 2) * input_dim
         
-        # Non-Linear Projection (SwiGLU-style)
-        self.net = nn.Sequential(
-            nn.Linear(patch_flat_dim + 8, hidden_dim), # +8 for Fourier Spins
-            nn.SiLU(),
-            nn.Linear(hidden_dim, embed_dim)
-        )
+        layers = []
+        # Input Projection
+        layers.append(nn.Linear(patch_flat_dim + 8, hidden_dim))
+        layers.append(nn.SiLU())
+        
+        # Deep Interface Layers (The "Griddy" Scaling)
+        for _ in range(mlp_depth - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            
+        # Final Projection
+        layers.append(nn.Linear(hidden_dim, embed_dim))
+        
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x, spins):
-        # x: [B, C, H, W]
-        # Pad to handle the "Ring" context at image edges
         x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
-        
-        # Unfold with Overlap
-        # Kernel=4, Stride=2
         patches = x_pad.unfold(2, self.context_size, self.stride).unfold(3, self.context_size, self.stride)
-        # [B, C, GridH, GridW, K, K]
-        
         B, C, GH, GW, K, _ = patches.shape
         num_tokens = GH * GW
-        
-        # Flatten patches: [B, NumTokens, C*K*K]
         patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, -1)
-        
-        # Expand spins to match
         spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
-        
-        # Concatenate and Project
         out = self.net(torch.cat([patches, spins_expanded], dim=-1))
         return out
 
 class NonLinearOutputHead(nn.Module):
-    """
-    Decodes latents back to 2x2 patches (Non-overlapping) using an MLP.
-    We don't use overlap here to keep reconstruction sharp/simple.
-    """
-    def __init__(self, embed_dim, output_dim=12): # 12 = 3ch * 2 * 2
+    def __init__(self, embed_dim, output_dim=12, mlp_depth=1): 
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, output_dim)
-        )
+        
+        layers = []
+        # Input Projection
+        layers.append(nn.Linear(embed_dim, embed_dim))
+        layers.append(nn.SiLU())
+        
+        # Deep Interface Layers
+        for _ in range(mlp_depth - 1):
+            layers.append(nn.Linear(embed_dim, embed_dim))
+            layers.append(nn.SiLU())
+            
+        # Final Projection
+        layers.append(nn.Linear(embed_dim, output_dim))
+        
+        self.net = nn.Sequential(*layers)
         
     def forward(self, x):
         return self.net(x)
@@ -338,17 +331,17 @@ class GatedAttentionBlock(nn.Module):
         return x, aux_loss
 
 class HybridGemmaDiT(nn.Module):
-    def __init__(self, mode='factorized', embed_dim=256, depth=8, ffn_type='swiglu'):
+    def __init__(self, mode='factorized', embed_dim=256, depth=8, ffn_type='swiglu', interface_depth=1):
         super().__init__()
         self.mode = mode
         
-        # 1. UPGRADE: Contextual Embedder
-        # Input dim becomes 4*4*3 = 48 (plus 8 spins) -> 56
+        # Pass interface_depth to embedder
         self.patch_in = ContextualPatchEmbedder(
             input_dim=3, 
             hidden_dim=embed_dim, 
             embed_dim=embed_dim, 
-            context_size=4 # The "Ring"
+            context_size=4,
+            mlp_depth=interface_depth
         )
         
         self.fourier_dim = 8
@@ -366,10 +359,10 @@ class HybridGemmaDiT(nn.Module):
         ])
         
         self.norm_final = nn.RMSNorm(embed_dim, elementwise_affine=False)
-        self.patch_dim = 12 # Output is still 2x2 (3*4)
+        self.patch_dim = 12
         
-        # 2. UPGRADE: Non-Linear Output
-        self.output_head = NonLinearOutputHead(embed_dim, self.patch_dim)
+        # Pass interface_depth to output head
+        self.output_head = NonLinearOutputHead(embed_dim, self.patch_dim, mlp_depth=interface_depth)
         
         if mode == 'factorized':
             self.scale_decoder = FourierScaleDecoder(self.fourier_dim, embed_dim, self.patch_dim)
@@ -378,9 +371,12 @@ class HybridGemmaDiT(nn.Module):
             self.scale_decoder = None
             self.lambda_head = None
 
+    # ... [Rest of methods (get_masks, forward) remain unchanged from Contextual version] ...
     def get_masks(self, grid_size):
         if grid_size in self.mask_cache: return self.mask_cache[grid_size]
-        mask_local = self.spatial.get_mask(grid_size, radius=2.5)
+        base_grid = 8.0; base_radius = 2.5
+        scaled_radius = base_radius * (grid_size / base_grid)
+        mask_local = self.spatial.get_mask(grid_size, radius=scaled_radius)
         mask_global = get_global_mask(grid_size * grid_size)
         self.mask_cache[grid_size] = (mask_local, mask_global)
         return mask_local, mask_global
@@ -389,27 +385,19 @@ class HybridGemmaDiT(nn.Module):
         B, C, H, W = z_t.shape
         grid_h, grid_w = H // 2, W // 2
         grid_size = grid_h 
-        
         spins = self.spin_encoder(logsnr)
-        
-        # Contextual Embedding handles the unfold/cat internally
         x = self.patch_in(z_t, spins)
-        
         mask_local, mask_global = self.get_masks(grid_size)
-        
         total_aux_loss = 0.0
         for layer in self.layers:
             mask = mask_global if layer.is_global else mask_local
             x, al = layer(x, mask, grid_size)
             total_aux_loss += al
-            
         x = self.norm_final(x)
         z_pred = self.output_head(x)
         l_pred = None
-        
         if self.mode == 'factorized':
             scale = self.scale_decoder(spins).unsqueeze(1)
             z_pred = z_pred * scale
             l_pred = self.lambda_head(x.mean(dim=1)).squeeze(-1)
-            
         return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred, total_aux_loss
