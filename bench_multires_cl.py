@@ -251,8 +251,8 @@ if __name__ == "__main__":
     logger.save_figure(dataset_fig, "dataset_groundtruth")
     
     # 1. Run training
-    df_naive, model_naive = train_multires('naive', steps=3000, embed_dim=256, depth=4, logger=logger)
-    df_fact, model_fact = train_multires('factorized', steps=3000, embed_dim=256, depth=4, logger=logger)
+    df_naive, model_naive = train_multires('naive', steps=3000, embed_dim=256, depth=8, logger=logger)
+    df_fact, model_fact = train_multires('factorized', steps=3000, embed_dim=256, depth=8, logger=logger)
     
     # 2. Plot loss curves
     print("\n📈 Plotting loss curves...")

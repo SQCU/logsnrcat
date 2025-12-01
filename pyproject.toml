@@ -34,7 +34,10 @@ dependencies = [
     "wandb>=0.19.11",
     "gluon-experiment @ git+https://github.com/sqcu/gluon-experiment.git", # dion has rocked for a long long time
     #logsnrcat
-    "matplotlib"
+    "matplotlib",
+    #crimes against nature
+    "pyzmq",
+    "cloudpickle"
 ]
 
 [project.optional-dependencies]
