@@ -330,12 +330,81 @@ class GatedAttentionBlock(nn.Module):
         
         return x, aux_loss
 
+class MLPResBlock(nn.Module):
+    """
+    A simple Residual Block for the Interface MLPs.
+    Pre-Norm structure: x = x + MLP(Norm(x))
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim, elementwise_affine=False)
+        self.net = SwiGLU(dim, dim*2)
+        
+    def forward(self, x):
+        return x + self.net(self.norm(x))
+
+class ContextualPatchEmbedder(nn.Module):
+    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=256, context_size=4, mlp_depth=1):
+        super().__init__()
+        self.context_size = context_size
+        self.stride = 2
+        self.padding = 1 
+        
+        patch_flat_dim = (context_size ** 2) * input_dim
+        
+        # 1. Lift from Pixels to Hidden Space
+        self.input_proj = nn.Linear(patch_flat_dim + 8, hidden_dim)
+        
+        # 2. Deep Interface (Residual Processing)
+        # If mlp_depth > 1, we add (depth-1) residual blocks
+        self.res_blocks = nn.Sequential(*[
+            MLPResBlock(hidden_dim) for _ in range(max(0, mlp_depth - 1))
+        ])
+        
+        # 3. Project to Embedding Dimension
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim), # Final norm before entering transformer
+            nn.Linear(hidden_dim, embed_dim)
+        )
+
+    def forward(self, x, spins):
+        x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
+        patches = x_pad.unfold(2, self.context_size, self.stride).unfold(3, self.context_size, self.stride)
+        B, C, GH, GW, K, _ = patches.shape
+        num_tokens = GH * GW
+        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, -1)
+        spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
+        
+        x = self.input_proj(torch.cat([patches, spins_expanded], dim=-1))
+        x = self.res_blocks(x)
+        x = self.output_proj(x)
+        return x
+
+class NonLinearOutputHead(nn.Module):
+    def __init__(self, embed_dim, output_dim=12, mlp_depth=1): 
+        super().__init__()
+        
+        # 1. Process in Embedding Space
+        # Note: We assume input is already normalized by the Transformer's final LN
+        self.res_blocks = nn.Sequential(*[
+            MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))
+        ])
+        
+        # 2. Project to Output Pixels
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        x = self.res_blocks(x)
+        return self.output_proj(x)
+
 class HybridGemmaDiT(nn.Module):
     def __init__(self, mode='factorized', embed_dim=256, depth=8, ffn_type='swiglu', interface_depth=1):
         super().__init__()
         self.mode = mode
         
-        # Pass interface_depth to embedder
         self.patch_in = ContextualPatchEmbedder(
             input_dim=3, 
             hidden_dim=embed_dim, 
@@ -361,7 +430,6 @@ class HybridGemmaDiT(nn.Module):
         self.norm_final = nn.RMSNorm(embed_dim, elementwise_affine=False)
         self.patch_dim = 12
         
-        # Pass interface_depth to output head
         self.output_head = NonLinearOutputHead(embed_dim, self.patch_dim, mlp_depth=interface_depth)
         
         if mode == 'factorized':
@@ -371,7 +439,6 @@ class HybridGemmaDiT(nn.Module):
             self.scale_decoder = None
             self.lambda_head = None
 
-    # ... [Rest of methods (get_masks, forward) remain unchanged from Contextual version] ...
     def get_masks(self, grid_size):
         if grid_size in self.mask_cache: return self.mask_cache[grid_size]
         base_grid = 8.0; base_radius = 2.5
