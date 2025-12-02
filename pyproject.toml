@@ -35,6 +35,8 @@ dependencies = [
     "gluon-experiment @ git+https://github.com/sqcu/gluon-experiment.git", # dion has rocked for a long long time
     #logsnrcat
     "matplotlib",
+    #"pytorch3d",
+    #pytorch3d is fictional
     #crimes against nature
     "pyzmq",
     "cloudpickle"
