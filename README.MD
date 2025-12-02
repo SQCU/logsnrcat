@@ -30,16 +30,22 @@ This project uses `uv` for fast and reliable dependency management.
 4.  **run it!**:
 
     ~~`python bench_v_pred.py`~~
-    better logging, less interactive repl:
+
+    
     `python bench_multires_cl.py`
 
+    better logging, less interactive repl:
+
     `python diffusion_lab_bench_v3`
+
     to concretely measure gradient 
 
     `python compiler_daemon.py`
+
     for crimes against torch
 
     `python bench_backbone_hit_that_griddy.py`
+    
     test marginal benefit of different flops assignments
 
 5. **why low resolution checkerboards?**
