@@ -1,8 +1,6 @@
 # dataset_torus_native.py
 import torch
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
 import math
 import os
 
@@ -10,12 +8,12 @@ class TorusRaymarcher:
     def __init__(self, device='cuda'):
         self.device = device
 
-    def get_camera_rays(self, batch_size, resolution, dist_range=(2.0, 4.0)):
+    def get_camera_rays(self, batch_size, resolution):
         """
-        Generates camera rays looking at the origin.
-        Random orbit around the object.
+        Generates camera rays with smart targeting.
+        Mixes 'Full Object' shots and 'Macro Surface' shots.
         """
-        # 1. Camera Intrinsics (Assume FOV ~60 deg)
+        # 1. Camera Intrinsics (Assume FOV ~60-90 deg)
         # Screen coordinates
         i, j = torch.meshgrid(
             torch.linspace(-1, 1, resolution, device=self.device),
@@ -24,36 +22,66 @@ class TorusRaymarcher:
         ) # [H, W]
         
         # Rays in camera space (Z-forward)
-        # [B, H, W, 3]
+        # We use a slightly wider implicit FOV to ensure we catch things close up
         dirs_cam = torch.stack([j, -i, torch.ones_like(i)], dim=-1).unsqueeze(0).expand(batch_size, -1, -1, -1)
         dirs_cam = F.normalize(dirs_cam, dim=-1)
         
-        # 2. Camera Extrinsics (Orbit)
-        # Random spherical coords
+        # 2. Camera Extrinsics (Targeting Logic)
+        
+        # Mode Selection: 60% Macro (Close-up), 40% Full View
+        is_macro = torch.rand(batch_size, device=self.device) < 0.6
+        
+        # -- Target Point Calculation --
+        # Full View: Look at (0,0,0)
+        # Macro View: Look at a random point on the major ring (Radius=1.0)
+        target_angle = torch.rand(batch_size, device=self.device) * 2 * math.pi
+        
+        tx = torch.cos(target_angle) # Radius 1.0
+        tz = torch.sin(target_angle)
+        
+        target = torch.zeros(batch_size, 3, device=self.device)
+        # Apply macro targets
+        target[is_macro, 0] = tx[is_macro]
+        target[is_macro, 2] = tz[is_macro]
+        # Jitter Y target slightly for macro to look at top/bottom of tube surface
+        target[is_macro, 1] = (torch.rand(is_macro.sum(), device=self.device) - 0.5) * 0.2
+        
+        # -- Camera Position Calculation --
+        # Distances relative to the TARGET
+        # Full: Far enough to see whole ring (2.5 to 4.0)
+        # Macro: Close enough to see texture, safe enough not to clip (0.6 to 1.2)
+        # Note: Tube radius is 0.4. Dist 0.6 leaves 0.2 clearance.
+        dist_full = torch.rand(batch_size, device=self.device) * 1.5 + 2.5
+        dist_macro = torch.rand(batch_size, device=self.device) * 0.6 + 0.6
+        dist = torch.where(is_macro, dist_macro, dist_full)
+        
+        # Orbit around the TARGET
         theta = torch.rand(batch_size, device=self.device) * 2 * math.pi
-        phi = torch.rand(batch_size, device=self.device) * math.pi * 0.8 + 0.1 # Avoid pure poles
-        radius = torch.rand(batch_size, device=self.device) * (dist_range[1] - dist_range[0]) + dist_range[0]
+        # Clamp phi to avoid degenerate LookAt (poles)
+        phi = torch.rand(batch_size, device=self.device) * 2.8 + 0.17 # ~10 to 170 degrees
         
-        # Camera Position (Eye)
-        cx = radius * torch.sin(phi) * torch.cos(theta)
-        cy = radius * torch.cos(phi)
-        cz = radius * torch.sin(phi) * torch.sin(theta)
-        origin = torch.stack([cx, cy, cz], dim=1) # [B, 3]
+        cx = dist * torch.sin(phi) * torch.cos(theta)
+        cy = dist * torch.cos(phi)
+        cz = dist * torch.sin(phi) * torch.sin(theta)
+        offset = torch.stack([cx, cy, cz], dim=1)
         
-        # LookAt Matrix (Target = 0,0,0)
-        # Forward = -Position (normalized)
-        forward = -F.normalize(origin, dim=1)
+        origin = target + offset # [B, 3]
+        
+        # -- LookAt Matrix --
+        # Forward = Direction from Camera to Target
+        forward = F.normalize(target - origin, dim=1)
+        
         # Up vector (World Up = 0,1,0)
         world_up = torch.tensor([0.0, 1.0, 0.0], device=self.device).view(1, 3).expand(batch_size, -1)
+        
+        # Standard Gram-Schmidt
         right = F.normalize(torch.cross(forward, world_up), dim=1)
         up = torch.cross(right, forward)
         
         # Transform rays to World Space
-        # [B, 3, 3] Rotation Matrix
-        R = torch.stack([right, up, forward], dim=2) 
+        R = torch.stack([right, up, forward], dim=2) # [B, 3, 3]
         
-        # Apply rotation to rays: [B, H, W, 3] @ [B, 3, 3] 
-        # We flatten rays for matmul, then reshape
+        # Apply rotation: [B, H*W, 3] @ [B, 3, 3]
         rays_world = torch.bmm(dirs_cam.view(batch_size, -1, 3), R).view(batch_size, resolution, resolution, 3)
         
         return origin, rays_world
@@ -61,7 +89,6 @@ class TorusRaymarcher:
     def sdf_torus(self, p, R_major=1.0, r_minor=0.4):
         """
         Signed Distance Function for a Torus lying on XZ plane.
-        p: [N, 3]
         """
         # Distance to the ring in XZ plane
         q_xy = torch.norm(p[..., [0, 2]], dim=-1) - R_major
@@ -83,11 +110,11 @@ class TorusRaymarcher:
         o = origin.view(B, 1, 3).expand(-1, H*W, -1).reshape(-1, 3)
         d = rays.view(-1, 3)
         
-        # Current position along ray
         t = torch.zeros(o.shape[0], device=self.device)
-        
-        # Mask of active rays (haven't hit, haven't escaped)
         active_mask = torch.ones_like(t, dtype=torch.bool)
+        
+        # Optimization: Don't march rays that look away from bounding sphere (approx)
+        # But for torus, just march everything, it's cheap enough.
         
         for _ in range(max_steps):
             if not active_mask.any(): break
@@ -95,19 +122,18 @@ class TorusRaymarcher:
             p = o + d * t.unsqueeze(-1)
             dist = self.sdf_torus(p)
             
-            # Update t
-            t[active_mask] += dist[active_mask]
+            # Update t only for active rays
+            # We use `where` to avoid inplace ops on masked tensors which can be slow/tricky
+            t_next = t + dist
+            t = torch.where(active_mask, t_next, t)
             
-            # Convergence check
+            # Check convergence
             hit = dist < 0.001
-            miss = t > 10.0
+            miss = t > 8.0 # Tighter bound than 10.0 for speed
             
-            # We don't stop marching hit rays immediately in simple vectorized, 
-            # we just stop updating them effectively or let them jitter.
-            # Ideally we mask.
+            # Update mask
             active_mask = active_mask & (~hit) & (~miss)
         
-        # Compute final points
         p_final = o + d * t.unsqueeze(-1)
         
         # Final validity check
@@ -124,18 +150,6 @@ class TorusRaymarcher:
         u = torch.atan2(p[..., 2], p[..., 0]) / (2 * math.pi) + 0.5
         
         # V: Angle around the tube center (Minor)
-        # Vector from center of major ring to point
-        center_to_p_xz = F.normalize(p[..., [0, 2]], dim=-1) * R_major
-        center_to_p = p.clone()
-        center_to_p[..., 0] -= center_to_p_xz[..., 0]
-        center_to_p[..., 2] -= center_to_p_xz[..., 1]
-        
-        # Now center_to_p is the vector from the tube spine to the surface
-        # Project onto the local frame of the tube section
-        # Local Y is world Y (p[..., 1])
-        # Local X is the radial direction outwards
-        
-        # Simplified: V is angle of (q_xy, q_z) from SDF logic
         q_xy = torch.norm(p[..., [0, 2]], dim=-1) - R_major
         q_z = p[..., 1]
         v = torch.atan2(q_z, q_xy) / (2 * math.pi) + 0.5
@@ -143,7 +157,6 @@ class TorusRaymarcher:
         return u, v
 
     def lab_to_rgb(self, L, a, b):
-        # ... [Same color conversion as before] ...
         y = (L + 16.) / 116.
         x = a / 500. + y
         z = y - b / 200.
@@ -160,106 +173,66 @@ class TorusRaymarcher:
         B = valid_mask.shape[0]
         H = W = resolution
         
-        # 1. Get Colors per batch item
-        # Bright: Grey
-        L_bright = torch.rand(B, 1, device=self.device) * 10.0 + 80.0
+        # 1. Colors
+        L_bright = torch.rand(B, 1, device=self.device) * 10.0 + 85.0
         c_bright = self.lab_to_rgb(L_bright, torch.zeros_like(L_bright), torch.zeros_like(L_bright))
         
-        # Dark: Random Color
         L_dark = torch.rand(B, 1, device=self.device) * 30.0 + 20.0
         a_dark = (torch.rand(B, 1, device=self.device) - 0.5) * 160.0
         b_dark = (torch.rand(B, 1, device=self.device) - 0.5) * 160.0
         c_dark = self.lab_to_rgb(L_dark, a_dark, b_dark)
         
-        # 2. Compute UVs
+        # 2. UVs & Pattern
         u, v = self.get_uv(p)
         
-        # 3. Herringbone Logic (Vectorized)
-        # Tile density
+        # Slightly higher frequency for macro details
         u_freq = 12.0
-        v_freq = 4.0
+        v_freq = 6.0 
         
         u_scaled = u * u_freq
         v_scaled = v * v_freq
         
-        # Column Index
         col_idx = torch.floor(u_scaled)
         
-        # Local pattern (x +/- y)
-        # Use simple stripes
         stripe_freq = 2.0 * math.pi
-        
         pat_even = torch.cos((u_scaled + v_scaled) * stripe_freq)
         pat_odd  = torch.cos((u_scaled - v_scaled) * stripe_freq)
         
-        # Mix based on column parity
         is_even = (col_idx % 2 == 0)
         pattern = torch.where(is_even, pat_even, pat_odd)
-        
-        # Threshold
         is_dark = pattern > 0
         
-        # 4. Composite
-        # Flatten valid_mask to match p [N_total, 3]? No, p is [N_total, 3]
-        # We need to map back to B,H,W
-        
-        # Colors: [B, 3] -> broadcast to [B, H, W, 3]
-        img = torch.zeros(B, H, W, 3, device=self.device)
-        
-        # We need to construct the texture per pixel
-        # This is tricky because `p` is flattened or masked.
-        # Let's assume `p` passed in is [B, H, W, 3] but contains garbage where !valid_mask
-        
+        # 3. Composite
         c_bright_expanded = c_bright.view(B, 1, 1, 3).expand(-1, H, W, -1)
         c_dark_expanded = c_dark.view(B, 1, 1, 3).expand(-1, H, W, -1)
         
         surface_color = torch.where(is_dark.unsqueeze(-1), c_dark_expanded, c_bright_expanded)
         
-        # Apply Background (Black or Noise? Let's do Black)
         final_img = torch.where(valid_mask.unsqueeze(-1), surface_color, torch.zeros_like(surface_color))
-        
         return final_img
-
-# --- The Iterator Replacement ---
 
 class TorusIterator:
     def __init__(self, device='cuda'):
         self.marcher = TorusRaymarcher(device)
         
     def generate_batch(self, batch_size, resolution, **kwargs):
-        # 1. Rays
         origins, rays = self.marcher.get_camera_rays(batch_size, resolution)
-        
-        # 2. March
         p, mask = self.marcher.intersect(origins, rays)
-        
-        # 3. Shade
-        # We reshape p to [B, H, W, 3] for shading logic
         p_reshaped = p.view(batch_size, resolution, resolution, 3)
         images = self.marcher.shade_batch(p_reshaped, mask, resolution)
-        
-        # Permute to [B, C, H, W] for the model
         return images.permute(0, 3, 1, 2)
 
-# --- Test Dump ---
 if __name__ == "__main__":
-    iterator = TorusIterator(device='cuda')
-    os.makedirs("torus_native_samples", exist_ok=True)
-    
-    configs = [(16, 16), (32, 16), (256, 4)]
-    
-    for res, bs in configs:
-        print(f"Rendering {res}x{res}...")
-        batch = iterator.generate_batch(bs, res)
-        
-        # Save Grid
-        batch_np = batch.permute(0, 2, 3, 1).cpu().numpy()
-        rows = int(math.sqrt(bs)); cols = math.ceil(bs/rows)
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*2, rows*2))
-        for i, ax in enumerate(axes.flat):
-            if i < bs:
-                ax.imshow(batch_np[i])
-            ax.axis('off')
-        plt.tight_layout()
-        plt.savefig(f"torus_native_samples/native_{res}px.png", dpi=150)
-        plt.close()
+    # Self-test if run directly
+    import matplotlib.pyplot as plt
+    iterator = TorusIterator(device='cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs("torus_test", exist_ok=True)
+    img = iterator.generate_batch(16, 64)
+    # Save a grid
+    grid = img.permute(0, 2, 3, 1).cpu().numpy()
+    fig, axes = plt.subplots(4, 4, figsize=(8, 8))
+    for i, ax in enumerate(axes.flat):
+        ax.imshow(grid[i])
+        ax.axis('off')
+    plt.savefig("torus_test/test_grid.png")
+    print("Test grid saved to torus_test/test_grid.png")
