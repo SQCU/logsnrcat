@@ -4,12 +4,14 @@
 This project uses `uv` for fast and reliable dependency management.
 
 1.  **Install `uv`**:
+
     If you don't have `uv` installed, follow the official instructions. For most systems:
     ```bash
     curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
 2.  **Create a Virtual Environment**:
+
     From the project's root directory, create and activate a virtual environment:
     ```bash
     # Create the virtual environment in a .venv folder
@@ -22,9 +24,11 @@ This project uses `uv` for fast and reliable dependency management.
     ```
 
 3.  **Dependency solve that thang!**:
+
     `uv sync --extra cuda`
 
 4.  **run it!**:
+
     ~~`python bench_v_pred.py`~~
     better logging, less interactive repl:
     `python bench_multires_cl.py`
@@ -39,6 +43,7 @@ This project uses `uv` for fast and reliable dependency management.
     test marginal benefit of different flops assignments
 
 5. **why low resolution checkerboards?**
+
     technically speaking this project is testing 2 hard things:
 
     1: generating data without supervisory signals like a perceptual or GAN loss or conditioning models
@@ -51,6 +56,7 @@ This project uses `uv` for fast and reliable dependency management.
     generalization of the frechet distance over parameter-free metrics to spatial correlation and parallelism/contiguity of color regions is left as an exercise to whoever forks the project next.
 
 6. **wait so does all of the stuff in this repo work?**
+
     hell yeah it does!
 
     even the weird torch kernel compilation interceptor server-client pair. i dont recommend using it (easy 2 comment out) but i don't recommend *not* using it either.
