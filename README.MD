@@ -38,7 +38,7 @@ This project uses `uv` for fast and reliable dependency management.
     `python bench_backbone_hit_that_griddy.py`
     test marginal benefit of different flops assignments
 
-5: **why low resolution checkerboards?**
+5. **why low resolution checkerboards?**
     technically speaking this project is testing 2 hard things:
 
     1: generating data without supervisory signals like a perceptual or GAN loss or conditioning models
@@ -49,3 +49,8 @@ This project uses `uv` for fast and reliable dependency management.
 
     you can, and should, calculate the frechet distance of the color histograms found in your output samples vs the color histograms in your generated training samples!
     generalization of the frechet distance over parameter-free metrics to spatial correlation and parallelism/contiguity of color regions is left as an exercise to whoever forks the project next.
+
+6. **wait so does all of the stuff in this repo work?**
+    hell yeah it does!
+
+    even the weird torch kernel compilation interceptor server-client pair. i dont recommend using it (easy 2 comment out) but i don't recommend *not* using it either.
