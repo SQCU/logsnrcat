@@ -22,6 +22,8 @@ This project uses `uv` for fast and reliable dependency management.
     # On Windows (Powershell):
     # .venv\Scripts\Activate.ps1
     ```
+    .venv\Scripts\deactivate
+
 
 3.  **Dependency solve that thang!**:
 
@@ -45,7 +47,7 @@ This project uses `uv` for fast and reliable dependency management.
     for crimes against torch
 
     `python bench_backbone_hit_that_griddy.py`
-    
+
     test marginal benefit of different flops assignments
 
 5. **why low resolution checkerboards?**
