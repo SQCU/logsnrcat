@@ -251,7 +251,8 @@ if __name__ == "__main__":
 
     # --- Configuration ---
     # Define resolutions and batch sizes here
-    BUCKETS = [(16, 256), (32, 64), (64, 16)] 
+    #BUCKETS = [(16, 256), (32, 64), (64, 16)] 
+    BUCKETS = [(32, 64), (64, 16)] 
     STEPS = 4000
     DEPTH = 4
     EMBED_DIM = 256
