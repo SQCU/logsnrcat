@@ -14,7 +14,6 @@ import sys
 from pathlib import Path
 
 from diffusion_utils import get_schedule, get_alpha_sigma, BucketManager
-# NEW: Import CompositeIterator
 from dataset import CompositeIterator
 from model import HybridGemmaDiT
 
@@ -51,7 +50,9 @@ def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     fig, axes = plt.subplots(len(resolutions), samples_per_res, 
                             figsize=(samples_per_res * 1.5, len(resolutions) * 1.8))
     
-    if len(resolutions) == 1: axes = axes.reshape(1, -1)
+    # Handle single resolution case (axes is 1D)
+    if len(resolutions) == 1: 
+        axes = axes.reshape(1, -1)
     
     for row_idx, res in enumerate(resolutions):
         # Generate batch
@@ -77,9 +78,13 @@ def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     plt.tight_layout()
     return fig
 
-def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
+def train_multires(mode, buckets, steps=1000, embed_dim=256, depth=12, logger=None):
+    """
+    Generalized training loop accepting dynamic buckets.
+    """
     device = torch.device('cuda')
     print(f"\n--- Training: {mode.upper()} ---")
+    print(f"    Buckets (Res, Batch): {buckets}")
     
     model = HybridGemmaDiT(mode, embed_dim=embed_dim, depth=depth).to(device)
     model = torch.compile(model)
@@ -87,17 +92,11 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
     # Standard Params
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
     
-    # NEW: Configure Composite Dataset
-    mix_config = {
-        'checkerboard': 0.5,
-        'torus': 0.5
-    }
+    # Configure Composite Dataset
+    mix_config = {'checkerboard': 0.5, 'torus': 0.5}
     iterator = CompositeIterator(device, config=mix_config)
-    print(f"    Dataset Mix: {mix_config}")
     
-    buckets = [(16, 256), (32, 64)]
     manager = BucketManager(buckets)
-    
     history = []
     
     pbar = tqdm(range(steps), desc=f"{mode}")
@@ -127,7 +126,6 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
             v_pred = raw
             
         # Detailed Loss Calculation
-        # Compute elementwise to separate by class
         loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
         total_loss = loss_elem.mean()
         
@@ -143,7 +141,7 @@ def train_multires(mode, steps=1000, embed_dim=256, depth=12, logger=None):
             if mask.any():
                 step_stats[f'loss_{name}'] = loss_elem[mask].mean().item()
             else:
-                step_stats[f'loss_{name}'] = None # Should handle NaN in plots
+                step_stats[f'loss_{name}'] = None 
                 
         history.append(step_stats)
         
@@ -176,19 +174,23 @@ def sample_viz(model, res, num_samples=8):
 
 def plot_detailed_loss(df_naive, df_fact, logger):
     """
-    Generates a 2x2 grid.
-    Rows: Resolution (16, 32)
-    Cols: Dataset Type (Checkerboard, Torus)
+    Generates a grid dynamically based on resolutions found in history.
+    Rows: Resolution
+    Cols: Dataset Type
     """
-    # Clean data (interpolating NaNs if batches were pure one type)
     df_naive = df_naive.interpolate()
     df_fact = df_fact.interpolate()
     
     resolutions = sorted(df_naive['res'].unique())
     datasets = ['checkerboard', 'torus']
     
-    fig, axes = plt.subplots(len(resolutions), len(datasets), figsize=(12, 8))
+    fig, axes = plt.subplots(len(resolutions), len(datasets), 
+                            figsize=(12, 4 * len(resolutions)))
     
+    # Handle single resolution case (axes is 1D)
+    if len(resolutions) == 1: 
+        axes = axes.reshape(1, -1)
+        
     for r_idx, res in enumerate(resolutions):
         n_res = df_naive[df_naive['res'] == res]
         f_res = df_fact[df_fact['res'] == res]
@@ -197,7 +199,6 @@ def plot_detailed_loss(df_naive, df_fact, logger):
             ax = axes[r_idx, d_idx]
             col_name = f'loss_{dtype}'
             
-            # Smoothing for cleaner plots
             roll_win = 20
             
             if col_name in n_res.columns:
@@ -217,16 +218,28 @@ def plot_detailed_loss(df_naive, df_fact, logger):
     plt.tight_layout()
     logger.save_figure(fig, "loss_breakdown_res_vs_type")
 
-def plot_sample_grid(n16, n32, f16, f32, logger):
-    fig, axes = plt.subplots(4, 8, figsize=(16, 9))
-    rows = [("Naive 16px", n16), ("Fact 16px", f16), 
-            ("Naive 32px", n32), ("Fact 32px", f32)]
+def plot_sample_grid(samples_list, logger):
+    """
+    Dynamically plots a list of sample batches.
+    Args:
+        samples_list: List of tuples (Title, TensorBatch)
+    """
+    num_rows = len(samples_list)
+    cols = 8 # Fixed sample count per batch
     
-    for r, (name, batch) in enumerate(rows):
-        for c in range(8):
-            axes[r, c].imshow(batch[c].permute(1,2,0))
+    fig, axes = plt.subplots(num_rows, cols, figsize=(cols * 2, num_rows * 2))
+    
+    # Handle single row case
+    if num_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    for r, (name, batch) in enumerate(samples_list):
+        for c in range(cols):
+            if c < batch.shape[0]:
+                axes[r, c].imshow(batch[c].permute(1,2,0).cpu().numpy())
             axes[r, c].axis('off')
-            if c == 0: axes[r, c].set_title(name, fontsize=10, loc='left')
+            if c == 0: 
+                axes[r, c].set_title(name, fontsize=10, loc='left')
             
     plt.suptitle("Unconditional Generation (Mixed Distribution)", fontsize=16)
     plt.tight_layout()
@@ -235,26 +248,49 @@ def plot_sample_grid(n16, n32, f16, f32, logger):
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
     logger = ExperimentLogger(output_dir="./experiments_mix")
+
+    # --- Configuration ---
+    # Define resolutions and batch sizes here
+    BUCKETS = [(16, 256), (32, 64), (64, 16)] 
+    STEPS = 4000
+    DEPTH = 4
+    EMBED_DIM = 256
+    
+    # Extract resolutions list for convenience
+    RESOLUTIONS = [res for (res, bs) in BUCKETS]
     
     # 1. Verify Data Mix
     print("\n📸 Verifying Composite Data...")
     iterator = CompositeIterator(device='cuda', config={'checkerboard': 0.5, 'torus': 0.5})
-    fig_data = visualize_dataset_samples(iterator, [16, 32])
+    fig_data = visualize_dataset_samples(iterator, RESOLUTIONS)
     logger.save_figure(fig_data, "dataset_mix_verification")
     
-    # 2. Train
-    # Reduced steps for demo, increase for real bench
-    steps = 4000 
-    df_n, mod_n = train_multires('naive', steps=steps, depth=4, logger=logger)
-    df_f, mod_f = train_multires('factorized', steps=steps, depth=4, logger=logger)
+    # 2. Train Models
+    df_n, mod_n = train_multires('naive', buckets=BUCKETS, steps=STEPS, 
+                                 depth=DEPTH, embed_dim=EMBED_DIM, logger=logger)
+    df_f, mod_f = train_multires('factorized', buckets=BUCKETS, steps=STEPS, 
+                                 depth=DEPTH, embed_dim=EMBED_DIM, logger=logger)
     
-    # 3. Analyze
+    # 3. Analyze Losses
     print("\n📈 Plotting breakdown...")
     plot_detailed_loss(df_n, df_f, logger)
     
+    # 4. Generate and Plot Samples Dynamically
     print("\n🎨 Sampling...")
-    n16 = sample_viz(mod_n, 16); n32 = sample_viz(mod_n, 32)
-    f16 = sample_viz(mod_f, 16); f32 = sample_viz(mod_f, 32)
     
-    plot_sample_grid(n16, n32, f16, f32, logger)
+    # Collect all samples in a list of tuples: [("Naive 16px", img), ("Fact 16px", img), ...]
+    samples_to_plot = []
+    
+    for res in RESOLUTIONS:
+        # Generate samples for this resolution
+        s_n = sample_viz(mod_n, res)
+        s_f = sample_viz(mod_f, res)
+        
+        # Append to plot list
+        samples_to_plot.append((f"Naive {res}px", s_n))
+        samples_to_plot.append((f"Fact {res}px", s_f))
+    
+    # Plot everything
+    plot_sample_grid(samples_to_plot, logger)
+    
     print(f"\n✅ Done. Check {logger.run_dir}")
