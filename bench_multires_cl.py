@@ -234,7 +234,7 @@ def plot_detailed_loss(df_naive, df_fact, logger):
     plt.tight_layout()
     logger.save_figure(fig, "loss_breakdown_res_vs_type")
 
-def plot_sample_grid(samples_list, logger):
+def plot_sample_grid(samples_list, logger, string="final_samples"):
     """
     Dynamically plots a list of sample batches.
     Args:
@@ -259,7 +259,7 @@ def plot_sample_grid(samples_list, logger):
             
     plt.suptitle("Unconditional Generation (Mixed Distribution)", fontsize=16)
     plt.tight_layout()
-    logger.save_figure(fig, "final_samples")
+    logger.save_figure(fig, string)
 
 def logsnr_to_alpha_sigma(logsnr):
     """Convert log(SNR) to (alpha, sigma) for noise schedule."""
@@ -407,7 +407,7 @@ def distill_multires(model, mode, buckets, steps=1000, embed_dim=256, logger=Non
     history = []
     
     # Enable fp16 autocast for memory efficiency
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     
     pbar = tqdm(range(steps), desc=f"distill-{mode}")
     for i in pbar:
@@ -596,7 +596,7 @@ if __name__ == "__main__":
         samples_to_plot.append((f"Fact {res}px", s_f))
     
     # Plot everything
-    plot_sample_grid(samples_to_plot, logger)
+    plot_sample_grid(samples_to_plot, logger, "unsupervised_samples")
     
     # ========================================
     # 5. DISTILLATION PHASE (NEW)
@@ -626,21 +626,21 @@ if __name__ == "__main__":
         samples_after.append((f"Naive {res}px", s_n))
         samples_after.append((f"Fact {res}px", s_f))
     
-    plot_sample_grid(samples_after, logger)
+    plot_sample_grid(samples_after, logger, "self_supervised_samples")
     
     # 8. COMPARISON PLOT (Before vs After)
     print("\n🔬 Generating before/after comparison...")
     
     # Reload pre-distillation samples for side-by-side
-    # (Already stored in samples_before)
+    # (Already stored in samples_to_plot)
     
     comparison_samples = []
-    for i, (name, batch) in enumerate(samples_before):
+    for i, (name, batch) in enumerate(samples_to_plot):
         comparison_samples.append((f"{name} (Before)", batch))
         comparison_samples.append((f"{samples_after[i][0]} (After)", samples_after[i][1]))
     
     # Create comparison grid
-    fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
+    fig_compare = plot_comparison_grid(samples_to_plot, samples_after, RESOLUTIONS)
     logger.save_figure(fig_compare, "before_after_comparison")
     
     print(f"\n✅ Done. Check {logger.run_dir}")
