@@ -1,0 +1,79 @@
+
+import triton
+import triton.language as tl
+
+from torch._inductor.runtime import triton_helpers, triton_heuristics
+from torch._inductor.runtime.triton_helpers import libdevice, math as tl_math
+from torch._inductor.runtime.hints import AutotuneHint, ReductionHint, TileHint, DeviceProperties
+triton_helpers.set_driver_to_gpu()
+
+@triton_heuristics.persistent_reduction(
+    size_hints={'x': 16384, 'r0_': 256},
+    reduction_hint=ReductionHint.INNER,
+    filename=__file__,
+    triton_meta={'signature': {'in_out_ptr0': '*fp32', 'in_out_ptr1': '*fp32', 'in_out_ptr2': '*fp32', 'in_ptr0': '*fp32', 'in_ptr1': '*fp32', 'in_ptr2': '*fp32', 'in_ptr3': '*fp32', 'in_ptr4': '*fp32', 'in_ptr5': '*fp32', 'out_ptr0': '*fp32', 'out_ptr1': '*fp32', 'xnumel': 'i32', 'r0_numel': 'i32', 'XBLOCK': 'constexpr'}, 'device': DeviceProperties(type='cuda', index=0, multi_processor_count=128, cc=89, major=8, regs_per_multiprocessor=65536, max_threads_per_multi_processor=1536, warp_size=32), 'constants': {}, 'configs': [{(0,): [['tt.divisibility', 16]], (1,): [['tt.divisibility', 16]], (2,): [['tt.divisibility', 16]], (3,): [['tt.divisibility', 16]], (4,): [['tt.divisibility', 16]], (5,): [['tt.divisibility', 16]], (6,): [['tt.divisibility', 16]], (7,): [['tt.divisibility', 16]], (8,): [['tt.divisibility', 16]], (9,): [['tt.divisibility', 16]], (10,): [['tt.divisibility', 16]], (11,): [['tt.divisibility', 16]], (12,): [['tt.divisibility', 16]]}]},
+    inductor_meta={'grid_type': 'Grid1D', 'autotune_hints': set(), 'kernel_name': 'triton_per_fused__unsafe_view_add_mean_mul_native_layer_norm_pow_rsqrt_sigmoid_view_55', 'mutated_arg_names': ['in_out_ptr0', 'in_out_ptr1', 'in_out_ptr2'], 'optimize_mem': False, 'no_x_dim': None, 'num_load': 7, 'num_reduction': 5, 'backend_hash': '19838AED018D8011B66C11B0225D309931656BCD5997815B2E573DBF03530A55', 'are_deterministic_algorithms_enabled': False, 'assert_indirect_indexing': True, 'autotune_local_cache': True, 'autotune_pointwise': True, 'autotune_remote_cache': None, 'force_disable_caches': False, 'dynamic_scale_rblock': True, 'max_autotune': False, 'max_autotune_pointwise': False, 'min_split_scan_rblock': 256, 'spill_threshold': 16, 'store_cubin': False, 'tiling_scores': {'x': 393216, 'r0_': 150996992}}
+)
+@triton.jit
+def triton_per_fused__unsafe_view_add_mean_mul_native_layer_norm_pow_rsqrt_sigmoid_view_55(in_out_ptr0, in_out_ptr1, in_out_ptr2, in_ptr0, in_ptr1, in_ptr2, in_ptr3, in_ptr4, in_ptr5, out_ptr0, out_ptr1, xnumel, r0_numel, XBLOCK : tl.constexpr):
+    xnumel = 16384
+    r0_numel = 256
+    R0_BLOCK: tl.constexpr = 256
+    rnumel = r0_numel
+    RBLOCK: tl.constexpr = R0_BLOCK
+    xoffset = tl.program_id(0) * XBLOCK
+    xindex = xoffset + tl.arange(0, XBLOCK)[:, None]
+    xmask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+    r0_index = tl.arange(0, R0_BLOCK)[None, :]
+    r0_offset = 0
+    r0_mask = tl.full([XBLOCK, R0_BLOCK], True, tl.int1)
+    roffset = r0_offset
+    rindex = r0_index
+    r0_1 = r0_index
+    x0 = xindex
+    tmp0 = tl.load(in_out_ptr0 + (r0_1 + 256*x0), None)
+    tmp1 = tl.load(in_ptr0 + (r0_1 + 256*x0), None)
+    tmp3 = tl.load(in_ptr1 + (r0_1 + 256*x0), None)
+    tmp4 = tl.load(in_ptr2 + (r0_1 + 256*x0), None)
+    tmp8 = tl.load(in_ptr3 + (r0_1 + 256*x0), None)
+    tmp39 = tl.load(in_ptr4 + (r0_1), None, eviction_policy='evict_last')
+    tmp41 = tl.load(in_ptr5 + (r0_1), None, eviction_policy='evict_last')
+    tmp2 = tmp0 + tmp1
+    tmp5 = tl.sigmoid(tmp4)
+    tmp6 = tmp3 * tmp5
+    tmp7 = tmp2 + tmp6
+    tmp9 = tmp7 + tmp8
+    tmp10 = tmp9 * tmp9
+    tmp11 = tl.broadcast_to(tmp10, [XBLOCK, R0_BLOCK])
+    tmp13 = tl.sum(tmp11, 1)[:, None].to(tl.float32)
+    tmp14 = 256.0
+    tmp15 = (tmp13 / tmp14)
+    tmp16 = 1.1920928955078125e-07
+    tmp17 = tmp15 + tmp16
+    tmp18 = libdevice.rsqrt(tmp17)
+    tmp19 = tmp9 * tmp18
+    tmp20 = tl.broadcast_to(tmp19, [XBLOCK, R0_BLOCK])
+    tmp22 = tl.broadcast_to(tmp20, [XBLOCK, R0_BLOCK])
+    tmp24 = tl.sum(tmp22, 1)[:, None].to(tl.float32)
+    tmp25 = tl.full([XBLOCK, 1], 256, tl.int32)
+    tmp26 = tmp25.to(tl.float32)
+    tmp27 = (tmp24 / tmp26)
+    tmp28 = tmp20 - tmp27
+    tmp29 = tmp28 * tmp28
+    tmp30 = tl.broadcast_to(tmp29, [XBLOCK, R0_BLOCK])
+    tmp32 = tl.sum(tmp30, 1)[:, None].to(tl.float32)
+    tmp33 = (tmp32 / tmp14)
+    tmp34 = 1e-05
+    tmp35 = tmp33 + tmp34
+    tmp36 = libdevice.rsqrt(tmp35)
+    tmp37 = tmp19 - tmp27
+    tmp38 = tmp37 * tmp36
+    tmp40 = tmp38 * tmp39
+    tmp42 = tmp40 + tmp41
+    tl.debug_barrier()
+    tl.store(in_out_ptr1 + (x0), tmp18, None)
+    tl.store(in_out_ptr0 + (r0_1 + 256*x0), tmp19, None)
+    tl.debug_barrier()
+    tl.store(in_out_ptr2 + (x0), tmp36, None)
+    tl.store(out_ptr1 + (r0_1 + 256*x0), tmp42, None)
+    tl.store(out_ptr0 + (x0), tmp27, None)

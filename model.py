@@ -98,7 +98,8 @@ class MultiSpanAllocator(nn.Module):
         self._last_radius_sq = -1.0
         self._last_spans_sig = None
         self._last_total_len = 0
-        
+
+    @torch.compiler.disable
     def update_buffers(self, spans):
         """
         Updates buffers only if the span topology (metadata) has changed.
@@ -175,6 +176,7 @@ class MultiSpanAllocator(nn.Module):
         scale = total_len / self.base_ref_len
         return GeometryState(rope_pos, None, None, total_len, scale, self.inv_freq)
 
+    @torch.compiler.disable
     def get_mask(self, total_len, radius=2.5):
         # 1. Check Radius Cache (Pure Python check = No Graph Break)
         target_radius_sq = float(radius) ** 2
@@ -205,6 +207,7 @@ class MultiSpanAllocator(nn.Module):
 
         return create_block_mask(mask_mod, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len)
 
+    @torch.compiler.disable
     def get_global_mask(self, total_len):
         # Logic remains the same, relies on buffers updated by compute_geometry
         def mask_mod(b, h, q_idx, kv_idx):

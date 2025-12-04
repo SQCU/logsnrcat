@@ -1,4 +1,6 @@
 # bench_multires_cl.py
+#import os
+#os.environ["TORCHINDUCTOR_CACHE_DIR"] = "./.inductor_cache"
 import inductor_cas_client
 # Hook the ZMQ compiler backend immediately
 inductor_cas_client.install_cas_client() 
@@ -88,6 +90,39 @@ def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     plt.tight_layout()
     return fig
 
+def warmup_model(model, buckets):
+    print("🔥 Warming up compilation cache...")
+    # 1. Warmup Training Graph
+    model.train()
+    for res, bs in buckets:
+        print(f"   ...compiling train graph for {res}px")
+        # Create dummy inputs
+        z = torch.randn(bs, 3, res, res, device='cuda')
+        t = torch.rand(bs, device='cuda')
+        logsnr = get_schedule(t)
+        spans = get_image_spans(res)
+        
+        # Run one step (Forward + Backward)
+        opt = torch.optim.AdamW(model.parameters())
+        opt.zero_grad()
+        out, _, _ = model(z, logsnr, spans)
+        loss = out.mean()
+        loss.backward()
+        opt.step()
+        opt.zero_grad() # cleanup
+
+    # 2. Warmup Inference Graph
+    model.eval()
+    with torch.no_grad():
+        for res, _ in buckets: # BS doesn't strictly matter for shape generalization usually
+            print(f"   ...compiling inference graph for {res}px")
+            z = torch.randn(2, 3, res, res, device='cuda') # Small batch
+            logsnr = get_schedule(torch.rand(2, device='cuda'))
+            spans = get_image_spans(res)
+            model(z, logsnr, spans)
+    model.train()
+    print("✅ Warmup complete. No more stalls expected.")
+
 def train_multires(mode, buckets, steps=1000, embed_dim=256, depth=12, logger=None):
     """
     Generalized training loop accepting dynamic buckets.
@@ -97,7 +132,9 @@ def train_multires(mode, buckets, steps=1000, embed_dim=256, depth=12, logger=No
     print(f"    Buckets (Res, Batch): {buckets}")
     
     model = HybridGemmaDiT(mode, embed_dim=embed_dim, depth=depth).to(device)
-    model = torch.compile(model)
+    #model = torch.compile(model, dynamic=True)
+    model = torch.compile(model, dynamic=True)
+    warmup_model(model, buckets)
         
     # Standard Params
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
@@ -395,7 +432,6 @@ def distill_multires(model, mode, buckets, steps=1000, embed_dim=256, logger=Non
     
     # Use lower LR for fine-tuning
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-    model = torch.compile(model)
     # Reduce batch sizes by half for memory headroom
     buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
     
