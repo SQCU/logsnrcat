@@ -261,6 +261,293 @@ def plot_sample_grid(samples_list, logger):
     plt.tight_layout()
     logger.save_figure(fig, "final_samples")
 
+def logsnr_to_alpha_sigma(logsnr):
+    """Convert log(SNR) to (alpha, sigma) for noise schedule."""
+    # logsnr = log(alpha^2 / sigma^2)
+    # SNR = alpha^2 / sigma^2
+    snr = torch.exp(logsnr)
+    # alpha^2 = SNR / (1 + SNR), sigma^2 = 1 / (1 + SNR)
+    alpha_sq = snr / (1.0 + snr)
+    sigma_sq = 1.0 / (1.0 + snr)
+    return torch.sqrt(alpha_sq), torch.sqrt(sigma_sq)
+
+def sample_logsnr_triplet(batch_size, device, min_logsnr=-10.0, max_logsnr=0.0, min_gap=1.0):
+    """
+    Sample three noise levels at least min_gap apart.
+    Returns: (logsnr_low, logsnr_mid, logsnr_high) where low > mid > high
+    """
+    # Sample lowest (least noisy, highest logsnr)
+    logsnr_low = torch.rand(batch_size, device=device) * (max_logsnr - min_logsnr) + min_logsnr
+    
+    # Sample mid: 1-4 logsnr units below low
+    gap_mid = torch.rand(batch_size, device=device) * 3.0 + min_gap
+    logsnr_mid = (logsnr_low - gap_mid).clamp(min=min_logsnr)
+    
+    # Sample high: 1-4 logsnr units below mid
+    gap_high = torch.rand(batch_size, device=device) * 3.0 + min_gap
+    logsnr_high = (logsnr_mid - gap_high).clamp(min=min_logsnr)
+    
+    return logsnr_low, logsnr_mid, logsnr_high
+
+def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
+    """
+    Take one deterministic reverse diffusion step using v-prediction.
+    
+    Args:
+        z_t: Current noisy latent [B, C, H, W]
+        v_pred: Model's v-prediction [B, C, H, W]
+        logsnr_from: Current log(SNR) [B]
+        logsnr_to: Target log(SNR) [B]
+    
+    Returns:
+        z_to: Denoised latent at target noise level [B, C, H, W]
+    """
+    alpha_from, sigma_from = logsnr_to_alpha_sigma(logsnr_from)
+    alpha_to, sigma_to = logsnr_to_alpha_sigma(logsnr_to)
+    
+    # v-prediction: v = alpha * eps - sigma * x0
+    # Solve for x0: x0 = (alpha * z_t - sigma * v) / (alpha^2 + sigma^2)
+    # But alpha^2 + sigma^2 = 1, so:
+    x0_pred = alpha_from.view(-1,1,1,1) * z_t - sigma_from.view(-1,1,1,1) * v_pred
+    
+    # eps prediction: eps = (sigma * z_t + alpha * v) / (alpha^2 + sigma^2) = sigma * z_t + alpha * v
+    eps_pred = sigma_from.view(-1,1,1,1) * z_t + alpha_from.view(-1,1,1,1) * v_pred
+    
+    # DDIM step (deterministic): z_to = alpha_to * x0_pred + sigma_to * eps_pred
+    z_to = alpha_to.view(-1,1,1,1) * x0_pred + sigma_to.view(-1,1,1,1) * eps_pred
+    
+    return z_to
+
+def compute_consistency_loss(model, x0, spans, mode='factorized', 
+                            min_logsnr=-10.0, max_logsnr=0.0):
+    """
+    Compute trajectory consistency loss.
+    
+    Strategy:
+    1. Sample triplet (logsnr_low, logsnr_mid, logsnr_high)
+    2. Add noise to x0 at logsnr_low (most noisy in this triplet)
+    3. Generate 1-step trajectory: low → high
+    4. Generate 2-step trajectory: low → mid → high
+    5. Minimize ||z_high_1step - z_high_2step||
+    6. Also minimize ||z_mid_1step - z_mid_2step|| (optional, for stability)
+    """
+    device = x0.device
+    batch_size = x0.shape[0]
+    
+    # Sample noise levels
+    logsnr_low, logsnr_mid, logsnr_high = sample_logsnr_triplet(
+        batch_size, device, min_logsnr, max_logsnr
+    )
+    
+    # Add noise at logsnr_low
+    alpha_low, sigma_low = logsnr_to_alpha_sigma(logsnr_low)
+    eps = torch.randn_like(x0)
+    z_low = alpha_low.view(-1,1,1,1) * x0 + sigma_low.view(-1,1,1,1) * eps
+    
+    # === 1-STEP TRAJECTORY: low → high ===
+    raw_low, l_pred_low, _ = model(z_low, logsnr_low, spans)
+    
+    if mode == 'factorized':
+        sigma_p_low = torch.sqrt(torch.sigmoid(-l_pred_low)).view(-1,1,1,1)
+        v_pred_low = raw_low * sigma_p_low
+    else:
+        v_pred_low = raw_low
+    
+    # Step to high (no grad needed for this trajectory)
+    with torch.no_grad():
+        z_high_1step = euler_reverse_step(z_low, v_pred_low, logsnr_low, logsnr_high)
+    
+    # === 2-STEP TRAJECTORY: low → mid → high ===
+    # Step 1: low → mid (requires grad for mid prediction)
+    z_mid_2step = euler_reverse_step(z_low, v_pred_low, logsnr_low, logsnr_mid)
+    
+    # Step 2: mid → high (this is where we need gradients)
+    raw_mid, l_pred_mid, _ = model(z_mid_2step, logsnr_mid, spans)
+    
+    if mode == 'factorized':
+        sigma_p_mid = torch.sqrt(torch.sigmoid(-l_pred_mid)).view(-1,1,1,1)
+        v_pred_mid = raw_mid * sigma_p_mid
+    else:
+        v_pred_mid = raw_mid
+    
+    z_high_2step = euler_reverse_step(z_mid_2step, v_pred_mid, logsnr_mid, logsnr_high)
+    
+    # === CONSISTENCY LOSSES ===
+    # Main loss: 1-step should match 2-step at high
+    loss_high = F.mse_loss(z_high_1step, z_high_2step)
+    
+    # Optional: Also match at mid (helps stability)
+    with torch.no_grad():
+        z_mid_1step = euler_reverse_step(z_low, v_pred_low, logsnr_low, logsnr_mid)
+    loss_mid = F.mse_loss(z_mid_1step, z_mid_2step)
+    
+    return loss_high + 0.5 * loss_mid
+
+def distill_multires(model, mode, buckets, steps=1000, embed_dim=256, logger=None):
+    """
+    Trajectory consistency distillation phase.
+    Runs AFTER initial denoising training.
+    """
+    device = torch.device('cuda')
+    print(f"\n--- Distilling: {mode.upper()} ---")
+    print(f"    Buckets (Res, Batch): {buckets}")
+    print(f"    ⚠️  Using fp16 + reduced batch size for memory")
+    
+    # Use lower LR for fine-tuning
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    
+    # Reduce batch sizes by half for memory headroom
+    buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
+    
+    # Configure dataset
+    mix_config = {'checkerboard': 0.5, 'torus': 0.5}
+    iterator = CompositeIterator(device, config=mix_config)
+    
+    manager = BucketManager(buckets_distill)
+    history = []
+    
+    # Enable fp16 autocast for memory efficiency
+    scaler = torch.cuda.amp.GradScaler()
+    
+    pbar = tqdm(range(steps), desc=f"distill-{mode}")
+    for i in pbar:
+        opt.zero_grad()
+        res, bs = manager.next_bucket()
+        
+        # Generate batch
+        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
+        labels = iterator.last_labels
+        
+        spans = get_image_spans(res)
+        
+        with torch.cuda.amp.autocast():
+            # Compute consistency loss (3 NFE per sample)
+            loss_consistency = compute_consistency_loss(
+                model, x0, spans, mode=mode,
+                min_logsnr=-10.0, max_logsnr=0.0
+            )
+            
+            # Optional: Add small denoising loss to prevent drift
+            # (Comment out if you want pure consistency training)
+            t = torch.rand(bs, device=device).clamp(0.001, 0.999)
+            logsnr = get_schedule(t)
+            alpha, sigma = get_alpha_sigma(logsnr)
+            
+            eps = torch.randn_like(x0)
+            z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
+            v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
+            
+            raw, l_pred, aux_loss = model(z_t, logsnr, spans)
+            
+            if mode == 'factorized':
+                sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1,1,1,1)
+                v_pred = raw * sigma_p
+            else:
+                v_pred = raw
+            
+            loss_denoise = F.mse_loss(v_pred, v_true)
+            
+            # Combined loss (consistency is primary, denoising prevents drift)
+            total_loss = loss_consistency + 0.1 * loss_denoise + aux_loss
+        
+        # Backward with gradient scaling
+        scaler.scale(total_loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        
+        # Logging
+        step_stats = {
+            'step': i, 
+            'res': res, 
+            'loss_consistency': loss_consistency.item(),
+            'loss_denoise': loss_denoise.item(),
+            'loss_total': total_loss.item()
+        }
+        history.append(step_stats)
+        
+        if i % 50 == 0:
+            pbar.set_postfix({
+                'cons': f'{loss_consistency.item():.4f}',
+                'den': f'{loss_denoise.item():.4f}',
+                'res': res
+            })
+    
+    return pd.DataFrame(history), model
+
+def plot_distillation_loss(df_naive, df_fact, logger):
+    """Plot consistency loss curves."""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    
+    # Consistency loss
+    ax = axes[0]
+    ax.plot(df_naive['step'], df_naive['loss_consistency'].rolling(20).mean(), 
+            label='Naive', color='tab:blue')
+    ax.plot(df_fact['step'], df_fact['loss_consistency'].rolling(20).mean(), 
+            label='Factorized', color='tab:orange')
+    ax.set_title("Trajectory Consistency Loss")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_yscale('log')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Denoising loss (for reference)
+    ax = axes[1]
+    ax.plot(df_naive['step'], df_naive['loss_denoise'].rolling(20).mean(), 
+            label='Naive', color='tab:blue', alpha=0.7)
+    ax.plot(df_fact['step'], df_fact['loss_denoise'].rolling(20).mean(), 
+            label='Factorized', color='tab:orange', alpha=0.7)
+    ax.set_title("Denoising Loss (Auxiliary)")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_yscale('log')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    logger.save_figure(fig, "distillation_loss")
+
+def plot_comparison_grid(samples_before, samples_after, resolutions):
+    """
+    Create a before/after comparison grid.
+    
+    Layout:
+    - Rows: [Naive 16px Before, Naive 16px After, Fact 16px Before, Fact 16px After, ...]
+    - Cols: 8 samples
+    """
+    num_rows = len(samples_before) + len(samples_after)  # Interleaved
+    cols = 8
+    
+    fig, axes = plt.subplots(num_rows, cols, figsize=(cols * 2, num_rows * 1.5))
+    
+    row_idx = 0
+    for i, (name_before, batch_before) in enumerate(samples_before):
+        name_after, batch_after = samples_after[i]
+        
+        # Plot "Before" row
+        for c in range(cols):
+            if c < batch_before.shape[0]:
+                axes[row_idx, c].imshow(batch_before[c].permute(1,2,0).cpu().numpy())
+            axes[row_idx, c].axis('off')
+            if c == 0:
+                axes[row_idx, c].set_title(f"{name_before}\n(Before)", 
+                                          fontsize=9, loc='left')
+        row_idx += 1
+        
+        # Plot "After" row
+        for c in range(cols):
+            if c < batch_after.shape[0]:
+                axes[row_idx, c].imshow(batch_after[c].permute(1,2,0).cpu().numpy())
+            axes[row_idx, c].axis('off')
+            if c == 0:
+                axes[row_idx, c].set_title(f"{name_after}\n(After)", 
+                                          fontsize=9, loc='left', color='green')
+        row_idx += 1
+    
+    plt.suptitle("Trajectory Consistency Distillation: Before vs After", fontsize=16)
+    plt.tight_layout()
+    return fig
+
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
     logger = ExperimentLogger(output_dir="./experiments_mix")
@@ -270,7 +557,8 @@ if __name__ == "__main__":
     #BUCKETS = [(16, 256), (32, 64), (64, 16)] 
     BUCKETS = [(16, 256), (32, 64)] 
     STEPS = 4000
-    DEPTH = 4
+    DISTILL_STEPS = 1000  # NEW: Distillation steps
+    DEPTH = 8
     EMBED_DIM = 256
     
     # Extract resolutions list for convenience
@@ -309,5 +597,50 @@ if __name__ == "__main__":
     
     # Plot everything
     plot_sample_grid(samples_to_plot, logger)
+    
+    # ========================================
+    # 5. DISTILLATION PHASE (NEW)
+    # ========================================
+    print("\n🔮 Phase 2: Trajectory Consistency Distillation")
+    
+    df_n_dist, mod_n = distill_multires(
+        mod_n, 'naive', buckets=BUCKETS, steps=DISTILL_STEPS, 
+        embed_dim=EMBED_DIM, logger=logger
+    )
+    
+    df_f_dist, mod_f = distill_multires(
+        mod_f, 'factorized', buckets=BUCKETS, steps=DISTILL_STEPS,
+        embed_dim=EMBED_DIM, logger=logger
+    )
+    
+    # 6. Plot Distillation Losses
+    print("\n📈 Plotting distillation losses...")
+    plot_distillation_loss(df_n_dist, df_f_dist, logger)
+    
+    # 7. Sample AFTER Distillation
+    print("\n🎨 Sampling (After Distillation)...")
+    samples_after = []
+    for res in RESOLUTIONS:
+        s_n = sample_viz(mod_n, res)
+        s_f = sample_viz(mod_f, res)
+        samples_after.append((f"Naive {res}px", s_n))
+        samples_after.append((f"Fact {res}px", s_f))
+    
+    plot_sample_grid(samples_after, logger)
+    
+    # 8. COMPARISON PLOT (Before vs After)
+    print("\n🔬 Generating before/after comparison...")
+    
+    # Reload pre-distillation samples for side-by-side
+    # (Already stored in samples_before)
+    
+    comparison_samples = []
+    for i, (name, batch) in enumerate(samples_before):
+        comparison_samples.append((f"{name} (Before)", batch))
+        comparison_samples.append((f"{samples_after[i][0]} (After)", samples_after[i][1]))
+    
+    # Create comparison grid
+    fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
+    logger.save_figure(fig_compare, "before_after_comparison")
     
     print(f"\n✅ Done. Check {logger.run_dir}")
