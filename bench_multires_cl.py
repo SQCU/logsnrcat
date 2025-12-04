@@ -395,7 +395,7 @@ def distill_multires(model, mode, buckets, steps=1000, embed_dim=256, logger=Non
     
     # Use lower LR for fine-tuning
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-    
+    model = torch.compile(model)
     # Reduce batch sizes by half for memory headroom
     buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
     
