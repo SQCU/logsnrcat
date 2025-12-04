@@ -420,7 +420,7 @@ def distill_multires(model, mode, buckets, steps=1000, embed_dim=256, logger=Non
         
         spans = get_image_spans(res)
         
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             # Compute consistency loss (3 NFE per sample)
             loss_consistency = compute_consistency_loss(
                 model, x0, spans, mode=mode,
@@ -558,7 +558,7 @@ if __name__ == "__main__":
     BUCKETS = [(16, 256), (32, 64)] 
     STEPS = 4000
     DISTILL_STEPS = 1000  # NEW: Distillation steps
-    DEPTH = 8
+    DEPTH = 4
     EMBED_DIM = 256
     
     # Extract resolutions list for convenience

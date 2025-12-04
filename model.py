@@ -92,43 +92,69 @@ class MultiSpanAllocator(nn.Module):
         self.register_buffer('shared_is_causal', torch.zeros(max_tokens, dtype=torch.bool, device=device))
         # ADD THIS: Buffer for radius_sq so mask_mod can capture it
         self.register_buffer('current_radius_sq', torch.tensor(6.25, device=device))  # default: 2.5^2
-
+        
+        # --- CACHE STATE (Python-side) ---
+        # We use these to track state without inspecting Tensors (avoids Graph Breaks)
+        self._last_radius_sq = -1.0
+        self._last_spans_sig = None
+        self._last_total_len = 0
+        
     def update_buffers(self, spans):
         """
-        Updates the internal buffers with the new span topology.
-        This runs in standard eager mode before the compiled block, or is traced as tensor updates.
+        Updates buffers only if the span topology (metadata) has changed.
+        Uses a Python signature check to avoid Graph Breaks and Autograd errors.
         """
+        # 1. Generate a signature for the current spans
+        # Tuple of (length, causality, shape_tuple)
+        sig = []
+        for s in spans:
+            shape_sig = tuple(s['shape']) if 'shape' in s else None
+            sig.append((s['len'], s.get('causal', True), shape_sig))
+        sig = tuple(sig)
+
+        # 2. Check cache (Pure Python check = No Graph Break)
+        if sig == self._last_spans_sig:
+            return self._last_total_len
+
+        # 3. If changed, regenerate tensors and update buffers
         device = self.inv_freq.device
         ptr = 0
         total_len = 0
         
-        # We build temporary lists/tensors then copy to buffer
-        # This update is "stateful" but necessary for flex_attention capture
+        # Create temp tensors
+        target_span_ids = torch.zeros_like(self.shared_span_ids)
+        target_is_causal = torch.zeros_like(self.shared_is_causal)
+        target_coords = torch.zeros_like(self.shared_coords)
+        
         for i, span in enumerate(spans):
             length = span['len']
             total_len += length
             if ptr + length > self.max_tokens:
                 raise ValueError(f"Sequence length {ptr+length} exceeds buffer size {self.max_tokens}")
                 
-            # Update Span IDs
-            self.shared_span_ids[ptr:ptr+length] = i
+            # Span IDs
+            target_span_ids[ptr:ptr+length] = i
             
             if span.get('causal', True):
-                self.shared_is_causal[ptr:ptr+length] = True
-                # For text, spatial coords are 0 (or just linear 1D map)
-                self.shared_coords[ptr:ptr+length, :] = 0.0
+                target_is_causal[ptr:ptr+length] = True
             else:
-                self.shared_is_causal[ptr:ptr+length] = False
-                # Handle Geometry
+                target_is_causal[ptr:ptr+length] = False
                 if 'shape' in span:
-                    # Generate coords on fly
-                    # Note: We do this computation every step. In a real efficient rig, 
-                    # we would cache these patterns.
                     coords = self._generate_grid(span['shape'], device)
                     D = min(coords.shape[1], self.max_spatial_dims)
-                    self.shared_coords[ptr:ptr+length, :D] = coords[:, :D]
-                    
+                    target_coords[ptr:ptr+length, :D] = coords[:, :D]
+            
             ptr += length
+
+        # Update Buffers
+        self.shared_span_ids.copy_(target_span_ids)
+        self.shared_is_causal.copy_(target_is_causal)
+        self.shared_coords.copy_(target_coords)
+        
+        # Update Cache
+        self._last_spans_sig = sig
+        self._last_total_len = total_len
+
         return total_len
 
     def _generate_grid(self, shape, device):
@@ -137,59 +163,50 @@ class MultiSpanAllocator(nn.Module):
         return torch.stack(mesh, dim=-1).reshape(-1, len(shape))
 
     def compute_geometry(self, spans):
-        """
-        Returns the RoPE positions (activations) but relies on buffers for Masking.
-        """
         total_len = self.update_buffers(spans)
         
-        # Generate RoPE positions (activations are fine for RoPE, just not for Mask compilation)
-        # We can reuse the buffers we just filled to generate RoPE pos
         rope_pos = torch.zeros(total_len, self.num_rope_dims, device=self.inv_freq.device)
-        
-        # Dim 0: Time/Sequence
         rope_pos[:, 0] = torch.arange(total_len, device=self.inv_freq.device)
         
-        # Dim 1+: Space (Read from the buffer we just updated)
-        # Note: We read the slice corresponding to valid data
         active_coords = self.shared_coords[:total_len]
         D = active_coords.shape[1]
         rope_pos[:, 1:1+D] = active_coords
         
         scale = total_len / self.base_ref_len
-        
         return GeometryState(rope_pos, None, None, total_len, scale, self.inv_freq)
 
     def get_mask(self, total_len, radius=2.5):
-        """
-        Mask Mod captures 'self' (the module), allowing access to registered buffers.
-        """
-        # UPDATE the buffer instead of creating a local variable
-        self.current_radius_sq.fill_(float(radius) ** 2)
+        # 1. Check Radius Cache (Pure Python check = No Graph Break)
+        target_radius_sq = float(radius) ** 2
+        
+        # We compare floats in Python. If they differ, we write to the tensor.
+        # This prevents the "Inplace" error because we don't write if the value is the same.
+        if abs(self._last_radius_sq - target_radius_sq) > 1e-5:
+            self.current_radius_sq.fill_(target_radius_sq)
+            self._last_radius_sq = target_radius_sq
         
         def mask_mod(b, h, q_idx, kv_idx):
-            # A. Block Causality
             q_span = self.shared_span_ids[q_idx]
             k_span = self.shared_span_ids[kv_idx]
             is_history = q_span > k_span
             
-            # B. Intra-Span Logic
             is_same_span = q_span == k_span
             
-            # C. Modality Causality
             is_causal_q = self.shared_is_causal[q_idx]
             is_valid_time = (~is_causal_q) | (q_idx >= kv_idx)
             
-            # D. Geometric Sparsity - READ from buffer instead of closure
             q_c = self.shared_coords[q_idx]
             k_c = self.shared_coords[kv_idx]
             dist_sq = ((q_c - k_c) ** 2).sum(dim=-1)
-            is_valid_space = dist_sq < self.current_radius_sq  # <-- NOW A BUFFER
+            # We read from the buffer, which was conditionally updated above
+            is_valid_space = dist_sq < self.current_radius_sq 
             
             return is_history | (is_same_span & is_valid_time & is_valid_space)
 
         return create_block_mask(mask_mod, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len)
 
     def get_global_mask(self, total_len):
+        # Logic remains the same, relies on buffers updated by compute_geometry
         def mask_mod(b, h, q_idx, kv_idx):
             q_span = self.shared_span_ids[q_idx]
             k_span = self.shared_span_ids[kv_idx]
