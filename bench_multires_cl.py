@@ -47,9 +47,11 @@ def get_image_spans(resolution):
     """
     Helper to generate span metadata for a single 2D continuous latent (image).
     """
-    length = resolution * resolution
+    # PATCH FIX: Adjust for model stride
+    latent_res = resolution // 2
+    length = latent_res * latent_res
     # Standard format: 1 span, not causal (bidirectional), with 2D shape
-    return [{'len': length, 'shape': (resolution, resolution), 'causal': False}]
+    return [{'len': length, 'shape': (latent_res, latent_res), 'causal': False}]
 
 def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     """
@@ -266,7 +268,7 @@ if __name__ == "__main__":
     # --- Configuration ---
     # Define resolutions and batch sizes here
     #BUCKETS = [(16, 256), (32, 64), (64, 16)] 
-    BUCKETS = [(32, 64), (64, 16)] 
+    BUCKETS = [(16, 256), (32, 64)] 
     STEPS = 4000
     DEPTH = 4
     EMBED_DIM = 256

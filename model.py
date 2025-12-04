@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from diffusion_utils import FourierFeatures
+import math
 
 # --- 0. Geometry & RoPE ---
 #thanks and complaints all go to:
@@ -66,6 +67,7 @@ GeometryState = namedtuple('GeometryState', [
     'metric_coeffs',  # [N, Geo_Dims]  - For mask metric
     'span_ids',       # [N]            - For mask block-causality
     'is_causal',      # [N]            - For mask modality-causality
+    'total_len',      # int            - for like lengths i guess?
     'scale',          # float          - Reference Scaling Factor
     'inv_freq'        # [D_sub]        - Base frequencies
 ])
@@ -80,17 +82,18 @@ class MultiSpanAllocator(nn.Module):
         
         # Dimensions: 1 Causal + K Spatial
         self.num_rope_dims = 1 + max_spatial_dims
-        self.dim_per_subspace = head_dim // self.num_rope_dims
+        # FIX: Target Half-Head-Dim for frequencies, because RoPE doubles features
+        self.freq_dim = head_dim // 2
+        self.dim_per_subspace = self.freq_dim // self.num_rope_dims
         
-        # Single Frequency Basis (Reference Scaling)
-        # Shared across all dimensions to ensure isotropy
+        # Frequency Basis
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.dim_per_subspace, 2, device=device).float() / self.dim_per_subspace))
         self.register_buffer('inv_freq', inv_freq)
 
+
     def compute_geometry(self, spans):
         """
-        Constructs the GeometryState.
-        spans: List of dicts, e.g. [{'len': 50, 'type': 'text'}, {'len': 256, 'shape': (16,16)}]
+        Constructs GeometryState.
         """
         device = self.inv_freq.device
         
@@ -98,29 +101,32 @@ class MultiSpanAllocator(nn.Module):
         lengths = [s['len'] for s in spans]
         total_len = sum(lengths)
         
-        # 2. Allocate Ephemeral Buffers (Functionpilled: No Side Effects)
+        # 2. Buffers
+        # rope_pos: [N, 3] -> Col 0=Causal, Col 1=Y, Col 2=X
         rope_pos = torch.zeros(total_len, self.num_rope_dims, device=device)
+        # metric_coeffs: [N, 2] -> Y, X
         metric_coeffs = torch.zeros(total_len, self.max_spatial_dims, device=device)
         span_ids = torch.zeros(total_len, dtype=torch.int32, device=device)
         is_causal = torch.zeros(total_len, dtype=torch.bool, device=device)
         
-        # 3. Fill Causal Dim (Dim 0) - Branchless
-        # "Every single embedding is uniformly placed along the 0th (context) R^n RoPE dim"
+        # 3. Fill Causal Dim (Dim 0) - STRICT UNIFORM LINEARITY
+        # Every token, regardless of type, advances time by 1.0
         rope_pos[:, 0] = torch.arange(total_len, device=device, dtype=torch.float32)
         
-        # 4. Fill Spans
+        # 4. Fill Spans (Metadata & Spatial Dims)
         ptr = 0
         for i, span in enumerate(spans):
             length = span['len']
             p_end = ptr + length
             
-            # Span Identity
             span_ids[ptr:p_end] = i
             
             # Modality Specifics
             if span.get('causal', True):
                 # Text: Causal Masking
                 is_causal[ptr:p_end] = True
+                # Spatial Dims remain 0.0 (already init to zero)
+                
             else:
                 # Latent: Bidirectional Masking
                 is_causal[ptr:p_end] = False
@@ -131,12 +137,13 @@ class MultiSpanAllocator(nn.Module):
                     coords = euclid_rpow_n(span['shape'], device=device)
                     D = min(coords.shape[1], self.max_spatial_dims)
                     
-                    # Overwrite default zeros
+                    # Fill RoPE (offset by 1 to skip Causal dim)
                     rope_pos[ptr:p_end, 1:1+D] = coords[:, :D]
+                    # Fill Metric
                     metric_coeffs[ptr:p_end, :D] = coords[:, :D]
                     
                 elif 'coords' in span:
-                    # Use provided coords
+                    # Explicit Coords
                     c = span['coords']
                     D = min(c.shape[1], self.max_spatial_dims)
                     rope_pos[ptr:p_end, 1:1+D] = c[:, :D]
@@ -144,10 +151,9 @@ class MultiSpanAllocator(nn.Module):
             
             ptr = p_end
             
-        # 5. Reference Scale
         scale = total_len / self.base_ref_len
         
-        return GeometryState(rope_pos, metric_coeffs, span_ids, is_causal, scale, self.inv_freq)
+        return GeometryState(rope_pos, metric_coeffs, span_ids, is_causal, total_len, scale, self.inv_freq)
 
     def get_mask(self, geo_state, radius=2.5):
         """
@@ -213,8 +219,10 @@ class RnRoPE(nn.Module):
     def __init__(self, head_dim, num_rope_dims):
         super().__init__()
         self.head_dim = head_dim
-        self.num_rope_dims = num_rope_dims
+        self.num_rope_dims = num_rope_dims  # Should be 3 (Causal, Y, X)
         self.orthogonal = HouseholderOrthogonal(head_dim, num_reflections=head_dim//2)
+        # FIX: We need freq_dim = head_dim // 2
+        self.freq_dim = head_dim // 2
         
     def forward(self, q, k, geo_state):
         # 1. Householder Transform (Basis mixing)
@@ -236,16 +244,19 @@ class RnRoPE(nn.Module):
         # Concatenate features
         full_freqs = torch.cat(freqs_list, dim=-1)
         
-        # Truncate/Pad to match head_dim
-        if full_freqs.shape[-1] > self.head_dim:
-            full_freqs = full_freqs[:, :self.head_dim]
-        elif full_freqs.shape[-1] < self.head_dim:
-            pad = torch.zeros(full_freqs.shape[0], self.head_dim - full_freqs.shape[-1], device=q.device)
+        # FIX: Truncate to freq_dim (head_dim // 2)
+        if full_freqs.shape[-1] > self.freq_dim:
+            full_freqs = full_freqs[:, :self.freq_dim]
+        elif full_freqs.shape[-1] < self.freq_dim:
+            pad = torch.zeros(full_freqs.shape[0], self.freq_dim - full_freqs.shape[-1], device=q.device)
             full_freqs = torch.cat([full_freqs, pad], dim=-1)
             
-        # 3. Apply Rotation
+        # 3. Rotation
+        # Duplicate for Cos/Sin
         emb = torch.cat((full_freqs, full_freqs), dim=-1)
-        cos, sin = emb.cos()[None], emb.sin()[None]
+        # Broadcast over Head/Batch dims [1, 1, S, D]
+        cos = emb.cos().unsqueeze(0).unsqueeze(1)
+        sin = emb.sin().unsqueeze(0).unsqueeze(1)
         
         def apply_rot(x, c, s):
             x1, x2 = x.chunk(2, dim=-1)
@@ -408,7 +419,7 @@ class GatedAttentionBlock(nn.Module):
 
         self.mlp_gate = nn.Linear(dim, dim) # Simple gate for the residual
 
-    def forward(self, x, block_mask):
+    def forward(self, x, block_mask, geo_state):
         B, S, D = x.shape
         resid = x
         x_norm = self.norm1(x)
@@ -420,8 +431,9 @@ class GatedAttentionBlock(nn.Module):
         
         #~~q, k = self.rn_rope(q, k, grid_size)~~
         # Apply RoPE using GeometryState
-        q, k = self.spatial.get_rope(q, k, geo_state, scale=scale)
-        
+        #q, k = self.spatial.get_rope(q, k, geo_state, scale=scale)
+        q, k = self.rn_rope(q, k, geo_state)
+
         attn = flex_attention(q, k, v, block_mask=block_mask)
         attn = attn.transpose(1, 2).contiguous().view(B, S, D)
         attn = self.out_proj(attn)
@@ -571,6 +583,7 @@ class HybridGemmaDiT(nn.Module):
             self.scale_decoder = None
             self.lambda_head = None
 
+    # i hope this is deprecated...
     def get_masks(self, grid_size):
         # Back-compat method
         spans = [{'len': grid_size*grid_size, 'shape': (grid_size, grid_size), 'causal': False}]
@@ -631,16 +644,18 @@ class HybridGemmaDiT(nn.Module):
         # 1. Compute Geometry State (Once per forward)
         geo_state = self.spatial.compute_geometry(spans)
         
-        # 2. Compute Masks (Once per forward)
-        # Logarithmic Radius Logic based on total sequence length
-        # Proxy 'resolution' is sqrt(total_len)
-        eff_res = math.sqrt(geo_state.total_len)
-        base_res = 8.0; base_radius = 2.5; log_scale = 1.5
+        # 2. Masks
+        # Optimized Logarithmic Radius (No sqrt)
+        # R = Base + 0.75 * log2(L / 64)
+        total_len = geo_state.total_len
+        base_len = 64.0
+        base_radius = 2.5
+        log_scale = 0.75 # 1.5 * 0.5
         
-        if eff_res <= base_res:
+        if total_len <= base_len:
             radius = base_radius
         else:
-            radius = base_radius + log_scale * math.log2(eff_res / base_res)
+            radius = base_radius + log_scale * math.log2(total_len / base_len)
             
         mask_local = self.spatial.get_mask(geo_state, radius=radius)
         mask_global = self.spatial.get_global_mask(geo_state)
