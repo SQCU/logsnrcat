@@ -79,50 +79,20 @@ class MultiSpanAllocator(nn.Module):
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.dim_per_subspace, 2, device=device).float() / self.dim_per_subspace))
         self.register_buffer('inv_freq', inv_freq)
 
-        # FIXED: Register a STATIC buffer for coordinates. 
-        # Dynamo loves Buffers. It hates local variables.
-        # We pre-fill this with a default grid pattern to be safe, 
-        # but in practice we'd write to it or index it carefully.
-        # For simplicity in this fix, we will just use 1D indices for the buffer 
-        # and assume the mask kernel can read this global state.
         self.register_buffer('shared_coords', torch.zeros(max_tokens, max_spatial_dims, device=device))
-        
-        # We also need buffers for span_ids and is_causal if we want to capture them in mask_mod without lifting errors
         self.register_buffer('shared_span_ids', torch.zeros(max_tokens, dtype=torch.int32, device=device))
         self.register_buffer('shared_is_causal', torch.zeros(max_tokens, dtype=torch.bool, device=device))
-        # ADD THIS: Buffer for radius_sq so mask_mod can capture it
-        self.register_buffer('current_radius_sq', torch.tensor(6.25, device=device))  # default: 2.5^2
-        
-        # --- CACHE STATE (Python-side) ---
-        # We use these to track state without inspecting Tensors (avoids Graph Breaks)
-        self._last_radius_sq = -1.0
-        self._last_spans_sig = None
-        self._last_total_len = 0
+        self.register_buffer('current_radius_sq', torch.tensor(6.25, device=device))
 
-    @torch.compiler.disable
     def update_buffers(self, spans):
         """
-        Updates buffers only if the span topology (metadata) has changed.
-        Uses a Python signature check to avoid Graph Breaks and Autograd errors.
+        Updates coordinate and topology buffers.
+        Traceable by Dynamo.
         """
-        # 1. Generate a signature for the current spans
-        # Tuple of (length, causality, shape_tuple)
-        sig = []
-        for s in spans:
-            shape_sig = tuple(s['shape']) if 'shape' in s else None
-            sig.append((s['len'], s.get('causal', True), shape_sig))
-        sig = tuple(sig)
-
-        # 2. Check cache (Pure Python check = No Graph Break)
-        if sig == self._last_spans_sig:
-            return self._last_total_len
-
-        # 3. If changed, regenerate tensors and update buffers
         device = self.inv_freq.device
         ptr = 0
         total_len = 0
         
-        # Create temp tensors
         target_span_ids = torch.zeros_like(self.shared_span_ids)
         target_is_causal = torch.zeros_like(self.shared_is_causal)
         target_coords = torch.zeros_like(self.shared_coords)
@@ -133,7 +103,6 @@ class MultiSpanAllocator(nn.Module):
             if ptr + length > self.max_tokens:
                 raise ValueError(f"Sequence length {ptr+length} exceeds buffer size {self.max_tokens}")
                 
-            # Span IDs
             target_span_ids[ptr:ptr+length] = i
             
             if span.get('causal', True):
@@ -147,15 +116,10 @@ class MultiSpanAllocator(nn.Module):
             
             ptr += length
 
-        # Update Buffers
         self.shared_span_ids.copy_(target_span_ids)
         self.shared_is_causal.copy_(target_is_causal)
         self.shared_coords.copy_(target_coords)
         
-        # Update Cache
-        self._last_spans_sig = sig
-        self._last_total_len = total_len
-
         return total_len
 
     def _generate_grid(self, shape, device):
@@ -176,51 +140,59 @@ class MultiSpanAllocator(nn.Module):
         scale = total_len / self.base_ref_len
         return GeometryState(rope_pos, None, None, total_len, scale, self.inv_freq)
 
-    @torch.compiler.disable
-    def get_mask(self, total_len, radius=2.5):
-        # 1. Check Radius Cache (Pure Python check = No Graph Break)
-        target_radius_sq = float(radius) ** 2
-        
-        # We compare floats in Python. If they differ, we write to the tensor.
-        # This prevents the "Inplace" error because we don't write if the value is the same.
-        if abs(self._last_radius_sq - target_radius_sq) > 1e-5:
-            self.current_radius_sq.fill_(target_radius_sq)
-            self._last_radius_sq = target_radius_sq
-        
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_span = self.shared_span_ids[q_idx]
-            k_span = self.shared_span_ids[kv_idx]
+    def get_masks(self, total_len):
+        # 1. Update Radius Buffer (Branchless)
+        t_len = torch.as_tensor(total_len, device=self.current_radius_sq.device, dtype=torch.float32)
+        ratio = torch.maximum(t_len / self.base_ref_len, torch.tensor(1.0, device=t_len.device))
+        radius = 2.5 + 0.75 * torch.log2(ratio)
+        self.current_radius_sq.fill_(radius ** 2)
+
+        # 2. Local Capture
+        span_ids = self.shared_span_ids
+        is_causal = self.shared_is_causal
+        coords = self.shared_coords
+        rad_sq = self.current_radius_sq
+        spatial_dims = self.max_spatial_dims
+
+        def mask_mod_local(b, h, q_idx, kv_idx):
+            q_span = span_ids[q_idx]
+            k_span = span_ids[kv_idx]
             is_history = q_span > k_span
-            
             is_same_span = q_span == k_span
-            
-            is_causal_q = self.shared_is_causal[q_idx]
+            is_causal_q = is_causal[q_idx]
             is_valid_time = (~is_causal_q) | (q_idx >= kv_idx)
             
-            q_c = self.shared_coords[q_idx]
-            k_c = self.shared_coords[kv_idx]
-            dist_sq = ((q_c - k_c) ** 2).sum(dim=-1)
-            # We read from the buffer, which was conditionally updated above
-            is_valid_space = dist_sq < self.current_radius_sq 
+            # Decomposed indexing to appease vmap/Dynamo:
+            # Avoid `coords[q_idx, :slice]`.
+            # Instead, index column-by-column. 
+            dist_sq = 0.0
+            for i in range(spatial_dims):
+                # 1. Select the static column buffer (Shape: [MaxTokens])
+                col = coords[:, i]
+                # 2. Gather using the batched indices (Shape: [Batch])
+                # This simple 1D gather is fully supported by vmap.
+                d = col[q_idx] - col[kv_idx]
+                dist_sq = dist_sq + (d * d)
+                
+            is_valid_space = dist_sq < rad_sq
             
             return is_history | (is_same_span & is_valid_time & is_valid_space)
 
-        return create_block_mask(mask_mod, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len)
-
-    @torch.compiler.disable
-    def get_global_mask(self, total_len):
-        # Logic remains the same, relies on buffers updated by compute_geometry
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_span = self.shared_span_ids[q_idx]
-            k_span = self.shared_span_ids[kv_idx]
+        def mask_mod_global(b, h, q_idx, kv_idx):
+            q_span = span_ids[q_idx]
+            k_span = span_ids[kv_idx]
             is_history = q_span > k_span
             is_same_span = q_span == k_span
-            is_causal_q = self.shared_is_causal[q_idx]
+            is_causal_q = is_causal[q_idx]
             is_valid_time = (~is_causal_q) | (q_idx >= kv_idx)
             return is_history | (is_same_span & is_valid_time)
-            
-        return create_block_mask(mask_mod, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len)
 
+        # 3. Create Masks 
+        mask_local = create_block_mask(mask_mod_local, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len)
+        mask_global = create_block_mask(mask_mod_global, B=1, H=1, Q_LEN=total_len, KV_LEN=total_len)
+
+        return mask_local, mask_global
+        
 # --- RnRoPE ---
 
 class RnRoPE(nn.Module):
@@ -445,16 +417,14 @@ class HybridGemmaDiT(nn.Module):
         else:
             self.scale_decoder = None; self.lambda_head = None
 
-    def get_masks(self, grid_size):
-        # Back-compat support using the new allocator
-        spans = [{'len': grid_size*grid_size, 'shape': (grid_size, grid_size), 'causal': False}]
+    def get_masks(self, spans):
         geo_state = self.spatial.compute_geometry(spans)
         
         eff_res = math.sqrt(geo_state.total_len)
         base_res = 8.0; base_radius = 2.5; log_scale = 1.5
         radius = base_radius if eff_res <= base_res else base_radius + log_scale * math.log2(eff_res / base_res)
             
-        mask_local = self.spatial.get_mask(geo_state, radius=radius)
+        mask_local, mask_global = self.spatial.get_masks_cached(geo_state, radius=radius)
         mask_global = self.spatial.get_global_mask(geo_state)
         return mask_local, mask_global, geo_state
 
@@ -465,29 +435,9 @@ class HybridGemmaDiT(nn.Module):
         # 1. Compute Geometry
         geo_state = self.spatial.compute_geometry(spans)
         
-        # 2. Mask Logic with Caching
-        total_len = geo_state.total_len
-        base_len = 64.0; base_radius = 2.5; log_scale = 0.75
-        
-        # Ensure total_len is int for math ops
-        if isinstance(total_len, torch.Tensor):
-            total_len_val = int(total_len.item())
-        else:
-            total_len_val = total_len
-            
-        if total_len_val <= base_len:
-            radius = float(base_radius)
-        else:
-            radius = float(base_radius + log_scale * math.log2(total_len_val / base_len))
-        
-        cache_key = (total_len_val, round(radius, 4))
-        
-        if cache_key in self.mask_cache:
-            mask_local, mask_global = self.mask_cache[cache_key]
-        else:
-            mask_local = self.spatial.get_mask(total_len_val, radius=radius)
-            mask_global = self.spatial.get_global_mask(total_len_val)
-            self.mask_cache[cache_key] = (mask_local, mask_global)
+        # 2. Retrieve Masks via the disabled/opaque method
+        # This returns the BlockMask objects without exposing the dictionary mutation to the graph
+        mask_local, mask_global = self.spatial.get_masks(geo_state.total_len)
         
         spins = self.spin_encoder(logsnr)
         x = self.patch_in(z_t, spins) 
