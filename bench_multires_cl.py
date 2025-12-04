@@ -43,6 +43,14 @@ class ExperimentLogger:
         self.figure_count += 1
         return filepath
 
+def get_image_spans(resolution):
+    """
+    Helper to generate span metadata for a single 2D continuous latent (image).
+    """
+    length = resolution * resolution
+    # Standard format: 1 span, not causal (bidirectional), with 2D shape
+    return [{'len': length, 'shape': (resolution, resolution), 'causal': False}]
+
 def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     """
     Generate samples from the composite iterator and label them.
@@ -115,9 +123,11 @@ def train_multires(mode, buckets, steps=1000, embed_dim=256, depth=12, logger=No
         eps = torch.randn_like(x0)
         z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
         v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
+
+        spans = get_image_spans(res)
         
         # Forward
-        raw, l_pred, aux_loss = model(z_t, logsnr)
+        raw, l_pred, aux_loss = model(z_t, logsnr, spans)
         
         if mode == 'factorized':
             sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1, 1, 1, 1)
@@ -155,10 +165,14 @@ def sample_viz(model, res, num_samples=8):
     model.eval()
     z = torch.randn(num_samples, 3, res, res, device='cuda')
     ts = torch.linspace(1.0, 0.001, 50, device='cuda')
+
+    # Pre-generate spans once (static for sampling loop)
+    spans = get_image_spans(res)
     for i in range(49):
         t = ts[i]; t_n = ts[i+1]
         logsnr = get_schedule(torch.full((num_samples,), t, device='cuda'))
-        raw, l_pred, _ = model(z, logsnr)
+        # Pass spans
+        raw, l_pred, _ = model(z, logsnr, spans)
         if model.mode == 'factorized':
             sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1,1,1,1)
             v_pred = raw * sigma_p

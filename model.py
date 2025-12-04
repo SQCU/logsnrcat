@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 from diffusion_utils import FourierFeatures
 
-# --- Geometry & RoPE ---
+# --- 0. Geometry & RoPE ---
 #thanks and complaints all go to:
 """ https://arxiv.org/abs/2504.06308
 Rethinking RoPE: A Mathematical Blueprint for
@@ -37,303 +37,225 @@ class HouseholderOrthogonal(nn.Module):
         Q = self.get_matrix()
         return x @ Q.t() if inverse else x @ Q
 
-class DynamicSpatialBuffer(nn.Module):
-    def __init__(self, max_grid_size=16, head_dim=64, device='cuda'):
+# --- 1. Top-Level Metric Definition ---
+
+def euclidean_sq(q_params, k_params):
+    """
+    Canonical Squared Euclidean Distance.
+    Used by the attention kernel for intra-span geometric masking.
+    q_params, k_params: [..., D] tensors of metric coefficients.
+    """
+    return torch.sum((q_params - k_params) ** 2, dim=-1)
+
+def euclid_rpow_n(shape, device='cuda'):
+    """
+    Generates N-dimensional coordinates for a grid of given shape.
+    Returns: [Product(shape), Rank(shape)] tensor.
+    Example: shape=(16, 16) -> [256, 2] tensor of (y, x) coords.
+    """
+    coords = [torch.arange(s, device=device, dtype=torch.float32) for s in shape]
+    mesh = torch.meshgrid(*coords, indexing='ij')
+    # Stack and flatten: [D, N] -> [N, D]
+    stacked = torch.stack(mesh, dim=-1).reshape(-1, len(shape))
+    return stacked
+
+from collections import namedtuple
+# Container for the geometry state of a specific forward pass
+GeometryState = namedtuple('GeometryState', [
+    'rope_pos',       # [N, RoPE_Dims] - For RnRoPE (Causal + Spatial)
+    'metric_coeffs',  # [N, Geo_Dims]  - For mask metric
+    'span_ids',       # [N]            - For mask block-causality
+    'is_causal',      # [N]            - For mask modality-causality
+    'scale',          # float          - Reference Scaling Factor
+    'inv_freq'        # [D_sub]        - Base frequencies
+])
+
+
+class MultiSpanAllocator(nn.Module):
+    def __init__(self, max_tokens=262144, head_dim=64, max_spatial_dims=2, base_ref_len=64.0, device='cuda'):
         super().__init__()
-        self.max_grid_size = max_grid_size
-        y = torch.arange(max_grid_size, device=device)
-        x = torch.arange(max_grid_size, device=device)
-        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-        self.coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
-        d = torch.cdist(self.coords, self.coords, p=2)
-        self.register_buffer('dist_matrix', d)
-        self.dim_half = head_dim // 2
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.dim_half, 2, device=device).float() / self.dim_half))
+        self.head_dim = head_dim
+        self.max_spatial_dims = max_spatial_dims
+        self.base_ref_len = base_ref_len
+        
+        # Dimensions: 1 Causal + K Spatial
+        self.num_rope_dims = 1 + max_spatial_dims
+        self.dim_per_subspace = head_dim // self.num_rope_dims
+        
+        # Single Frequency Basis (Reference Scaling)
+        # Shared across all dimensions to ensure isotropy
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.dim_per_subspace, 2, device=device).float() / self.dim_per_subspace))
         self.register_buffer('inv_freq', inv_freq)
 
-    def get_rope(self, B, grid_size, base_grid_size=8):
+    def compute_geometry(self, spans):
         """
-        RoPE with semantic distance invariance for 2D spatial grids.
+        Constructs the GeometryState.
+        spans: List of dicts, e.g. [{'len': 50, 'type': 'text'}, {'len': 256, 'shape': (16,16)}]
+        """
+        device = self.inv_freq.device
         
-        Principle:
-            Two patches that span the same *fraction* of the image
-            should have similar relative position encodings, regardless
-            of the total image resolution.
+        # 1. Calculate Sizes
+        lengths = [s['len'] for s in spans]
+        total_len = sum(lengths)
         
-        Example:
-            - At 8×8 grid: Patches 2 units apart span 2/8 = 25% of image
-            - At 32×32 grid: Patches 8 units apart span 8/32 = 25% of image
-            → Both pairs should have the same RoPE rotation angle
+        # 2. Allocate Ephemeral Buffers (Functionpilled: No Side Effects)
+        rope_pos = torch.zeros(total_len, self.num_rope_dims, device=device)
+        metric_coeffs = torch.zeros(total_len, self.max_spatial_dims, device=device)
+        span_ids = torch.zeros(total_len, dtype=torch.int32, device=device)
+        is_causal = torch.zeros(total_len, dtype=torch.bool, device=device)
         
-        Implementation:
-            rotation_angle = θ · distance
+        # 3. Fill Causal Dim (Dim 0) - Branchless
+        # "Every single embedding is uniformly placed along the 0th (context) R^n RoPE dim"
+        rope_pos[:, 0] = torch.arange(total_len, device=device, dtype=torch.float32)
+        
+        # 4. Fill Spans
+        ptr = 0
+        for i, span in enumerate(spans):
+            length = span['len']
+            p_end = ptr + length
             
-            For semantic invariance:
-            θ_effective = θ_base · (grid_size / base_grid_size)
+            # Span Identity
+            span_ids[ptr:p_end] = i
             
-            This makes rotation_angle invariant when distance scales
-            proportionally with grid_size.
-        
-        Why This Matters:
-            - Checkerboards: A tile at 8×8 spans ~2 patches; at 32×32 spans ~8 patches.
-            With scaling, both are recognized as "same tile" by attention.
-            - Torii: Curvature features at 8×8 span ~4 patches; at 32×32 span ~16 patches.
-            With scaling, the model learns shape geometry consistently.
-        """
-        scale = grid_size / base_grid_size
-        scaled_base = self.base_freq * scale
-        
-        inv_freq = 1.0 / (scaled_base ** (
-            torch.arange(0, self.dim_half, 2, device=self.inv_freq.device).float() 
-            / self.dim_half
-        ))
-        
-        # Get active coordinates
-        if grid_size == self.max_grid_size:
-            active_coords = self.coords
-        else:
-            y = torch.arange(grid_size, device=self.inv_freq.device)
-            grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
-            active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
-        
-        y_pos, x_pos = active_coords[:, 0], active_coords[:, 1]
-        freqs_y = torch.einsum('i, j -> i j', y_pos, inv_freq)
-        freqs_x = torch.einsum('i, j -> i j', x_pos, inv_freq)
-        emb = torch.cat((torch.cat([freqs_y, freqs_x], dim=-1), 
-                        torch.cat([freqs_y, freqs_x], dim=-1)), dim=-1)
-        return emb.cos()[None], emb.sin()[None]
-    def get_rope_spherical(self, angular_distance, bandwidth_L, base_bandwidth_L=16):
-        """
-        RoPE for SO(3)-equivariant spherical convolutions.
-        
-        Principle:
-            Angular distance on a sphere is resolution-independent.
-            However, the *discretization* (spherical harmonic bandwidth L)
-            determines the Nyquist frequency.
-        
-        Example:
-            - At L=16: Can resolve features with ~16 lobes
-            - At L=64: Can resolve features with ~64 lobes
-            → A 4-lobe pattern at L=16 is analogous to a 16-lobe pattern at L=64
-        
-        Implementation:
-            For a feature with k lobes:
-            θ_effective = θ_base · (bandwidth_L / base_bandwidth_L)
+            # Modality Specifics
+            if span.get('causal', True):
+                # Text: Causal Masking
+                is_causal[ptr:p_end] = True
+            else:
+                # Latent: Bidirectional Masking
+                is_causal[ptr:p_end] = False
+                
+                # Spatial Geometry (Dims 1..K)
+                if 'shape' in span:
+                    # Generate coords from shape
+                    coords = euclid_rpow_n(span['shape'], device=device)
+                    D = min(coords.shape[1], self.max_spatial_dims)
+                    
+                    # Overwrite default zeros
+                    rope_pos[ptr:p_end, 1:1+D] = coords[:, :D]
+                    metric_coeffs[ptr:p_end, :D] = coords[:, :D]
+                    
+                elif 'coords' in span:
+                    # Use provided coords
+                    c = span['coords']
+                    D = min(c.shape[1], self.max_spatial_dims)
+                    rope_pos[ptr:p_end, 1:1+D] = c[:, :D]
+                    metric_coeffs[ptr:p_end, :D] = c[:, :D]
             
-            This makes the rotation period match the *perceptual frequency*
-            of features (lobes/harmonics) rather than raw angular distance.
-        
-        Note:
-            Unlike 2D grids, spherical distance is already normalized [0, π].
-            The scaling applies to the *frequency content* we can represent,
-            not the coordinate system itself.
-        """
-        scale = bandwidth_L / base_bandwidth_L
-        scaled_base = self.base_freq * scale
-        
-        inv_freq = 1.0 / (scaled_base ** (
-            torch.arange(0, self.dim_half, 2).float() / self.dim_half
-        ))
-        
-        # angular_distance ∈ [0, π] (geodesic on sphere)
-        freqs = torch.einsum('i, j -> i j', angular_distance, inv_freq)
-        return freqs.cos(), freqs.sin()
-    def get_rope_graph(self, geodesic_dist, diameter, base_diameter=10):
-        """
-        RoPE for graph-structured data using geodesic distance.
-        
-        Principle:
-            Nodes that are X% of the graph's diameter apart should
-            have similar relative encodings, regardless of graph size.
-        
-        Example:
-            - Small molecule (diameter=5): Nodes 2 hops apart are "distant" (40%)
-            - Protein (diameter=50): Nodes 20 hops apart are "distant" (40%)
-            → Both pairs should have similar attention affinity
-        
-        Implementation:
-            Normalize geodesic distance by diameter:
-            d_semantic = geodesic_dist / diameter
+            ptr = p_end
             
-            Then scale RoPE:
-            θ_effective = θ_base · (diameter / base_diameter)
-            
-            This makes attention depend on *relative position in the graph's
-            structure*, not absolute hop count.
+        # 5. Reference Scale
+        scale = total_len / self.base_ref_len
         
-        Alternative (For Irregular Graphs):
-            Use diffusion distance instead of geodesic:
-            d_diffusion = -log(P_t(i → j))
-            
-            where P_t is the t-step random walk transition matrix.
-            This captures "functional distance" (how information flows)
-            rather than topological distance (shortest path).
+        return GeometryState(rope_pos, metric_coeffs, span_ids, is_causal, scale, self.inv_freq)
+
+    def get_mask(self, geo_state, radius=2.5):
         """
-        scale = diameter / base_diameter
-        scaled_base = self.base_freq * scale
-        
-        inv_freq = 1.0 / (scaled_base ** (
-            torch.arange(0, self.dim_half, 2).float() / self.dim_half
-        ))
-        
-        # geodesic_dist: [num_nodes, num_nodes] matrix of shortest path lengths
-        freqs = torch.einsum('ij, k -> ijk', geodesic_dist.float(), inv_freq)
-        return freqs.cos(), freqs.sin()
-    def get_rope_char_lm(self, position, seq_length, base_seq_length=512):
+        Local/Tangle Mask.
         """
-        RoPE for character-level language models (no BPE tokenization).
-        
-        Principle:
-            Character-level models lack the "compression" of BPE, which
-            naturally adapts to content density. A 10-character word is
-            semantically similar whether embedded in a 100-char or 10,000-char
-            document.
-        
-        Problem:
-            Standard RoPE uses absolute position → "character 50" has the same
-            encoding in a tweet (100 chars) and a novel (100k chars), even though
-            its *semantic role* is very different.
-        
-        Solution:
-            Scale RoPE by sequence length:
-            θ_effective = θ_base · (seq_length / base_seq_length)
-            
-            This makes position encoding reflect *relative progress through
-            the document*, not raw character index.
-        
-        Caveat:
-            This assumes documents of different lengths have comparable
-            *density* of information per character. For highly heterogeneous
-            corpora (tweets + books), consider adaptive scaling based on
-            local compression ratio (entropy per character).
-        
-        Why BPE Models Don't Need This:
-            BPE tokens are already "semantically normalized" — common patterns
-            (words, subwords) become single tokens regardless of context.
-            A 100-token BPE sequence and a 10,000-token sequence are directly
-            comparable (both represent ~100 and ~10,000 semantic units).
-            Character-level models lack this normalization.
-        """
-        scale = seq_length / base_seq_length
-        scaled_base = self.base_freq * scale
-        
-        inv_freq = 1.0 / (scaled_base ** (
-            torch.arange(0, self.dim_half, 2).float() / self.dim_half
-        ))
-        
-        # position: [seq_length] (0, 1, 2, ..., seq_length-1)
-        freqs = torch.einsum('i, j -> i j', position.float(), inv_freq)
-        return freqs.cos(), freqs.sin()
-    """
-    def get_mask(self, grid_size, radius=2.5):
-        if grid_size == self.max_grid_size: d = self.dist_matrix
-        else:
-            y = torch.arange(grid_size, device=self.dist_matrix.device)
-            grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
-            active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
-            d = torch.cdist(active_coords, active_coords, p=2)
-        valid_mask = d < radius
-        num_tokens = grid_size * grid_size
-        def mask_mod(b, h, q_idx, kv_idx):
-            q_safe, k_safe = q_idx.clamp(0, num_tokens - 1), kv_idx.clamp(0, num_tokens - 1)
-            return valid_mask[q_safe, k_safe] & (q_idx < num_tokens) & (kv_idx < num_tokens)
-        return create_block_mask(mask_mod, B=1, H=1, Q_LEN=num_tokens, KV_LEN=num_tokens)
-    """
-    def get_mask(self, grid_size, base_radius=2.5, base_grid=8.0):
-        """
-        Compute attention mask with logarithmically-scaled radius.
-        
-        Scaling Law:
-            radius(G) = base_radius + log2(G / G_base) * scale_factor
-        
-        Intuition:
-            At 8×8:   radius = 2.5 (covers ~20% of spatial extent)
-            At 16×16: radius = 4.0 (covers ~12.5% of spatial extent)
-            At 32×32: radius = 5.5 (covers ~8.6% of spatial extent)
-            
-            In absolute terms, the radius grows to capture
-            finer details. In relative terms, it shrinks to
-            maintain local inductive bias.
-        
-        Why Logarithmic (not linear, not constant):
-            - Linear scaling: O(N²) attention cost, loses local bias
-            - Constant radius: Fails to capture multi-tile patterns at high-res
-            - Logarithmic: Balances detail capture with computational efficiency
-        
-        Why This Preserves Perceptual Consistency:
-            The number of patches WITHIN a semantic structure
-            (e.g., one checkerboard tile) grows linearly with resolution.
-            But the number of ADJACENT structures we need to attend to
-            grows logarithmically (due to hierarchical spatial decomposition).
-        
-        Connection to CNNs:
-            This mimics how CNN receptive fields grow:
-            - Early layers: Small, constant receptive field
-            - Deep layers: Exponentially growing receptive field
-            
-            We implement this spatially (across resolution) rather than
-            temporally (across layers).
-        """
-        # Logarithmic scaling coefficient
-        # Tuned so that radius grows ~1.5 patches per doubling of resolution
-        log_scale_factor = 1.5
-        
-        if grid_size <= base_grid:
-            effective_radius = base_radius
-        else:
-            log_ratio = torch.log2(torch.tensor(grid_size / base_grid, dtype=torch.float32))
-            effective_radius = base_radius + log_scale_factor * log_ratio.item()
-        
-        # Compute distance matrix
-        if grid_size == self.max_grid_size:
-            d = self.dist_matrix
-        else:
-            y = torch.arange(grid_size, device=self.dist_matrix.device)
-            grid_y, grid_x = torch.meshgrid(y, y, indexing='ij')
-            active_coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
-            d = torch.cdist(active_coords, active_coords, p=2)
-        
-        valid_mask = d < effective_radius
-        num_tokens = grid_size * grid_size
+        N = geo_state.total_len
+        span_ids = geo_state.span_ids
+        is_causal = geo_state.is_causal
+        coeffs = geo_state.metric_coeffs
+        radius_sq = radius ** 2
         
         def mask_mod(b, h, q_idx, kv_idx):
-            """
-            Block mask predicate for flex_attention.
+            # A. Block Causality (Global)
+            q_span = span_ids[q_idx]
+            k_span = span_ids[kv_idx]
+            is_history = q_span > k_span
             
-            Ensures queries only attend to keys within the spatial neighborhood
-            defined by effective_radius. This creates a spatially-localized
-            attention pattern that scales gracefully across resolutions.
-            """
-            q_safe = q_idx.clamp(0, num_tokens - 1)
-            k_safe = kv_idx.clamp(0, num_tokens - 1)
-            return valid_mask[q_safe, k_safe] & (q_idx < num_tokens) & (kv_idx < num_tokens)
+            # B. Intra-Span Logic
+            is_same_span = q_span == k_span
+            
+            # C. Modality Causality
+            is_valid_time = (~is_causal[q_idx]) | (q_idx >= kv_idx)
+            
+            # D. Geometric Sparsity (Local Metric)
+            q_c = coeffs[q_idx]
+            k_c = coeffs[kv_idx]
+            dist_sq = euclidean_sq(q_c, k_c)
+            is_valid_space = dist_sq < radius_sq
+            
+            return is_history | (is_same_span & is_valid_time & is_valid_space)
+
+        return create_block_mask(mask_mod, B=1, H=1, Q_LEN=N, KV_LEN=N)
+
+    def get_global_mask(self, geo_state):
+        """
+        Global/Block-Causal Mask.
+        No spatial radius constraints, just Span & Modality Causality.
+        """
+        N = geo_state.total_len
+        span_ids = geo_state.span_ids
+        is_causal = geo_state.is_causal
         
-        return create_block_mask(
-            mask_mod, 
-            B=1, H=1, 
-            Q_LEN=num_tokens, 
-            KV_LEN=num_tokens
-        )
+        def mask_mod(b, h, q_idx, kv_idx):
+            # Block Causality
+            q_span = span_ids[q_idx]
+            k_span = span_ids[kv_idx]
+            is_history = q_span > k_span
+            
+            # Intra-Span
+            is_same_span = q_span == k_span
+            
+            # Modality Causality
+            is_valid_time = (~is_causal[q_idx]) | (q_idx >= kv_idx)
+            
+            # No geometric check
+            return is_history | (is_same_span & is_valid_time)
+            
+        return create_block_mask(mask_mod, B=1, H=1, Q_LEN=N, KV_LEN=N)
+
+# --- 4. RnRoPE Module ---
 
 class RnRoPE(nn.Module):
-    def __init__(self, head_dim, spatial_buffer):
+    def __init__(self, head_dim, num_rope_dims):
         super().__init__()
-        self.buffer = spatial_buffer
+        self.head_dim = head_dim
+        self.num_rope_dims = num_rope_dims
         self.orthogonal = HouseholderOrthogonal(head_dim, num_reflections=head_dim//2)
         
-    def forward(self, q, k, grid_size):
+    def forward(self, q, k, geo_state):
+        # 1. Householder Transform (Basis mixing)
         q = self.orthogonal(q, inverse=True)
         k = self.orthogonal(k, inverse=True)
-        cos, sin = self.buffer.get_rope(q.shape[0], grid_size)
-        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
-        q1, q2 = q.chunk(2, dim=-1); k1, k2 = k.chunk(2, dim=-1)
-        q_rot = (q * cos) + (torch.cat((-q2, q1), dim=-1) * sin)
-        k_rot = (k * cos) + (torch.cat((-k2, k1), dim=-1) * sin)
+        
+        # 2. RoPE Feature Generation
+        inv_freq_scaled = geo_state.inv_freq / geo_state.scale
+        rope_pos = geo_state.rope_pos # [N, NumDims]
+        
+        freqs_list = []
+        # Generate features for each dimension (Causal + Spatial_1...K)
+        # Note: num_rope_dims matches the allocator config
+        for d in range(self.num_rope_dims):
+            vals = rope_pos[:, d]
+            f = torch.outer(vals, inv_freq_scaled)
+            freqs_list.append(f)
+            
+        # Concatenate features
+        full_freqs = torch.cat(freqs_list, dim=-1)
+        
+        # Truncate/Pad to match head_dim
+        if full_freqs.shape[-1] > self.head_dim:
+            full_freqs = full_freqs[:, :self.head_dim]
+        elif full_freqs.shape[-1] < self.head_dim:
+            pad = torch.zeros(full_freqs.shape[0], self.head_dim - full_freqs.shape[-1], device=q.device)
+            full_freqs = torch.cat([full_freqs, pad], dim=-1)
+            
+        # 3. Apply Rotation
+        emb = torch.cat((full_freqs, full_freqs), dim=-1)
+        cos, sin = emb.cos()[None], emb.sin()[None]
+        
+        def apply_rot(x, c, s):
+            x1, x2 = x.chunk(2, dim=-1)
+            return (x * c) + (torch.cat((-x2, x1), dim=-1) * s)
+            
+        q_rot = apply_rot(q, cos, sin)
+        k_rot = apply_rot(k, cos, sin)
+        
+        # 4. Inverse Householder Transform
         return self.orthogonal(q_rot, inverse=False), self.orthogonal(k_rot, inverse=False)
-
-def get_global_mask(seq_len):
-    def mask_mod(b, h, q_idx, kv_idx): return (q_idx < seq_len) & (kv_idx < seq_len)
-    return create_block_mask(mask_mod, B=1, H=1, Q_LEN=seq_len, KV_LEN=seq_len)
 
 # --- FFN Primitives ---
 
@@ -430,63 +352,6 @@ class SigmoidMoE(nn.Module):
         
         return out, aux_loss
 
-
-class ContextualPatchEmbedder(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=256, context_size=4, mlp_depth=1):
-        super().__init__()
-        self.context_size = context_size
-        self.stride = 2
-        self.padding = 1 
-        
-        patch_flat_dim = (context_size ** 2) * input_dim
-        
-        layers = []
-        # Input Projection
-        layers.append(nn.Linear(patch_flat_dim + 8, hidden_dim))
-        layers.append(nn.SiLU())
-        
-        # Deep Interface Layers (The "Griddy" Scaling)
-        for _ in range(mlp_depth - 1):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.SiLU())
-            
-        # Final Projection
-        layers.append(nn.Linear(hidden_dim, embed_dim))
-        
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x, spins):
-        x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='reflect')
-        patches = x_pad.unfold(2, self.context_size, self.stride).unfold(3, self.context_size, self.stride)
-        B, C, GH, GW, K, _ = patches.shape
-        num_tokens = GH * GW
-        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, num_tokens, -1)
-        spins_expanded = spins.unsqueeze(1).expand(-1, num_tokens, -1)
-        out = self.net(torch.cat([patches, spins_expanded], dim=-1))
-        return out
-
-class NonLinearOutputHead(nn.Module):
-    def __init__(self, embed_dim, output_dim=12, mlp_depth=1): 
-        super().__init__()
-        
-        layers = []
-        # Input Projection
-        layers.append(nn.Linear(embed_dim, embed_dim))
-        layers.append(nn.SiLU())
-        
-        # Deep Interface Layers
-        for _ in range(mlp_depth - 1):
-            layers.append(nn.Linear(embed_dim, embed_dim))
-            layers.append(nn.SiLU())
-            
-        # Final Projection
-        layers.append(nn.Linear(embed_dim, output_dim))
-        
-        self.net = nn.Sequential(*layers)
-        
-    def forward(self, x):
-        return self.net(x)
-
 # --- Blocks ---
 
 class FourierScaleDecoder(nn.Module):
@@ -505,15 +370,21 @@ class FourierScaleDecoder(nn.Module):
         return torch.exp(self.net(fourier_features))
 
 class GatedAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads, spatial_buffer, is_global=False, ffn_type='swiglu'):
+    def __init__(self, dim, num_heads, spatial_allocator, is_global=False, ffn_type='swiglu'):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.is_global = is_global
+        self.spatial = spatial_allocator # Reference to shared allocator
         
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.rn_rope = RnRoPE(self.head_dim, spatial_buffer)
+        #self.rn_rope = RnRoPE(self.head_dim, spatial_buffer)
+
+        # NOTE: GatedAttentionBlock needs to be updated to initialize RnRoPE
+        # using self.spatial.num_rope_dims. Assuming GatedAttentionBlock structure:
+        self.rn_rope = RnRoPE(self.head_dim, spatial_allocator.num_rope_dims)
+
         self.out_proj = nn.Linear(dim, dim, bias=False)
         self.gate_proj = nn.Linear(dim, dim)
         
@@ -537,7 +408,7 @@ class GatedAttentionBlock(nn.Module):
 
         self.mlp_gate = nn.Linear(dim, dim) # Simple gate for the residual
 
-    def forward(self, x, block_mask, grid_size):
+    def forward(self, x, block_mask):
         B, S, D = x.shape
         resid = x
         x_norm = self.norm1(x)
@@ -547,7 +418,9 @@ class GatedAttentionBlock(nn.Module):
         k = k.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         
-        q, k = self.rn_rope(q, k, grid_size)
+        #~~q, k = self.rn_rope(q, k, grid_size)~~
+        # Apply RoPE using GeometryState
+        q, k = self.spatial.get_rope(q, k, geo_state, scale=scale)
         
         attn = flex_attention(q, k, v, block_mask=block_mask)
         attn = attn.transpose(1, 2).contiguous().view(B, S, D)
@@ -575,8 +448,13 @@ class GatedAttentionBlock(nn.Module):
         # Your old code: g, val = mlp_gate(norm(x))... x + mlp_out(val * gelu(g))
         # That was a GLU. We replaced it with SwiGLU/MoE. 
         # So we just add directly? Let's add a gate for stability.
-        gate_ffn = torch.sigmoid(self.mlp_gate(x_norm))
-        x = resid + (ffn_out * gate_ffn)
+        #gate_ffn = torch.sigmoid(self.mlp_gate(x_norm))
+        #x = resid + (ffn_out * gate_ffn)
+        # what on earth was that...? reverting to a basic ah ah resnet.
+
+        # totally ordinary post-ffn residual.
+        x = resid + ffn_out
+
         
         return x, aux_loss
 
@@ -665,7 +543,9 @@ class HybridGemmaDiT(nn.Module):
         
         self.fourier_dim = 8
         self.spin_encoder = FourierFeatures(num_bands=4)
-        self.spatial = DynamicSpatialBuffer(max_grid_size=16, head_dim=embed_dim//4)
+        # Allocator: 2 Spatial Dims (X, Y) -> 3 Total RoPE Dims (Time, X, Y)
+        # Head Dim splits roughly 64 // 3 = 21 per dim
+        self.spatial = MultiSpanAllocator(head_dim=embed_dim//4, max_spatial_dims=2)
         self.mask_cache = {} 
         self.depth = depth
         
@@ -677,10 +557,11 @@ class HybridGemmaDiT(nn.Module):
             )
             for i in range(depth)
         ])
-        
         self.norm_final = nn.RMSNorm(embed_dim, elementwise_affine=False)
+
+        #this is a hand-coded rgb color channel * samples-per-patch parsing.
+        # feel free to refactor this at some time when it's not a confusing distraction
         self.patch_dim = 12
-        
         self.output_head = NonLinearOutputHead(embed_dim, self.patch_dim, mlp_depth=interface_depth)
         
         if mode == 'factorized':
@@ -691,31 +572,99 @@ class HybridGemmaDiT(nn.Module):
             self.lambda_head = None
 
     def get_masks(self, grid_size):
-        if grid_size in self.mask_cache: return self.mask_cache[grid_size]
-        base_grid = 8.0; base_radius = 2.5
-        scaled_radius = base_radius * (grid_size / base_grid)
-        mask_local = self.spatial.get_mask(grid_size, radius=scaled_radius)
-        mask_global = get_global_mask(grid_size * grid_size)
-        self.mask_cache[grid_size] = (mask_local, mask_global)
-        return mask_local, mask_global
+        # Back-compat method
+        spans = [{'len': grid_size*grid_size, 'shape': (grid_size, grid_size), 'causal': False}]
+        geo_state = self.spatial.compute_geometry(spans)
+        
+        eff_res = math.sqrt(geo_state.total_len)
+        base_res = 8.0; base_radius = 2.5; log_scale = 1.5
+        
+        if eff_res <= base_res:
+            radius = base_radius
+        else:
+            radius = base_radius + log_scale * math.log2(eff_res / base_res)
+            
+        mask_local = self.spatial.get_mask(geo_state, radius=radius)
+        mask_global = self.spatial.get_global_mask(geo_state)
+        
+        return mask_local, mask_global, geo_state
 
-    def forward(self, z_t, logsnr):
+
+    def forward(self, z_t, logsnr, spans):
+        """
+        Forward pass with flexible topology.
+
+        Args:
+            z_t (Tensor): Input latents. Currently [B, C, H, W] for compatibility, 
+                          or [B, N, D] for flat inputs.
+            logsnr (Tensor): Noise levels [B].
+            spans (List[Dict]): Metadata defining the sequence topology. 
+                                The sum of 'len' in spans must match N.
+                
+                Format per span dict:
+                {
+                    # REQUIRED
+                    'len': int,       # Number of tokens in this span
+                    
+                    # OPTIONAL (Topology)
+                    'causal': bool,   # True = Text/Time (Autoregressive mask, Integer RoPE steps).
+                                      # False = Latent/Space (Bidirectional mask, Fractional RoPE steps).
+                                      # Defaults to True.
+                    
+                    # OPTIONAL (Geometry - Only used if causal=False)
+                    'shape': tuple,   # (H, W) tuple for 2D/3D grids. 
+                                      # Generates Euclidean coordinates automatically.
+                    'coords': Tensor, # [Len, D] Tensor of explicit coordinates.
+                                      # Use for graphs or manifolds. Overrides 'shape'.
+                }
+
+                Example (Image Captioning):
+                [
+                    {'len': 16, 'causal': True},                 # "Prefix: "
+                    {'len': 256, 'causal': False, 'shape':(16,16)}, # [Image]
+                    {'len': 32, 'causal': True}                  # " description..."
+                ]
+        """
         B, C, H, W = z_t.shape
         grid_h, grid_w = H // 2, W // 2
-        grid_size = grid_h 
+        
+        # 1. Compute Geometry State (Once per forward)
+        geo_state = self.spatial.compute_geometry(spans)
+        
+        # 2. Compute Masks (Once per forward)
+        # Logarithmic Radius Logic based on total sequence length
+        # Proxy 'resolution' is sqrt(total_len)
+        eff_res = math.sqrt(geo_state.total_len)
+        base_res = 8.0; base_radius = 2.5; log_scale = 1.5
+        
+        if eff_res <= base_res:
+            radius = base_radius
+        else:
+            radius = base_radius + log_scale * math.log2(eff_res / base_res)
+            
+        mask_local = self.spatial.get_mask(geo_state, radius=radius)
+        mask_global = self.spatial.get_global_mask(geo_state)
+        
+        # 3. Embedding
         spins = self.spin_encoder(logsnr)
-        x = self.patch_in(z_t, spins)
-        mask_local, mask_global = self.get_masks(grid_size)
+        x = self.patch_in(z_t, spins) 
+        # x is [B, N, D]
+        
         total_aux_loss = 0.0
         for layer in self.layers:
             mask = mask_global if layer.is_global else mask_local
-            x, al = layer(x, mask, grid_size)
+            # Pass geo_state explicitly to layer/rope
+            x, al = layer(x, mask, geo_state)
             total_aux_loss += al
+            
         x = self.norm_final(x)
         z_pred = self.output_head(x)
+        
         l_pred = None
         if self.mode == 'factorized':
             scale = self.scale_decoder(spins).unsqueeze(1)
             z_pred = z_pred * scale
             l_pred = self.lambda_head(x.mean(dim=1)).squeeze(-1)
+            
+        # Unflatten to original shape for compatibility with image-based training loops
         return z_pred.view(B, grid_h, grid_w, 3, 2, 2).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W), l_pred, total_aux_loss
