@@ -60,7 +60,9 @@ class BlockManager:
         if prefix_hash != -1:
             h.update(prefix_hash.to_bytes(8, 'little'))
         if isinstance(content_hashes, list):
-            content_hashes = np.array(content_hashes, dtype=np.int64)
+            # CHANGED: Use uint64 to support full unsigned 64-bit hash values.
+            # np.int64 raises OverflowError for values > 2^63-1.
+            content_hashes = np.array(content_hashes, dtype=np.uint64)
         h.update(content_hashes.tobytes())
         return h.intdigest()
 
