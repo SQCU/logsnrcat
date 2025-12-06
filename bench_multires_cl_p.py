@@ -173,8 +173,8 @@ def run_forward_step(
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
-        k_caches=[kvt_manager.kv_cache[i] for i in range(model.depth)],
-        v_caches=[kvt_manager.kv_cache[i] for i in range(model.depth)],
+        k_caches=[kvt_manager.k_cache[i] for i in range(model.depth)], # Use k_cache
+        v_caches=[kvt_manager.v_cache[i] for i in range(model.depth)], # Use v_cache
         slot_mapping=attn_inputs['slot_mapping'],
         block_mask=block_mask
     )
