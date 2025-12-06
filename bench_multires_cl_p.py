@@ -87,13 +87,6 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     else:
         v_final = v_raw
     
-    # 4. Create cleanup callback
-    def cleanup():
-        for rid in req_ids:
-            kvt_manager.free_request(rid)
-    
-    #context = CacheContext(req_ids=req_ids, cleanup_fn=cleanup)
-
         # 4. Create cleanup callback
     def cleanup():
         for rid in req_ids:
@@ -128,7 +121,15 @@ def run_forward_step(
         zero_map = torch.zeros((1, H, W), device=device)
         logsnr_maps = [zero_map] * B
     else:
-        logsnr_maps = [logsnr[i].view(1, H, W) for i in range(B)]
+        # ✅ FIX: Handle both scalar and spatial logsnr
+        if logsnr.dim() == 1:  # Scalar per sample: [B]
+            # Broadcast to spatial map: [B] -> [B, 1, H, W]
+            logsnr_spatial = logsnr.view(B, 1, 1, 1).expand(B, 1, H, W)
+            logsnr_maps = [logsnr_spatial[i] for i in range(B)]
+        elif logsnr.dim() == 4:  # Already spatial: [B, 1, H, W]
+            logsnr_maps = [logsnr[i] for i in range(B)]
+        else:
+            raise ValueError(f"Invalid logsnr shape: {logsnr.shape}")
 
     for i in range(B):
         item_spans = [s.copy() for s in base_spans]
