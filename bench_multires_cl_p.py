@@ -110,6 +110,7 @@ def run_forward_step(
     model, span_embedder, _, kvt_manager, page_table = components
     B, C, H, W = z.shape
     device = z.device
+    num_layers = len(model.layers)
     
     # 1. Prepare Metadata & Inputs
     batch_spans_meta = []
@@ -163,7 +164,8 @@ def run_forward_step(
     
     block_mask = build_composed_mask(
         span_objects,
-        topo_active=attn_inputs['topo_active'],
+        # FIX: Pass the flattened tensor 'topo_embeds' instead of the list 'attn_inputs['topo_active']'
+        topo_active=topo_embeds,
         topo_heap=attn_inputs['topo_heap'],
         page_table=page_table,
         batch_idx=attn_inputs['batch_idx']
@@ -173,8 +175,8 @@ def run_forward_step(
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
-        k_caches=[kvt_manager.k_cache[i] for i in range(model.depth)], # Use k_cache
-        v_caches=[kvt_manager.v_cache[i] for i in range(model.depth)], # Use v_cache
+        k_caches=[kvt_manager.k_cache[i] for i in range(num_layers)], # Use k_cache
+        v_caches=[kvt_manager.v_cache[i] for i in range(num_layers)], # Use v_cache
         slot_mapping=attn_inputs['slot_mapping'],
         block_mask=block_mask
     )

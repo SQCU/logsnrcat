@@ -288,31 +288,39 @@ class KVTManager:
                  layers: int, 
                  heads: int, 
                  topo_dim: int, 
-                 device='cuda'):
+                 device='cuda',
+                 dtype=torch.float32):
         
         self.device = device
+        self.dtype = dtype
         self.block_size = block_size
         self.block_manager = BlockManager(max_blocks, block_size)
         
         # --- Physical Memory ---
-        # 1. Feature Cache (KV)
-        # [Layers, Max_Blocks, Heads, Block_Size, Head_Dim]
+        # Feature Cache (Split K and V to prevent overwrite)
         self.head_dim = kv_dim // heads
-        self.kv_cache = torch.zeros(
+        
+        # [Layers, Max_Blocks, Heads, Block_Size, Head_Dim]
+        self.k_cache = torch.zeros(
             (layers, max_blocks, heads, block_size, self.head_dim),
-            dtype=torch.bfloat16, device=device
+            dtype=self.dtype, device=device
+        )
+        self.v_cache = torch.zeros(
+            (layers, max_blocks, heads, block_size, self.head_dim),
+            dtype=self.dtype, device=device
         )
         
         # 2. Topology Cache (Coords)
         # [Max_Blocks, Block_Size, Topo_Dim]
         self.topo_cache = torch.zeros(
             (max_blocks, block_size, topo_dim),
-            dtype=torch.float32, device=device
+            dtype=self.dtype, device=device
         )
 
         # Track request metadata
-        self.req_tables: Dict[int, List[int]] = {}  # req_id -> block_table
+        self.req_tables: Dict[int, List[int]] = {}   # req_id -> block_table
         self.req_lengths: Dict[int, int] = {}        # req_id -> total_length
+        self.req_highway_offset: Dict[int, int] = {} # req_id -> last highway val
         
     def allocate_and_write_sequence(
         self,
@@ -391,6 +399,7 @@ class KVTManager:
         """Decrements ref counts and recycles blocks."""
         self.block_manager.free(block_table)
     
+    
     def get_attention_inputs(
         self,
         req_ids: List[int],
@@ -398,27 +407,16 @@ class KVTManager:
     ) -> Dict[str, Any]:
         """
         Returns everything needed for a single attention layer forward pass.
-        
-        Returns dict with:
-            'k_cache': [1, H, Capacity, D]
-            'v_cache': [1, H, Capacity, D]
-            'topo_heap': [Capacity, Topo_Dim] - FULL heap topology
-            'slot_mapping': [sum(L_i)] - where to write new tokens
-            'batch_idx': [B] - request IDs for page table lookup
-            'block_tables': List[List[int]] - for building page table
         """
         # 1. Get K/V views
         k_cache, v_cache = self.get_flat_kv_view(layer_idx)
         
-        # 2. Get FULL topology heap (not just active tokens)
-        topo_heap = self.get_topo_view()  # [Capacity, Topo_Dim]
-        
-        # 3. Build slot mapping for active tokens
+        # 2. Build slot mapping for active tokens
         block_tables = [self.req_tables[rid] for rid in req_ids]
         seq_lengths = [self.req_lengths[rid] for rid in req_ids]
         slot_mapping = self.get_slot_mapping(block_tables, seq_lengths)
         
-        # 4. Batch index tensor
+        # 3. Batch index tensor
         batch_idx = torch.arange(len(req_ids), device=self.device)
         
         return {
@@ -436,16 +434,13 @@ class KVTManager:
         # [Max_Blocks, Block_Size, Topo_Dim] -> [Capacity, Topo_Dim]
         return self.topo_cache.flatten(0, 1)
     
+    
     def get_active_topo_slices(
         self,
         req_ids: List[int]
     ) -> List[torch.Tensor]:
         """
         Returns topology for ONLY the active tokens in each request.
-        Used when you need per-request topology (e.g., for RoPE on Q/K).
-        
-        Returns:
-            List of [L_i, Topo_Dim] tensors
         """
         result = []
         for rid in req_ids:
@@ -475,113 +470,67 @@ class KVTManager:
         Returns a flattened [1, 1, Total_Capacity, Dim] view of K and V caches
         for a specific layer, satisfying FlexAttention's input requirements.
         """
-        # self.kv_cache: [Layers, Max_Blocks, Heads, Block_Size, Head_Dim]
-        # We need to flatten Blocks, Heads, Block_Size into one dimension?
-        # WAIT: Paged FlexAttention expects [1, 1, Total_Tokens, Dim].
-        # It treats the heap as a massive sequence.
-        # But our heap has 'Heads' dimension.
-        # Standard FlexAttention expects:
-        #   query: [B, H, 1, D]
-        #   key:   [B, H, L, D] (Here B=1, H=1, L=Huge)
-        #
-        # If we have multi-head KV cache, we must be careful.
-        # If Heads > 1, the physical heap is [Blocks, Heads, Block_Size, Head_Dim].
-        # Flattening to [Total_Tokens, D] mixes Heads and Tokens if not careful.
-        #
-        # Correct View for Multi-Head Paged Attention:
-        # We treat Heads as part of the Batch or keep them separate?
-        # FlexAttention usually broadcasts over Heads.
-        #
-        # If we flatten to [1, 1, Blocks*Heads*Block_Size, Head_Dim], 
-        # the indices in `page_table` must account for the Head stride? 
-        # OR, we keep Heads dim: [1, Heads, Blocks*Block_Size, Head_Dim]?
-        # 
-        # Let's assume standard layout: [Blocks, Heads, Block_Size, Head_Dim]
-        # We permute to [Heads, Blocks, Block_Size, Head_Dim] -> [Heads, Total_Tokens, D]
-        # Then FlexAttn inputs:
-        #   k: [1, Heads, Total_Tokens, D]
-        
-        k_cache = self.kv_cache[layer_idx] # [Max_Blocks, Heads, Block_Size, Head_Dim]
+        # Retrieve split K and V caches
+        k_cache = self.k_cache[layer_idx] # [Blocks, Heads, Block_Size, Head_Dim]
+        v_cache = self.v_cache[layer_idx]
         
         # Permute to bring Heads out
-        k_cache = k_cache.permute(1, 0, 2, 3) # [Heads, Max_Blocks, Block_Size, Head_Dim]
-        k_flat = k_cache.flatten(1, 2)        # [Heads, Total_Capacity, Head_Dim]
+        # [Blocks, Heads, Block_Size, D] -> [Heads, Blocks, Block_Size, D]
+        k_cache = k_cache.permute(1, 0, 2, 3) 
+        v_cache = v_cache.permute(1, 0, 2, 3)
+        
+        # Flatten Blocks and Block_Size -> Total_Capacity
+        # [Heads, Total_Capacity, Head_Dim]
+        k_flat = k_cache.flatten(1, 2)        
+        v_flat = v_cache.flatten(1, 2)
         
         # Expand Batch dim to 1
-        k_out = k_flat.unsqueeze(0) # [1, Heads, Total_Capacity, Head_Dim]
+        # [1, Heads, Total_Capacity, Head_Dim]
+        k_out = k_flat.unsqueeze(0) 
+        v_out = v_flat.unsqueeze(0)
         
-        # For this demo, assuming K and V are in same tensor or separate.
-        # If self.kv_cache holds both, split them. 
-        # (Assuming separate or caller handles splits).
-        return k_out, k_out # Placeholder: return K and V views
+        return k_out, v_out
+
 
     def get_batch_mappings(self, req_ids: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generates the Page Table and Inverse Table for the Glue Layer.
-        
-        Returns:
-            page_table: [Batch, Max_Logical_Blocks]
-            phys_to_log_table: [Batch, Max_Physical_Blocks]
         """
         batch_size = len(req_ids)
         
-        # 1. Fetch tables
-        tables = [self.block_manager.hash_to_block_id.get(rid, []) for rid in req_ids] 
-        # Wait, block_manager.hash_to... is the cache map. 
-        # We need the block_tables for these requests.
-        # The 'content-agnostic' manager stores tables where?
-        # Ah, the 'memory_manager.py' previous turn implemented 'allocate' returning IDs,
-        # but didn't explicitly store the table per Request ID inside KVTManager.
-        # KVTManager needs to track {req_id -> block_table}.
-        # (Assuming self.req_tables exists)
-        
         tables = [self.req_tables[rid] for rid in req_ids]
-        max_log = max(len(t) for t in tables)
-        max_phys = self.block_manager.blocks.shape[0] if hasattr(self.block_manager, 'blocks') else len(self.block_manager.blocks)
+        # Handle empty batches gracefully using default 0
+        max_log = max([len(t) for t in tables] + [0])
         
-        # 2. Build Page Table (Logical -> Physical)
+        # FIX: Use len() for list-based block storage
+        max_phys = len(self.block_manager.blocks)
+        
+        # Page Table (Logical -> Physical)
         page_table = torch.full((batch_size, max_log), -1, dtype=torch.int32, device=self.device)
         for i, t in enumerate(tables):
-            page_table[i, :len(t)] = torch.tensor(t, dtype=torch.int32, device=self.device)
+            if len(t) > 0:
+                # Direct tensor creation handles the list of ints
+                page_table[i, :len(t)] = torch.tensor(t, dtype=torch.int32, device=self.device)
             
-        # 3. Build Inverse Table (Physical -> Logical)
-        # Initialize with -1
+        # Inverse Table (Physical -> Logical)
         phys_to_log = torch.full((batch_size, max_phys), -1, dtype=torch.int32, device=self.device)
         
-        # Scatter logical indices
-        # logical indices are just 0..len(t)
-        # phys_to_log[b, page_table[b, i]] = i
-        
-        # Vectorized scatter:
-        # We can use scatter_()
-        # indices = page_table.long() # [B, Max_Log] (Physical IDs)
-        # values = torch.arange(max_log).expand(B, -1)
-        # phys_to_log.scatter_(1, indices, values) 
-        # (Need to handle -1 in page_table to avoid invalid writes)
-        
         for i, t in enumerate(tables):
-            phys_ids = torch.tensor(t, dtype=torch.long, device=self.device)
-            log_ids = torch.arange(len(t), dtype=torch.int32, device=self.device)
-            phys_to_log[i].scatter_(0, phys_ids, log_ids)
+            if len(t) > 0:
+                phys_ids = torch.tensor(t, dtype=torch.long, device=self.device)
+                log_ids = torch.arange(len(t), dtype=torch.int32, device=self.device)
+                # Scatter writes logical indices into physical slots
+                phys_to_log[i].scatter_(0, phys_ids, log_ids)
             
         return page_table, phys_to_log
         
-    # In KVTManager (memory_manager.py)
+        
     def get_slot_mapping(self, block_tables: List[List[int]], seq_lengths: List[int]) -> torch.Tensor:
         """
         Generates flat physical token indices for scatter writes.
-        
-        Args:
-            block_tables: List of [block_ids] per sequence
-            seq_lengths: List of L_i per sequence
-            
-        Returns:
-            [sum(seq_lengths)] - flat physical indices
         """
         slots = []
         for table, length in zip(block_tables, seq_lengths):
-            # For each sequence, map token positions to physical slots
-            # Token i in sequence -> Block (i // block_size), Offset (i % block_size)
             for token_idx in range(length):
                 block_idx_in_table = token_idx // self.block_size
                 offset = token_idx % self.block_size

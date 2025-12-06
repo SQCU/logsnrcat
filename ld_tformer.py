@@ -586,36 +586,44 @@ def build_composed_mask(
     doc_ids = []
     for i, span in enumerate(spans):
         doc_ids.extend([i] * (span.end_idx - span.start_idx))
-    doc_ids = torch.tensor(doc_ids, device=topo_embeds.device)
+    doc_ids = torch.tensor(doc_ids, device=topo_active.device)
     
     # 2. Compose mask_mod
-    def composed_mod(b, h, q_idx, kv_idx):
-        # Both indices now index into spaces with GLOBAL coordinates
-        
-        # q_idx: index into active tokens (but they have global coords)
-        # kv_idx: index into heap (which has global coords)
-        
-        # Spatial distance uses global coordinates
-        q_highway = topo_active[q_idx, 0]  # e.g., 336
-        k_highway = topo_heap[kv_idx, 0]   # e.g., 150
-        
-        # Highway enforces causality: can't attend to future
-        causal = q_highway >= k_highway
-        
-        # Spatial dims for sliding window
-        q_spatial = topo_active[q_idx, 1:]
-        k_spatial = topo_heap[kv_idx, 1:]
-        
-        # For text tokens, spatial = [0, 0, ...] so distance is just highway
-        # For image tokens, spatial = [x, y, ...] so distance includes geometry
-        spatial_dist = torch.norm(q_spatial - k_spatial)
-        
-        return causal & (spatial_dist < window_size)
+    topo_columns = topo_active.unbind(dim=-1)
     
-    # 3. Create logical mask
+    highway_col = topo_columns[0]   # 1D Tensor
+    spatial_cols = topo_columns[1:] # List of 1D Tensors
+    
+    # Pre-calculate threshold for efficiency
+    win_sq = window_size * window_size
+    
+    # 3. Define Mask Mod using only 1D accesses
+    def composed_mod(b, h, q_idx, kv_idx):
+        # A. Document Masking
+        # Access 1D tensor -> Scalar
+        q_doc = doc_ids[q_idx]
+        k_doc = doc_ids[kv_idx]
+        same_doc = (q_doc == k_doc)
+        
+        # B. Causal Highway Masking
+        # Access 1D tensor -> Scalar
+        q_time = highway_col[q_idx]
+        k_time = highway_col[kv_idx]
+        causal = q_time >= k_time
+        
+        # C. Spatial Sliding Window (N-Dimensional)
+        # Compute Squared Euclidean Distance via scalar accumulation
+        dist_sq = 0.0
+        for col in spatial_cols:
+            d = col[q_idx] - col[kv_idx]
+            dist_sq = dist_sq + (d * d)
+            
+        return same_doc & causal & (dist_sq < win_sq)
+    
+    # 4. Create logical mask
     logical_mask = create_block_mask(
         composed_mod,
-        B=None, H=None,  # Will be inferred
+        B=None, H=None,
         Q_LEN=len(doc_ids),
         KV_LEN=len(doc_ids)
     )
@@ -667,8 +675,8 @@ class LDTformerAttention(nn.Module):
         # 1. Compute Q, K, V for NEW/ACTIVE tokens
         qkv = self.qkv(x)
         qkv = qkv.reshape(B, L, 3, self.num_heads, self.head_dim)
-        # [3, B, L, H, D_head] -> [3, B, H, L, D_head]
-        q, k, v = qkv.permute(0, 1, 3, 2, 4).unbind(0)
+        # [B, L, 3, H, D_head] -> [3, B, H, L, D_head]
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         
         # Apply RoPE using GLOBAL coordinates
         # topo_active[i] contains the ABSOLUTE highway position + spatial coords
