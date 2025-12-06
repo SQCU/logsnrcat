@@ -3,7 +3,7 @@ import torch
 import xxhash
 import numpy as np
 import math
-from typing import List, Dict, Tuple, Any, Callable
+from typing import List, Dict, Tuple, Any, Callable, Optional
 
 # =========================================================
 # 1. CONTENT IDENTITY (Hashing Policy)
@@ -101,7 +101,7 @@ def render_topology_embeddings(
     spans: List[Dict],
     max_dims: int,
     device: torch.device,
-    highway_offset: int = 0  # CRITICAL: Where to START counting
+    highway_offset: int = 0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Renders GLOBAL topology coordinates.
@@ -115,12 +115,16 @@ def render_topology_embeddings(
     manifold_coords = []
     doc_ids = []
     
-    current_highway = highway_offset  # Start from offset, not 0
+    current_highway = highway_offset
+    
+    # Dimension 0 is Highway. Remaining dimensions are Spatial/Manifold.
+    spatial_dim_capacity = max_dims - 1
     
     for i, span in enumerate(spans):
-        num_tokens = math.prod(span['shape'])
+        shape = span['shape']
+        num_tokens = math.prod(shape)
         
-        # Highway: continue global counting
+        # 1. Highway (Global Linear Time)
         h_range = torch.arange(
             current_highway, 
             current_highway + num_tokens, 
@@ -129,20 +133,23 @@ def render_topology_embeddings(
         highway_idx.append(h_range)
         current_highway += num_tokens
         
-        # B. Manifold (Local Spatial Grid)
-        # Generates integer coordinates
+        # 2. Manifold (Local Spatial Grid)
+        # Uniform logic for 1D (Text), 2D (Images), or ND
         dims = [torch.arange(d, device=device) for d in shape]
-        if dims:
-            mesh = torch.meshgrid(*dims, indexing='ij')
-            coords = torch.stack([m.flatten() for m in mesh], dim=-1)
-        else:
-            # Scalar case (empty shape?) -> 0d
-            coords = torch.zeros((num_tokens, 0), device=device)
         
-        # Pad to fixed spatial capacity
+        # meshgrid works for 1 arg (1D) or N args (ND)
+        mesh = torch.meshgrid(*dims, indexing='ij')
+        
+        # Stack coordinates: 
+        # 1D -> [L, 1], 2D -> [H*W, 2], etc.
+        coords = torch.stack([m.flatten() for m in mesh], dim=-1)
+        
+        # Pad to fixed spatial capacity (R^k -> R^N)
         current_dim = coords.shape[-1]
+        
         if current_dim < spatial_dim_capacity:
             pad_size = spatial_dim_capacity - current_dim
+            # Pad with zeros in the extra dimensions
             padding = torch.zeros((num_tokens, pad_size), device=device)
             coords = torch.cat([coords, padding], dim=-1)
         elif current_dim > spatial_dim_capacity:
@@ -150,15 +157,14 @@ def render_topology_embeddings(
              
         manifold_coords.append(coords)
         
-        # C. Doc IDs
-        # Used for block-causal masking
+        # 3. Doc IDs
         doc_ids.append(torch.full((num_tokens,), i, device=device, dtype=torch.int32))
 
     # Stack
     flat_highway = torch.cat(highway_idx).unsqueeze(-1).float()
     flat_manifold = torch.cat(manifold_coords).float()
     
-    # [Total_L, Max_Dims]
+    # [Total_L, 1 + Spatial_Cap]
     topo_embeds = torch.cat([flat_highway, flat_manifold], dim=-1)
     flat_doc_ids = torch.cat(doc_ids)
     

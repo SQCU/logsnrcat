@@ -2,18 +2,23 @@
 import os
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from typing import List, Dict, Any, Optional
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
-import os
 import sys
 from pathlib import Path
 
 from diffusion_utils import get_schedule, get_alpha_sigma, BucketManager
 from dataset import CompositeIterator
-from model import HybridGemmaDiT
+#from model import HybridGemmaDiT
+
+from ld_tformer import coolerLDTformer, SpanEmbedder, SpanUnembedder, build_composed_mask
+from ld_tformer_embedding_functional import render_topology_embeddings
+from memory_manager import KVTManager, PageTable
 
 # Hook the ZMQ compiler backend immediately if available
 try:
@@ -49,6 +54,46 @@ class ExperimentLogger:
         self.figure_count += 1
         return filepath
 
+### wowie this is where we put diffusion helpers!!!!
+
+def predict_velocity_field(components, z, logsnr, spans, mode):
+    """
+    Unified prediction logic.
+    Returns:
+        v_final: [B, C, H, W] - Spatially corrected velocity field
+        aux_loss: Scalar - Internal model auxiliary loss (e.g. MoE balancing)
+    """
+    model, _, span_unemb, _, _ = components
+    
+    # 1. Forward Pass
+    # Naive mode passes zeroed logsnr input, but the architecture is invariant
+    suppress = (mode == 'naive')
+    z_flat, aux_loss, objs = run_forward_step(
+        components, z, logsnr, spans, 
+        suppress_logsnr_input=suppress
+    )
+    
+    # 2. Unembed
+    decoded = span_unemb.decode(z_flat, objs)
+    
+    # 3. Stack & Parse
+    # [B, C, H, W]
+    v_raw = torch.stack([d['image_vpreds'] for d in decoded])
+    
+    if mode == 'factorized':
+        # [B, 1, H, W] - Preserve spatial dimensions!
+        l_maps = torch.stack([d['image_logsnrs'] for d in decoded])
+        
+        # Spatial Correction: Apply sigmoid scale element-wise per pixel
+        # sigma_p(x,y) = sqrt(sigmoid(-logsnr(x,y)))
+        sigma_p = torch.sqrt(torch.sigmoid(-l_maps))
+        
+        # [B, C, H, W] * [B, 1, H, W] -> Broadcasts spatially
+        v_final = v_raw * sigma_p
+    else:
+        v_final = v_raw
+        
+    return v_final, aux_loss
 
 def run_forward_step(
     components, 
@@ -141,6 +186,65 @@ def run_forward_step(
     return z_out.squeeze(0), aux_loss, span_objects
 
 
+def logsnr_to_alpha_sigma(logsnr):
+    """Convert log(SNR) to (alpha, sigma) for noise schedule."""
+    # logsnr = log(alpha^2 / sigma^2)
+    # SNR = alpha^2 / sigma^2
+    snr = torch.exp(logsnr)
+    # alpha^2 = SNR / (1 + SNR), sigma^2 = 1 / (1 + SNR)
+    alpha_sq = snr / (1.0 + snr)
+    sigma_sq = 1.0 / (1.0 + snr)
+    return torch.sqrt(alpha_sq), torch.sqrt(sigma_sq)
+
+def sample_logsnr_triplet(batch_size, device, min_logsnr=-10.0, max_logsnr=0.0, min_gap=1.0):
+    """
+    Sample three noise levels at least min_gap apart.
+    Returns: (logsnr_low, logsnr_mid, logsnr_high) where low > mid > high
+    """
+    # Sample lowest (least noisy, highest logsnr)
+    logsnr_low = torch.rand(batch_size, device=device) * (max_logsnr - min_logsnr) + min_logsnr
+    
+    # Sample mid: 1-4 logsnr units below low
+    gap_mid = torch.rand(batch_size, device=device) * 3.0 + min_gap
+    logsnr_mid = (logsnr_low - gap_mid).clamp(min=min_logsnr)
+    
+    # Sample high: 1-4 logsnr units below mid
+    gap_high = torch.rand(batch_size, device=device) * 3.0 + min_gap
+    logsnr_high = (logsnr_mid - gap_high).clamp(min=min_logsnr)
+    
+    return logsnr_low, logsnr_mid, logsnr_high
+
+def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
+    """
+    Take one deterministic reverse diffusion step using v-prediction.
+    
+    Args:
+        z_t: Current noisy latent [B, C, H, W]
+        v_pred: Model's v-prediction [B, C, H, W]
+        logsnr_from: Current log(SNR) [B]
+        logsnr_to: Target log(SNR) [B]
+    
+    Returns:
+        z_to: Denoised latent at target noise level [B, C, H, W]
+    """
+    alpha_from, sigma_from = logsnr_to_alpha_sigma(logsnr_from)
+    alpha_to, sigma_to = logsnr_to_alpha_sigma(logsnr_to)
+    
+    # v-prediction: v = alpha * eps - sigma * x0
+    # Solve for x0: x0 = (alpha * z_t - sigma * v) / (alpha^2 + sigma^2)
+    # But alpha^2 + sigma^2 = 1, so:
+    x0_pred = alpha_from.view(-1,1,1,1) * z_t - sigma_from.view(-1,1,1,1) * v_pred
+    
+    # eps prediction: eps = (sigma * z_t + alpha * v) / (alpha^2 + sigma^2) = sigma * z_t + alpha * v
+    eps_pred = sigma_from.view(-1,1,1,1) * z_t + alpha_from.view(-1,1,1,1) * v_pred
+    
+    # DDIM step (deterministic): z_to = alpha_to * x0_pred + sigma_to * eps_pred
+    z_to = alpha_to.view(-1,1,1,1) * x0_pred + sigma_to.view(-1,1,1,1) * eps_pred
+    
+    return z_to
+
+### metadata helpers!!!
+
 def get_image_spans(resolution):
     """
     Helper to generate span metadata for a single 2D continuous latent (image).
@@ -157,6 +261,8 @@ def get_image_spans(resolution):
     #{'len': 120, 'shape': (8, 15), 'causal': False},
     #{'len': 120, 'shape': (15, 8), 'causal': False}]
     return [{'type': 'latent', 'len': length, 'shape': (latent_res, latent_res), 'causal': False}]
+
+### plotting and historiography helpers!!
 
 def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     """
@@ -192,155 +298,6 @@ def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
     plt.suptitle("Composite Dataset Samples", fontsize=14)
     plt.tight_layout()
     return fig
-
-def warmup_model(model, buckets):
-    print("🔥 Warming up compilation cache...")
-    # 1. Warmup Training Graph
-    model.train()
-    for res, bs in buckets:
-        print(f"   ...compiling train graph for {res}px")
-        # Create dummy inputs
-        z = torch.randn(bs, 3, res, res, device='cuda')
-        t = torch.rand(bs, device='cuda')
-        logsnr = get_schedule(t)
-        spans = get_image_spans(res)
-        
-        # Run one step (Forward + Backward)
-        opt = torch.optim.AdamW(model.parameters())
-        opt.zero_grad()
-        out, _, _ = model(z, logsnr, spans)
-        loss = out.mean()
-        loss.backward()
-        opt.step()
-        opt.zero_grad() # cleanup
-
-    # 2. Warmup Inference Graph
-    model.eval()
-    with torch.no_grad():
-        for res, _ in buckets: # BS doesn't strictly matter for shape generalization usually
-            print(f"   ...compiling inference graph for {res}px")
-            z = torch.randn(2, 3, res, res, device='cuda') # Small batch
-            logsnr = get_schedule(torch.rand(2, device='cuda'))
-            spans = get_image_spans(res)
-            model(z, logsnr, spans)
-    model.train()
-    print("✅ Warmup complete. No more stalls expected.")
-
-def train_multires(mode, buckets, steps=1000, embed_dim=256, depth=12, logger=None):
-    """
-    Generalized training loop accepting dynamic buckets.
-    """
-    device = torch.device('cuda')
-    print(f"\n--- Training: {mode.upper()} ---")
-    print(f"    Buckets (Res, Batch): {buckets}")
-    
-    model = HybridGemmaDiT(mode, embed_dim=embed_dim, depth=depth).to(device)
-    #model = torch.compile(model, dynamic=True)
-    model = torch.compile(model, dynamic=True)
-    warmup_model(model, buckets)
-        
-    # Standard Params
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
-    
-    # Configure Composite Dataset
-    mix_config = {'checkerboard': 0.5, 'torus': 0.5}
-    iterator = CompositeIterator(device, config=mix_config)
-    
-    manager = BucketManager(buckets)
-    history = []
-    
-    pbar = tqdm(range(steps), desc=f"{mode}")
-    for i in pbar:
-        opt.zero_grad()
-        res, bs = manager.next_bucket()
-        
-        # Generate mixed batch
-        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
-        labels = iterator.last_labels # [B]
-        
-        t = torch.rand(bs, device=device).clamp(0.001, 0.999)
-        logsnr = get_schedule(t)
-        alpha, sigma = get_alpha_sigma(logsnr)
-        
-        eps = torch.randn_like(x0)
-        z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
-        v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
-
-        spans = get_image_spans(res)
-        
-        # Forward
-        raw, l_pred, aux_loss = model(z_t, logsnr, spans)
-        
-        if mode == 'factorized':
-            sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1, 1, 1, 1)
-            v_pred = raw * sigma_p
-        else:
-            v_pred = raw
-            
-        # Detailed Loss Calculation
-        loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
-        total_loss = loss_elem.mean()
-        
-        total_loss.backward()
-        opt.step()
-        
-        # --- LOGGING ---
-        step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
-        
-        # Breakdown by dataset type
-        for idx, name in iterator.label_map.items():
-            mask = (labels == idx)
-            if mask.any():
-                step_stats[f'loss_{name}'] = loss_elem[mask].mean().item()
-            else:
-                step_stats[f'loss_{name}'] = None 
-                
-        history.append(step_stats)
-        
-        if i % 100 == 0:
-            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'res': res})
-            
-    return pd.DataFrame(history), model
-
-@torch.no_grad()
-def sample_viz(components, res, num_samples=8):
-    model, span_emb, span_unemb, kvt, pt = components
-    model.eval()
-    
-    z = torch.randn(num_samples, 3, res, res, device='cuda')
-    ts = torch.linspace(1.0, 0.001, 50, device='cuda')
-    base_spans = get_image_spans(res)
-
-    for i in range(49):
-        t = ts[i]; t_n = ts[i+1]
-        logsnr = get_schedule(torch.full((num_samples,), t, device='cuda'))
-        
-        # Forward
-        z_out_flat, _, span_objs = run_forward_step(
-            model, span_emb, kvt, pt, z, logsnr, base_spans
-        )
-        
-        outputs = span_unemb.decode(z_out_flat, span_objs)
-        v_pred_raw = torch.stack(outputs['image_vpreds'])
-        l_pred = torch.stack(outputs['image_logsnrs']).mean(dim=[2,3])
-        
-        # Sampler Logic
-        # (Assuming 'factorized' check can be inferred or passed. Defaulting to raw for viz)
-        # Hack: Check if model wrapper has mode? We passed components tuple.
-        # Let's assume naive for viz unless we stored mode.
-        v_pred = v_pred_raw # Simplify for viz
-        
-        logsnr_n = get_schedule(torch.full((num_samples,), t_n, device='cuda'))
-        alpha, sigma = get_alpha_sigma(logsnr)
-        alpha_n, sigma_n = get_alpha_sigma(logsnr_n)
-        
-        x0 = alpha.view(-1,1,1,1)*z - sigma.view(-1,1,1,1)*v_pred
-        eps = sigma.view(-1,1,1,1)*z + alpha.view(-1,1,1,1)*v_pred
-        z = alpha_n.view(-1,1,1,1)*x0 + sigma_n.view(-1,1,1,1)*eps
-        
-    model.train()
-    return z.cpu().clamp(0, 1)
-
 
 def plot_detailed_loss(df_naive, df_fact, logger):
     """
@@ -414,218 +371,6 @@ def plot_sample_grid(samples_list, logger, string="final_samples"):
     plt.suptitle("Unconditional Generation (Mixed Distribution)", fontsize=16)
     plt.tight_layout()
     logger.save_figure(fig, string)
-
-def logsnr_to_alpha_sigma(logsnr):
-    """Convert log(SNR) to (alpha, sigma) for noise schedule."""
-    # logsnr = log(alpha^2 / sigma^2)
-    # SNR = alpha^2 / sigma^2
-    snr = torch.exp(logsnr)
-    # alpha^2 = SNR / (1 + SNR), sigma^2 = 1 / (1 + SNR)
-    alpha_sq = snr / (1.0 + snr)
-    sigma_sq = 1.0 / (1.0 + snr)
-    return torch.sqrt(alpha_sq), torch.sqrt(sigma_sq)
-
-def sample_logsnr_triplet(batch_size, device, min_logsnr=-10.0, max_logsnr=0.0, min_gap=1.0):
-    """
-    Sample three noise levels at least min_gap apart.
-    Returns: (logsnr_low, logsnr_mid, logsnr_high) where low > mid > high
-    """
-    # Sample lowest (least noisy, highest logsnr)
-    logsnr_low = torch.rand(batch_size, device=device) * (max_logsnr - min_logsnr) + min_logsnr
-    
-    # Sample mid: 1-4 logsnr units below low
-    gap_mid = torch.rand(batch_size, device=device) * 3.0 + min_gap
-    logsnr_mid = (logsnr_low - gap_mid).clamp(min=min_logsnr)
-    
-    # Sample high: 1-4 logsnr units below mid
-    gap_high = torch.rand(batch_size, device=device) * 3.0 + min_gap
-    logsnr_high = (logsnr_mid - gap_high).clamp(min=min_logsnr)
-    
-    return logsnr_low, logsnr_mid, logsnr_high
-
-def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
-    """
-    Take one deterministic reverse diffusion step using v-prediction.
-    
-    Args:
-        z_t: Current noisy latent [B, C, H, W]
-        v_pred: Model's v-prediction [B, C, H, W]
-        logsnr_from: Current log(SNR) [B]
-        logsnr_to: Target log(SNR) [B]
-    
-    Returns:
-        z_to: Denoised latent at target noise level [B, C, H, W]
-    """
-    alpha_from, sigma_from = logsnr_to_alpha_sigma(logsnr_from)
-    alpha_to, sigma_to = logsnr_to_alpha_sigma(logsnr_to)
-    
-    # v-prediction: v = alpha * eps - sigma * x0
-    # Solve for x0: x0 = (alpha * z_t - sigma * v) / (alpha^2 + sigma^2)
-    # But alpha^2 + sigma^2 = 1, so:
-    x0_pred = alpha_from.view(-1,1,1,1) * z_t - sigma_from.view(-1,1,1,1) * v_pred
-    
-    # eps prediction: eps = (sigma * z_t + alpha * v) / (alpha^2 + sigma^2) = sigma * z_t + alpha * v
-    eps_pred = sigma_from.view(-1,1,1,1) * z_t + alpha_from.view(-1,1,1,1) * v_pred
-    
-    # DDIM step (deterministic): z_to = alpha_to * x0_pred + sigma_to * eps_pred
-    z_to = alpha_to.view(-1,1,1,1) * x0_pred + sigma_to.view(-1,1,1,1) * eps_pred
-    
-    return z_to
-
-def compute_consistency_loss(model, x0, spans, mode='factorized', 
-                            min_logsnr=-10.0, max_logsnr=0.0):
-    """
-    Compute trajectory consistency loss.
-    
-    Strategy:
-    1. Sample triplet (logsnr_low, logsnr_mid, logsnr_high)
-    2. Add noise to x0 at logsnr_low (most noisy in this triplet)
-    3. Generate 1-step trajectory: low → high
-    4. Generate 2-step trajectory: low → mid → high
-    5. Minimize ||z_high_1step - z_high_2step||
-    6. Also minimize ||z_mid_1step - z_mid_2step|| (optional, for stability)
-    """
-    device = x0.device
-    batch_size = x0.shape[0]
-    
-    # Sample noise levels
-    logsnr_low, logsnr_mid, logsnr_high = sample_logsnr_triplet(
-        batch_size, device, min_logsnr, max_logsnr
-    )
-    
-    # Add noise at logsnr_low
-    alpha_low, sigma_low = logsnr_to_alpha_sigma(logsnr_low)
-    eps = torch.randn_like(x0)
-    z_low = alpha_low.view(-1,1,1,1) * x0 + sigma_low.view(-1,1,1,1) * eps
-    
-    # === 1-STEP TRAJECTORY: low → high ===
-    raw_low, l_pred_low, _ = model(z_low, logsnr_low, spans)
-    
-    if mode == 'factorized':
-        sigma_p_low = torch.sqrt(torch.sigmoid(-l_pred_low)).view(-1,1,1,1)
-        v_pred_low = raw_low * sigma_p_low
-    else:
-        v_pred_low = raw_low
-    
-    # Step to high (no grad needed for this trajectory)
-    with torch.no_grad():
-        z_high_1step = euler_reverse_step(z_low, v_pred_low, logsnr_low, logsnr_high)
-    
-    # === 2-STEP TRAJECTORY: low → mid → high ===
-    # Step 1: low → mid (requires grad for mid prediction)
-    z_mid_2step = euler_reverse_step(z_low, v_pred_low, logsnr_low, logsnr_mid)
-    
-    # Step 2: mid → high (this is where we need gradients)
-    raw_mid, l_pred_mid, _ = model(z_mid_2step, logsnr_mid, spans)
-    
-    if mode == 'factorized':
-        sigma_p_mid = torch.sqrt(torch.sigmoid(-l_pred_mid)).view(-1,1,1,1)
-        v_pred_mid = raw_mid * sigma_p_mid
-    else:
-        v_pred_mid = raw_mid
-    
-    z_high_2step = euler_reverse_step(z_mid_2step, v_pred_mid, logsnr_mid, logsnr_high)
-    
-    # === CONSISTENCY LOSSES ===
-    # Main loss: 1-step should match 2-step at high
-    loss_high = F.mse_loss(z_high_1step, z_high_2step)
-    
-    # Optional: Also match at mid (helps stability)
-    with torch.no_grad():
-        z_mid_1step = euler_reverse_step(z_low, v_pred_low, logsnr_low, logsnr_mid)
-    loss_mid = F.mse_loss(z_mid_1step, z_mid_2step)
-    
-    return loss_high + 0.5 * loss_mid
-
-def distill_multires(model, mode, buckets, steps=1000, embed_dim=256, logger=None):
-    """
-    Trajectory consistency distillation phase.
-    Runs AFTER initial denoising training.
-    """
-    device = torch.device('cuda')
-    print(f"\n--- Distilling: {mode.upper()} ---")
-    print(f"    Buckets (Res, Batch): {buckets}")
-    print(f"    ⚠️  Using fp16 + reduced batch size for memory")
-    
-    # Use lower LR for fine-tuning
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-    # Reduce batch sizes by half for memory headroom
-    buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
-    
-    # Configure dataset
-    mix_config = {'checkerboard': 0.5, 'torus': 0.5}
-    iterator = CompositeIterator(device, config=mix_config)
-    
-    manager = BucketManager(buckets_distill)
-    history = []
-    
-    # Enable fp16 autocast for memory efficiency
-    scaler = torch.amp.GradScaler('cuda')
-    
-    pbar = tqdm(range(steps), desc=f"distill-{mode}")
-    for i in pbar:
-        opt.zero_grad()
-        res, bs = manager.next_bucket()
-        
-        # Generate batch
-        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
-        labels = iterator.last_labels
-        
-        spans = get_image_spans(res)
-        
-        with torch.amp.autocast('cuda'):
-            # Compute consistency loss (3 NFE per sample)
-            loss_consistency = compute_consistency_loss(
-                model, x0, spans, mode=mode,
-                min_logsnr=-10.0, max_logsnr=0.0
-            )
-            
-            # Optional: Add small denoising loss to prevent drift
-            # (Comment out if you want pure consistency training)
-            t = torch.rand(bs, device=device).clamp(0.001, 0.999)
-            logsnr = get_schedule(t)
-            alpha, sigma = get_alpha_sigma(logsnr)
-            
-            eps = torch.randn_like(x0)
-            z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
-            v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
-            
-            raw, l_pred, aux_loss = model(z_t, logsnr, spans)
-            
-            if mode == 'factorized':
-                sigma_p = torch.sqrt(torch.sigmoid(-l_pred)).view(-1,1,1,1)
-                v_pred = raw * sigma_p
-            else:
-                v_pred = raw
-            
-            loss_denoise = F.mse_loss(v_pred, v_true)
-            
-            # Combined loss (consistency is primary, denoising prevents drift)
-            total_loss = loss_consistency + 0.1 * loss_denoise + aux_loss
-        
-        # Backward with gradient scaling
-        scaler.scale(total_loss).backward()
-        scaler.step(opt)
-        scaler.update()
-        
-        # Logging
-        step_stats = {
-            'step': i, 
-            'res': res, 
-            'loss_consistency': loss_consistency.item(),
-            'loss_denoise': loss_denoise.item(),
-            'loss_total': total_loss.item()
-        }
-        history.append(step_stats)
-        
-        if i % 50 == 0:
-            pbar.set_postfix({
-                'cons': f'{loss_consistency.item():.4f}',
-                'den': f'{loss_denoise.item():.4f}',
-                'res': res
-            })
-    
-    return pd.DataFrame(history), model
 
 def plot_distillation_loss(df_naive, df_fact, logger):
     """Plot consistency loss curves."""
@@ -701,11 +446,190 @@ def plot_comparison_grid(samples_before, samples_after, resolutions):
     plt.tight_layout()
     return fig
 
+### crunchy stuff!!!
+
+@torch.no_grad()
+def sample_viz(components, res, num_samples=8):
+    model, span_emb, span_unemb, kvt, pt = components
+    model.eval()
+    
+    z = torch.randn(num_samples, 3, res, res, device='cuda')
+    ts = torch.linspace(1.0, 0.001, 50, device='cuda')
+    base_spans = get_image_spans(res)
+
+    for i in range(49):
+        t = ts[i]; t_n = ts[i+1]
+        logsnr = get_schedule(torch.full((num_samples,), t, device='cuda'))
+        
+        # Forward
+        z_out_flat, _, span_objs = run_forward_step(
+            model, span_emb, kvt, pt, z, logsnr, base_spans
+        )
+        
+        outputs = span_unemb.decode(z_out_flat, span_objs)
+        v_pred_raw = torch.stack(outputs['image_vpreds'])
+        l_pred = torch.stack(outputs['image_logsnrs']).mean(dim=[2,3])
+        
+        # Sampler Logic
+        # (Assuming 'factorized' check can be inferred or passed. Defaulting to raw for viz)
+        # Hack: Check if model wrapper has mode? We passed components tuple.
+        # Let's assume naive for viz unless we stored mode.
+        v_pred = v_pred_raw # Simplify for viz
+        
+        logsnr_n = get_schedule(torch.full((num_samples,), t_n, device='cuda'))
+        alpha, sigma = get_alpha_sigma(logsnr)
+        alpha_n, sigma_n = get_alpha_sigma(logsnr_n)
+        
+        x0 = alpha.view(-1,1,1,1)*z - sigma.view(-1,1,1,1)*v_pred
+        eps = sigma.view(-1,1,1,1)*z + alpha.view(-1,1,1,1)*v_pred
+        z = alpha_n.view(-1,1,1,1)*x0 + sigma_n.view(-1,1,1,1)*eps
+        
+    model.train()
+    return z.cpu().clamp(0, 1)
+
+def warmup_model(model, buckets):
+    print("🔥 Warming up compilation cache...")
+    # 1. Warmup Training Graph
+    model.train()
+    for res, bs in buckets:
+        print(f"   ...compiling train graph for {res}px")
+        # Create dummy inputs
+        z = torch.randn(bs, 3, res, res, device='cuda')
+        t = torch.rand(bs, device='cuda')
+        logsnr = get_schedule(t)
+        spans = get_image_spans(res)
+        
+        # Run one step (Forward + Backward)
+        opt = torch.optim.AdamW(model.parameters())
+        opt.zero_grad()
+        out, _, _ = model(z, logsnr, spans)
+        loss = out.mean()
+        loss.backward()
+        opt.step()
+        opt.zero_grad() # cleanup
+
+    # 2. Warmup Inference Graph
+    model.eval()
+    with torch.no_grad():
+        for res, _ in buckets: # BS doesn't strictly matter for shape generalization usually
+            print(f"   ...compiling inference graph for {res}px")
+            z = torch.randn(2, 3, res, res, device='cuda') # Small batch
+            logsnr = get_schedule(torch.rand(2, device='cuda'))
+            spans = get_image_spans(res)
+            model(z, logsnr, spans)
+    model.train()
+    print("✅ Warmup complete. No more stalls expected.")
+
+def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsnr=-5.0, max_logsnr=5.0):
+    """
+    Consolidated Consistency Loss.
+    Optimizes 2 objectives:
+    1. Trajectory Consistency: 1-Step (Coarse) should match 2-Step (Fine).
+    2. Drift Correction: Generated states should yield predictions matching Ground Truth states.
+    """
+    B = x0.shape[0]
+    device = x0.device
+
+    # 1. Setup Trajectory Points
+    l_start, l_mid, l_end = sample_logsnr_triplet(B, device, min_logsnr, max_logsnr)
+    
+    # Create Starting State (Noisy)
+    a_start, s_start = logsnr_to_alpha_sigma(l_start)
+    z_start = x0 * a_start.view(-1,1,1,1) + torch.randn_like(x0) * s_start.view(-1,1,1,1)
+    
+    # === A. FINE TRAJECTORY (The Target) ===
+    # Step 1: Start -> Mid
+    # We differentiate through v_start to optimize the start of the chain
+    v_start, aux_start = predict_velocity_field(components, z_start, l_start, spans, mode)
+    z_mid_gen = euler_reverse_step(z_start, v_start, l_start, l_mid)
+    
+    # Step 2: Mid -> End
+    # We detach z_mid_gen for the *prediction* calculation to prevent 
+    # the target from moving to meet the student.
+    v_mid_gen, aux_mid = predict_velocity_field(components, z_mid_gen.detach(), l_mid, spans, mode)
+    z_end_fine = euler_reverse_step(z_mid_gen, v_mid_gen, l_mid, l_end)
+    
+    # === B. COARSE TRAJECTORY (The Student) ===
+    # Start -> End (Directly using v_start)
+    z_end_coarse = euler_reverse_step(z_start, v_start, l_start, l_end)
+    
+    # LOSS 1: Trajectory Consistency
+    # "Fine" is the ground truth approximation. "Coarse" tries to match it.
+    loss_traj = F.mse_loss(z_end_coarse, z_end_fine.detach())
+    
+    # === C. DRIFT CORRECTION ===
+    # Ensure the model's prediction at the *generated* mid-point (z_mid_gen)
+    # is consistent with what it would predict at a *true* mid-point (z_mid_real).
+    
+    # Create Ground Truth Mid State
+    a_mid, s_mid = logsnr_to_alpha_sigma(l_mid)
+    z_mid_real = x0 * a_mid.view(-1,1,1,1) + torch.randn_like(x0) * s_mid.view(-1,1,1,1)
+    
+    # Get Teacher Prediction (at real state)
+    with torch.no_grad():
+        v_mid_real, _ = predict_velocity_field(components, z_mid_real, l_mid, spans, mode)
+    
+    # LOSS 2: Drift / Denoising Consistency
+    # v_mid_gen (from A) should match v_mid_real
+    loss_drift = F.mse_loss(v_mid_gen, v_mid_real)
+    
+    return loss_traj + loss_drift, aux_start + aux_mid
+
+
+def distill_multires(components, mode, buckets, steps=1000, logger=None):
+    print(f"\n--- Distilling: {mode.upper()} ---")
+    model = components[0]
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    
+    # Halve batch size for memory safety (student + teacher forwards)
+    buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
+    
+    iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
+    manager = BucketManager(buckets_distill)
+    history = []
+    scaler = torch.amp.GradScaler('cuda')
+    
+    pbar = tqdm(range(steps), desc=f"distill-{mode}")
+    for i in pbar:
+        opt.zero_grad()
+        res, bs = manager.next_bucket()
+        
+        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
+        spans = get_image_spans(res)
+        
+        with torch.amp.autocast('cuda'):
+            # 1. Consistency Loss
+            loss_c = compute_consistency_loss(
+                components, x0, spans, mode=mode,
+                min_logsnr=-4.0, max_logsnr=4.0
+            )
+            
+            # 2. Denoising Regularization (Prevent drift)
+            t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
+            l_den = get_schedule(t)
+            a, s = logsnr_to_alpha_sigma(l_den)
+            eps = torch.randn_like(x0)
+            z_t = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
+            v_t = a.view(-1,1,1,1)*eps - s.view(-1,1,1,1)*x0
+            
+            v_pred, aux_loss = predict_velocity_field(components, z_t, l_den, spans, mode)
+            
+            loss_d = F.mse_loss(v_pred, v_t)
+            loss = loss_c + 0.1 * loss_d + aux_loss
+            
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        
+        history.append({'step': i, 'res': res, 'loss_total': loss.item(), 'loss_cons': loss_c.item()})
+        if i % 50 == 0:
+            pbar.set_postfix({'cons': f'{loss_c.item():.4f}', 'den': f'{loss_d.item():.4f}'})
+            
+    return pd.DataFrame(history)
+
 def train_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Training: {mode.upper()} ---")
-    model, _, span_unembedder, _, _ = components
-    
-    # Optimizer resets every run
+    model = components[0]
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
     
     iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
@@ -729,29 +653,8 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
 
         base_spans = get_image_spans(res)
         
-        # Control Input
-        suppress_input = (mode == 'naive')
-        
-        z_out_flat, aux_loss, span_objs = run_forward_step(
-            components, z_t, logsnr, base_spans, 
-            suppress_logsnr_input=suppress_input
-        )
-        
-        # Decode (List of Dicts)
-        outputs = span_unembedder.decode(z_out_flat, span_objs)
-        
-        # Parse Output List
-        v_pred_raw = torch.stack([o['image_vpreds'] for o in outputs])
-        l_pred_maps = torch.stack([o['image_logsnrs'] for o in outputs])
-        
-        # Logic branching for Loss
-        if mode == 'factorized':
-            # Mean pool logsnr prediction for scalar scale
-            l_scalar = l_pred_maps.mean(dim=[1,2,3]) 
-            sigma_p = torch.sqrt(torch.sigmoid(-l_scalar)).view(-1, 1, 1, 1)
-            v_pred = v_pred_raw * sigma_p
-        else:
-            v_pred = v_pred_raw
+        # === Unified Prediction Call ===
+        v_pred, aux_loss = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
             
         loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
         total_loss = loss_elem.mean() + aux_loss

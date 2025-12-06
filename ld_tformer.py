@@ -1,8 +1,14 @@
 # ld_tformer.py
 import torch
 import torch.nn as nn
-from torch.nn.attention.flex_attention import flex_attention
+import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, BlockMask
+from typing import Tuple, List, Dict, Any, Optional
+from dataclasses import dataclass
+import math
+
 from nvllm_flex_attention import update_kv_cache
+from memory_manager import KVTManager, PageTable
 
 # === Initialization Helpers ===
 
@@ -276,13 +282,13 @@ class ContextualPatchEmbedder(nn.Module):
         self.fourier_enc = FourierFeatures(fourier_dim=fourier_dim)
         
         # 2. Input Projection        
-        self.input_proj = nn.Linear(input_dim, embed_dim)
+        self.input_proj = nn.Linear(self.input_dim, embed_dim)
         
         self.res_blocks = nn.Sequential(*[
             MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))
         ])
-    self.param_init()
-        
+        self.param_init()
+
     def param_init(self):
         init_linear(self.input_proj)
         for block in self.res_blocks:
@@ -631,6 +637,13 @@ class LDTformerAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
         self.rope = RnRoPE(self.head_dim, topo_dim)
+        # Initialize immediately
+        self.param_init()
+
+    def param_init(self):
+        init_linear(self.qkv)
+        init_linear(self.proj)
+        self.rope.param_init()
 
     # In LDTformerAttention.forward():
     def forward(
@@ -690,7 +703,16 @@ class LDTformerBlock(nn.Module):
         # Using SigmoidMoE for FFN
         hidden_dim = int(dim * mlp_ratio)
         self.moe = SigmoidMoE(dim, hidden_dim, num_experts=8, num_active=3, ) # Defaults: 8 experts, 3 active
-        self.gate_proj = nn.Linear(dim)
+        self.gate_proj = nn.Linear(dim, dim)
+        # Initialize immediately
+        self.param_init()
+
+    def param_init(self):
+        init_layer_norm(self.norm1)
+        self.attn.param_init()
+        init_layer_norm(self.norm2)
+        self.moe.param_init()
+        init_linear(self.gate_proj)
 
     def forward(self, x, topo, k_cache, v_cache, slots, mask):
         # Attention Sub-block
@@ -792,48 +814,3 @@ class coolerLDTformer(nn.Module):
     def param_load(self, state_dict):
         """Load a specific parameter set."""
         self.load_state_dict(state_dict)
-
-"""
-# === Training ===
-
-# 1. Prepare heterogeneous batch
-spans_meta = [
-    {'type': 'text', 'len': 128},
-    {'type': 'latent', 'len': 144, 'shape': (12, 12), 'causal': False},
-    {'type': 'latent', 'len': 256, 'shape': (16, 16), 'causal': False}
-]
-
-embedder = SpanEmbedder(model.text_embed, model.patch_embedder)
-unembedder = SpanUnembedder(model.text_head, model.patch_unembedder)
-
-# 2. Embed (outside model)
-z_flat, span_objects = embedder.embed(
-    spans_meta,
-    text_tokens=[tokens_128],
-    images=[img_144, img_256],
-    logsnr_maps=[logsnr_144, logsnr_256]
-)  # [528, D]
-
-# 3. Run model (inside, metadata-agnostic)
-z_out, aux_loss = model(
-    z_flat.unsqueeze(0),  # [1, 528, D]
-    topo_embeds.unsqueeze(0),
-    k_caches, v_caches, slot_mapping, block_mask
-)
-
-# 4. Decode (outside model)
-outputs = unembedder.decode(z_out.squeeze(0), span_objects)
-
-# 5. Compute losses (user's choice)
-text_loss = F.cross_entropy(
-    outputs['text_logits'][0], 
-    text_targets
-)
-
-img_loss = sum(
-    F.mse_loss(pred, target) 
-    for pred, target in zip(outputs['image_vpreds'], image_targets)
-)
-
-total_loss = text_loss + img_loss + aux_loss
-"""
