@@ -613,7 +613,8 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         #disable cast for now
         #with torch.amp.autocast('cuda'):
         # 1. Consistency Loss
-        loss_c, cleanup_fn_con = compute_consistency_loss(
+
+        loss_c, aux_loss_con, cleanup_fn_con = compute_consistency_loss(
             components, x0, spans, mode=mode,
             min_logsnr=-4.0, max_logsnr=4.0
         )
@@ -629,18 +630,28 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         v_pred, aux_loss, cleanup_fn_den = predict_velocity_field(components, z_t, l_den, spans, mode)
         
         loss_d = F.mse_loss(v_pred, v_t)
-        loss = loss_c + 0.1 * loss_d + aux_loss
+        loss_t = loss_c + 0.1 * loss_d + aux_loss+aux_loss_con
             
         # CRITICAL: Backward BEFORE cleanup
-        scaler.scale(loss).backward()
-        scaler.step(opt)
-        scaler.update()
+        #scaler.scale(loss).backward()
+        #scaler.step(opt)
+        #scaler.update()
+        loss_t.backward()
+        opt.step()
         
         # NOW it's safe to free cache blocks
         cleanup_fn_con()
         cleanup_fn_den()
 
-        history.append({'step': i, 'res': res, 'loss_total': loss.item(), 'loss_cons': loss_c.item()})
+        # Logging
+        step_stats = {
+            'step': i, 
+            'res': res, 
+            'loss_consistency': loss_c.item(),
+            'loss_denoise': loss_d.item(),
+            'loss_total': loss_t.item()
+        }
+        history.append(step_stats)
         if i % 50 == 0:
             pbar.set_postfix({'cons': f'{loss_c.item():.4f}', 'den': f'{loss_d.item():.4f}'})
             
@@ -685,7 +696,19 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         # NOW free the cache
         cleanup_fn()
         
-        history.append({'step': i, 'res': res, 'loss_total': total_loss.item()})
+        # CHANGED: Extract per-dataset loss for detailed plotting
+        step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
+        
+        # Use last_labels from iterator to segregate loss
+        if hasattr(iterator, 'last_labels') and hasattr(iterator, 'label_map'):
+            labels = iterator.last_labels
+            for lbl_idx, lbl_name in iterator.label_map.items():
+                mask = (labels == lbl_idx)
+                if mask.any():
+                    # Compute mean loss for this dataset type in this batch
+                    step_stats[f'loss_{lbl_name}'] = loss_elem[mask].mean().item()
+        
+        history.append(step_stats)
         if i % 100 == 0:
             pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'res': res})
             
