@@ -36,6 +36,7 @@ dependencies = [
     #logsnrcat
     "matplotlib",
     #"pytorch3d",
+    'xxhash',
     #pytorch3d is fictional
     #crimes against nature
     "pyzmq",
