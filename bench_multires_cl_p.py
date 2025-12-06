@@ -4,13 +4,14 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Callable
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 import sys
 from pathlib import Path
+from dataclasses import dataclass
 
 from diffusion_utils import get_schedule, get_alpha_sigma, BucketManager
 from dataset import CompositeIterator
@@ -19,6 +20,7 @@ from dataset import CompositeIterator
 from ld_tformer import coolerLDTformer, SpanEmbedder, SpanUnembedder, build_composed_mask
 from ld_tformer_embedding_functional import render_topology_embeddings
 from memory_manager import KVTManager, PageTable
+from kv_cache_allocator import allocate_kv_cache_safely
 
 # Hook the ZMQ compiler backend immediately if available
 try:
@@ -58,17 +60,16 @@ class ExperimentLogger:
 
 def predict_velocity_field(components, z, logsnr, spans, mode):
     """
-    Unified prediction logic.
     Returns:
-        v_final: [B, C, H, W] - Spatially corrected velocity field
-        aux_loss: Scalar - Internal model auxiliary loss (e.g. MoE balancing)
+        v_final: [B, C, H, W] - Velocity field
+        aux_loss: Scalar
+        context: CacheContext - Must be kept alive until after backward()
     """
-    model, _, span_unemb, _, _ = components
+    model, _, span_unemb, kvt_manager, _ = components
     
-    # 1. Forward Pass
-    # Naive mode passes zeroed logsnr input, but the architecture is invariant
+    # 1. Forward Pass (DO NOT FREE)
     suppress = (mode == 'naive')
-    z_flat, aux_loss, objs = run_forward_step(
+    z_flat, aux_loss, objs, req_ids = run_forward_step(
         components, z, logsnr, spans, 
         suppress_logsnr_input=suppress
     )
@@ -77,23 +78,23 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     decoded = span_unemb.decode(z_flat, objs)
     
     # 3. Stack & Parse
-    # [B, C, H, W]
     v_raw = torch.stack([d['image_vpreds'] for d in decoded])
     
     if mode == 'factorized':
-        # [B, 1, H, W] - Preserve spatial dimensions!
         l_maps = torch.stack([d['image_logsnrs'] for d in decoded])
-        
-        # Spatial Correction: Apply sigmoid scale element-wise per pixel
-        # sigma_p(x,y) = sqrt(sigmoid(-logsnr(x,y)))
         sigma_p = torch.sqrt(torch.sigmoid(-l_maps))
-        
-        # [B, C, H, W] * [B, 1, H, W] -> Broadcasts spatially
         v_final = v_raw * sigma_p
     else:
         v_final = v_raw
-        
-    return v_final, aux_loss
+    
+    # 4. Create cleanup callback
+    def cleanup():
+        for rid in req_ids:
+            kvt_manager.free_request(rid)
+    
+    context = CacheContext(req_ids=req_ids, cleanup_fn=cleanup)
+    
+    return v_final, aux_loss, context
 
 def run_forward_step(
     components, 
@@ -103,9 +104,11 @@ def run_forward_step(
     suppress_logsnr_input: bool = False
 ):
     """
-    Step logic. 
-    If suppress_logsnr_input is True, we pass zeros to the embedder (Naive Mode),
-    but the graph execution path remains identical.
+    Returns:
+        z_out: [L_total, D]
+        aux_loss: Scalar
+        span_objects: List[Span]
+        req_ids: List[int] - Allocated request IDs (caller must free!)
     """
     model, span_embedder, _, kvt_manager, page_table = components
     B, C, H, W = z.shape
@@ -114,24 +117,18 @@ def run_forward_step(
     
     # 1. Prepare Metadata & Inputs
     batch_spans_meta = []
-    images = []
-    logsnr_maps = []
+    images = [z[i] for i in range(B)]
     
-    zero_map = torch.zeros((1, H, W), device=device)
-    
+    if suppress_logsnr_input:
+        zero_map = torch.zeros((1, H, W), device=device)
+        logsnr_maps = [zero_map] * B
+    else:
+        logsnr_maps = [logsnr[i].view(1, H, W) for i in range(B)]
+
     for i in range(B):
-        # Create unique IDs
         item_spans = [s.copy() for s in base_spans]
-        for s in item_spans: s['id'] = f"req_{i}"
+        for s in item_spans: s['id'] = f"req_{i}" 
         batch_spans_meta.extend(item_spans)
-        
-        images.append(z[i])
-        
-        # CONTROL POINT: Naive mode sees zeroed logsnr map
-        if suppress_logsnr_input:
-            logsnr_maps.append(zero_map)
-        else:
-            logsnr_maps.append(logsnr[i].view(1, 1, 1).expand(1, H, W))
 
     # 2. Embed
     z_flat, span_objects, content_hashes = span_embedder.embed(
@@ -141,51 +138,58 @@ def run_forward_step(
         logsnr_maps=logsnr_maps
     )
     
-    # 3. Topo & Alloc
+    # 3. Render Topology
+    from ld_tformer_embedding_functional import render_topology_embeddings
     topo_embeds, _ = render_topology_embeddings(batch_spans_meta, 3, device)
     
+    # 4. Allocate KV Cache
     req_ids = list(range(B))
+    tokens_per_req = sum(s['len'] for s in base_spans)
+    
     cursor = 0
     for rid in req_ids:
-        span_len = batch_spans_meta[rid]['len'] 
-        kvt_manager.allocate_and_write_sequence(
-            rid, 
-            content_hashes[cursor:cursor+span_len], 
-            topo_embeds[cursor:cursor+span_len]
-        )
-        cursor += span_len
+        chunk_hashes = content_hashes[cursor : cursor + tokens_per_req]
+        chunk_topo = topo_embeds[cursor : cursor + tokens_per_req]
+        kvt_manager.allocate_and_write_sequence(rid, chunk_hashes, chunk_topo)
+        cursor += tokens_per_req
 
-    # 4. Inputs & Mask
-    attn_inputs = kvt_manager.get_attention_inputs(req_ids, layer_idx=0)
-    pt_table, phys_to_log = kvt_manager.get_batch_mappings(req_ids)
+    # 5. Get Physical Mappings
+    flat_page_table, inverse_page_table = kvt_manager.get_flat_page_mapping(req_ids)
     
-    page_table.page_table[:B, :pt_table.shape[1]] = pt_table
-    page_table.physical_to_logical[:B, :phys_to_log.shape[1]] = phys_to_log
-    
+    # 6. Get Slot Mapping
+    block_tables = [kvt_manager.req_tables[rid] for rid in req_ids]
+    seq_lengths = [kvt_manager.req_lengths[rid] for rid in req_ids]
+    slot_mapping = kvt_manager.get_slot_mapping(block_tables, seq_lengths)
+
+    # 7. Build Physical Mask
     block_mask = build_composed_mask(
         span_objects,
-        # FIX: Pass the flattened tensor 'topo_embeds' instead of the list 'attn_inputs['topo_active']'
         topo_active=topo_embeds,
-        topo_heap=attn_inputs['topo_heap'],
+        topo_heap=kvt_manager.get_topo_view(),
         page_table=page_table,
-        batch_idx=attn_inputs['batch_idx']
+        flat_page_table=flat_page_table,
+        inverse_page_table=inverse_page_table,
     )
     
-    # 5. Forward (Compiled Graph)
+    # 8. Forward Pass
+    # CHANGED: Retrieve flattened views [1, H, Capacity, D] from manager
+    k_views = []
+    v_views = []
+    for i in range(num_layers):
+        k, v = kvt_manager.get_flat_kv_view(i)
+        k_views.append(k)
+        v_views.append(v)
+
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
-        k_caches=[kvt_manager.k_cache[i] for i in range(num_layers)], # Use k_cache
-        v_caches=[kvt_manager.v_cache[i] for i in range(num_layers)], # Use v_cache
-        slot_mapping=attn_inputs['slot_mapping'],
+        k_caches=k_views,
+        v_caches=v_views,
+        slot_mapping=slot_mapping,
         block_mask=block_mask
     )
     
-    # 6. Cleanup
-    for rid in req_ids:
-        kvt_manager.free_sequence(kvt_manager.req_tables[rid])
-        
-    return z_out.squeeze(0), aux_loss, span_objects
+    return z_out.squeeze(0), aux_loss, span_objects, req_ids
 
 
 def logsnr_to_alpha_sigma(logsnr):
@@ -246,6 +250,14 @@ def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
     return z_to
 
 ### metadata helpers!!!
+
+@dataclass
+class CacheContext:
+    """
+    Tracks allocated requests that must stay alive during backward pass.
+    """
+    req_ids: List[int]
+    cleanup_fn: Callable[[], None]
 
 def get_image_spans(resolution):
     """
@@ -524,13 +536,18 @@ def warmup_model(model, buckets):
 
 def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsnr=-5.0, max_logsnr=5.0):
     """
-    Consolidated Consistency Loss.
-    Optimizes 2 objectives:
-    1. Trajectory Consistency: 1-Step (Coarse) should match 2-Step (Fine).
-    2. Drift Correction: Generated states should yield predictions matching Ground Truth states.
+    Consolidated Consistency Loss with proper cache lifecycle management.
+    
+    Returns:
+        loss: Total loss tensor
+        aux_loss: Auxiliary loss (MoE balancing, etc)
+        cleanup_fn: Callable that must be called AFTER backward()
     """
     B = x0.shape[0]
     device = x0.device
+
+    # Track all contexts for cleanup
+    contexts = []
 
     # 1. Setup Trajectory Points
     l_start, l_mid, l_end = sample_logsnr_triplet(B, device, min_logsnr, max_logsnr)
@@ -541,14 +558,19 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     
     # === A. FINE TRAJECTORY (The Target) ===
     # Step 1: Start -> Mid
-    # We differentiate through v_start to optimize the start of the chain
-    v_start, aux_start = predict_velocity_field(components, z_start, l_start, spans, mode)
+    v_start, aux_start, ctx1 = predict_velocity_field_with_context(
+        components, z_start, l_start, spans, mode
+    )
+    contexts.append(ctx1)
+    
     z_mid_gen = euler_reverse_step(z_start, v_start, l_start, l_mid)
     
     # Step 2: Mid -> End
-    # We detach z_mid_gen for the *prediction* calculation to prevent 
-    # the target from moving to meet the student.
-    v_mid_gen, aux_mid = predict_velocity_field(components, z_mid_gen.detach(), l_mid, spans, mode)
+    v_mid_gen, aux_mid, ctx2 = predict_velocity_field_with_context(
+        components, z_mid_gen.detach(), l_mid, spans, mode
+    )
+    contexts.append(ctx2)
+    
     z_end_fine = euler_reverse_step(z_mid_gen, v_mid_gen, l_mid, l_end)
     
     # === B. COARSE TRAJECTORY (The Student) ===
@@ -556,26 +578,30 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     z_end_coarse = euler_reverse_step(z_start, v_start, l_start, l_end)
     
     # LOSS 1: Trajectory Consistency
-    # "Fine" is the ground truth approximation. "Coarse" tries to match it.
     loss_traj = F.mse_loss(z_end_coarse, z_end_fine.detach())
     
     # === C. DRIFT CORRECTION ===
-    # Ensure the model's prediction at the *generated* mid-point (z_mid_gen)
-    # is consistent with what it would predict at a *true* mid-point (z_mid_real).
-    
     # Create Ground Truth Mid State
     a_mid, s_mid = logsnr_to_alpha_sigma(l_mid)
     z_mid_real = x0 * a_mid.view(-1,1,1,1) + torch.randn_like(x0) * s_mid.view(-1,1,1,1)
     
     # Get Teacher Prediction (at real state)
     with torch.no_grad():
-        v_mid_real, _ = predict_velocity_field(components, z_mid_real, l_mid, spans, mode)
+        v_mid_real, _, ctx3 = predict_velocity_field_with_context(
+            components, z_mid_real, l_mid, spans, mode
+        )
+        # Free immediately since we're in no_grad context
+        ctx3.cleanup_fn()
     
     # LOSS 2: Drift / Denoising Consistency
-    # v_mid_gen (from A) should match v_mid_real
     loss_drift = F.mse_loss(v_mid_gen, v_mid_real)
     
-    return loss_traj + loss_drift, aux_start + aux_mid
+    # Create unified cleanup function
+    def cleanup():
+        for ctx in contexts:
+            ctx.cleanup_fn()
+    
+    return loss_traj + loss_drift, aux_start + aux_mid, cleanup
 
 
 def distill_multires(components, mode, buckets, steps=1000, logger=None):
@@ -601,7 +627,7 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         
         with torch.amp.autocast('cuda'):
             # 1. Consistency Loss
-            loss_c = compute_consistency_loss(
+            loss_c, cleanup_fn_con = compute_consistency_loss(
                 components, x0, spans, mode=mode,
                 min_logsnr=-4.0, max_logsnr=4.0
             )
@@ -614,15 +640,20 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
             z_t = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
             v_t = a.view(-1,1,1,1)*eps - s.view(-1,1,1,1)*x0
             
-            v_pred, aux_loss = predict_velocity_field(components, z_t, l_den, spans, mode)
+            v_pred, aux_loss, cleanup_fn_den = predict_velocity_field(components, z_t, l_den, spans, mode)
             
             loss_d = F.mse_loss(v_pred, v_t)
             loss = loss_c + 0.1 * loss_d + aux_loss
             
+        # CRITICAL: Backward BEFORE cleanup
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
         
+        # NOW it's safe to free cache blocks
+        cleanup_fn_con()
+        cleanup_fn_den()
+
         history.append({'step': i, 'res': res, 'loss_total': loss.item(), 'loss_cons': loss_c.item()})
         if i % 50 == 0:
             pbar.set_postfix({'cons': f'{loss_c.item():.4f}', 'den': f'{loss_d.item():.4f}'})
@@ -656,13 +687,17 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         base_spans = get_image_spans(res)
         
         # === Unified Prediction Call ===
-        v_pred, aux_loss = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
+        v_pred, aux_loss, cleanup_fn = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
             
         loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
         total_loss = loss_elem.mean() + aux_loss
         
+        # Backward BEFORE cleanup
         total_loss.backward()
         opt.step()
+
+        # NOW free the cache
+        cleanup_fn()
         
         history.append({'step': i, 'res': res, 'loss_total': total_loss.item()})
         if i % 100 == 0:
@@ -686,9 +721,40 @@ if __name__ == "__main__":
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
     
-    kvt_manager = KVTManager(max_blocks=2000, block_size=128, kv_dim=embed_dim, layers=depth, heads=8, topo_dim=3, device=device)
-    page_table = PageTable(num_blocks=2000, block_size=128, max_batch_size=256, max_logical_blocks=256, device=device)
-    
+    # Compute safe cache AND page table sizes
+    max_blocks, max_batch_size, max_logical_blocks = allocate_kv_cache_safely(
+        device=device,
+        block_size=128,
+        embed_dim=embed_dim,
+        num_layers=depth,
+        num_heads=8,
+        expected_batch_size=128,
+        expected_seq_len=8*8,  # 16px image -> 8×8 after 2×2 pooling
+        kv_cache_memory_fraction=0.85,
+        safety_margin_gb=1.5,
+        concurrent_requests_multiplier=2.0,  # Allow 2× batch size headroom
+        verbose=True
+    )
+
+    kvt_manager = KVTManager(
+        max_blocks=max_blocks,
+        block_size=128,
+        kv_dim=embed_dim,
+        layers=depth,
+        heads=8,
+        topo_dim=3,
+        device=device
+    )
+
+    page_table = PageTable(
+        num_blocks=max_blocks,
+        block_size=128,
+        max_batch_size=max_batch_size,
+        max_logical_blocks=max_logical_blocks,
+        device=device
+    )
+    print("🔥 Compiling Model (dynamic=True)...")
+    model = torch.compile(model, dynamic=True)
     components = (model, span_emb, span_unemb, kvt_manager, page_table)
     
     # 2. Run A (Naive)

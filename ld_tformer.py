@@ -175,25 +175,57 @@ class SigmoidMoE(nn.Module):
             expert.param_init()
 
     def forward(self, x):
+        # 1. Routing
+        B, L, D = x.shape
         router_logits = self.router(x)
         if self.training and self.jitter_noise > 0:
             router_logits = router_logits + torch.randn_like(router_logits) * self.jitter_noise
             
         scores = torch.sigmoid(router_logits)
         top_k_scores, top_k_indices = torch.topk(scores, self.num_active, dim=-1)
+        
+        # Normalize weights
         router_weights = top_k_scores / (top_k_scores.sum(dim=-1, keepdim=True) + 1e-6)
         
-        out = torch.zeros_like(x)
-        for i in range(self.num_active):
-            idx = top_k_indices[:, :, i]
-            weight = router_weights[:, :, i:i+1]
-            for e in range(self.num_experts):
-                mask = (idx == e)
-                if mask.any():
-                    out = out + (self.experts[e](x) * weight * mask.unsqueeze(-1))
+        # 2. Flatten for efficient indexing
+        # Shape: [N, D] where N = B*L
+        x_flat = x.view(-1, D)
+        out_flat = torch.zeros_like(x_flat)
+        
+        # Shape: [N, K]
+        indices_flat = top_k_indices.view(-1, self.num_active)
+        weights_flat = router_weights.view(-1, self.num_active)
+        
+        # 3. Process Experts (Static Loop for compilation)
+        for e in range(self.num_experts):
+            # A. Identify tokens for this expert
+            # mask: [N, K] bool
+            match_mask = (indices_flat == e)
+            
+            # token_mask: [N] bool (True if token picked expert 'e' in ANY slot)
+            token_mask = match_mask.any(dim=-1)
+            
+            # B. Get Indices (Dynamic Shape, but graph-safe)
+            active_indices = torch.nonzero(token_mask).flatten()
+            
+            # C. Gather Weights & Input
+            # Aggregate weight for expert 'e' per token (usually just one slot, but sums if dupes)
+            # [N] -> [Num_Selected]
+            active_weights = (weights_flat * match_mask.float()).sum(dim=-1)[active_indices]
+            
+            # Gather inputs: [Num_Selected, D]
+            # (If active_indices is empty, this is [0, D], which works fine in Linear layers)
+            active_x = x_flat[active_indices]
+            
+            # D. Compute Expert
+            expert_out = self.experts[e](active_x)
+            
+            # E. Scale & Scatter Add
+            weighted_out = expert_out * active_weights.unsqueeze(-1)
+            out_flat.index_add_(0, active_indices, weighted_out)
         
         aux_loss = 1e-2 * (router_logits ** 2).mean()
-        return out, aux_loss
+        return out_flat.view(B, L, D), aux_loss
 
 # latent embedding units
 class MLPResBlock(nn.Module):
@@ -570,68 +602,108 @@ class SpanUnembedder:
 
 def build_composed_mask(
     spans: List[Span],
-    topo_active: torch.Tensor,  # [L_active, Topo_Dim] - for Q positions
-    topo_heap: torch.Tensor,    # [Capacity, Topo_Dim] - for KV positions  
+    topo_active: torch.Tensor,      # [L_active, Topo_Dim] - Active tokens only
+    topo_heap: torch.Tensor,        # [Capacity, Topo_Dim] - Full heap
     page_table: PageTable,
-    batch_idx: torch.Tensor,
+    flat_page_table: torch.Tensor,  # [Num_Logical_Blocks] -> Physical_Block_ID
+    inverse_page_table: torch.Tensor,  # [Capacity_Blocks] -> Logical_Block_ID
     window_size: float = 10.0
 ) -> BlockMask:
     """
-    Composes: Block-Causal AND Sliding-Window AND Paged-Lookup
+    Composes masks and converts to physical B=1 space.
+    EFFICIENT: Uses tensor operations instead of Python loops.
     """
     from torch.nn.attention.flex_attention import create_block_mask
-    from ld_tformer_embedding_functional import get_block_causal_mod, get_sliding_window_mod
     
-    # 1. Build doc_ids from spans
-    doc_ids = []
+    device = topo_active.device
+    L_active = topo_active.shape[0]
+    L_heap = topo_heap.shape[0]
+    block_size = page_table.block_size
+    
+    # 1. Build doc_ids for ACTIVE tokens
+    doc_ids_active = []
     for i, span in enumerate(spans):
-        doc_ids.extend([i] * (span.end_idx - span.start_idx))
-    doc_ids = torch.tensor(doc_ids, device=topo_active.device)
+        doc_ids_active.extend([i] * (span.end_idx - span.start_idx))
+    doc_ids_active_t = torch.tensor(doc_ids_active, dtype=torch.long, device=device)
     
-    # 2. Compose mask_mod
-    topo_columns = topo_active.unbind(dim=-1)
+    # 2. Build doc_ids for HEAP (EFFICIENT VERSION)
+    # Initialize heap as unallocated
+    doc_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=device)
     
-    highway_col = topo_columns[0]   # 1D Tensor
-    spatial_cols = topo_columns[1:] # List of 1D Tensors
+    # For each span, compute which physical slots it occupies
+    cursor = 0
+    for rid, span in enumerate(spans):
+        span_len = span.end_idx - span.start_idx
+        
+        # Get logical block range for this span
+        start_block = cursor // block_size
+        end_block = (cursor + span_len - 1) // block_size + 1
+        
+        # Map logical blocks -> physical slots
+        for log_block_idx in range(start_block, end_block):
+            if log_block_idx >= len(flat_page_table):
+                break
+                
+            phys_block = flat_page_table[log_block_idx].item()
+            
+            # Calculate which tokens in this span map to this physical block
+            block_start_in_span = max(0, log_block_idx * block_size - cursor)
+            block_end_in_span = min(span_len, (log_block_idx + 1) * block_size - cursor)
+            
+            # Physical slot range
+            offset_start = (cursor + block_start_in_span) % block_size
+            offset_end = offset_start + (block_end_in_span - block_start_in_span)
+            
+            phys_start = phys_block * block_size + offset_start
+            phys_end = phys_block * block_size + offset_end
+            
+            # Mark these slots as belonging to this document
+            doc_ids_heap_t[phys_start:phys_end] = rid
+        
+        cursor += span_len
     
-    # Pre-calculate threshold for efficiency
+    # 3. Decompose Topology
+    topo_active_cols = topo_active.unbind(dim=-1)
+    highway_active = topo_active_cols[0]
+    spatial_active = topo_active_cols[1:]
+    
+    topo_heap_cols = topo_heap.unbind(dim=-1)
+    highway_heap = topo_heap_cols[0]
+    spatial_heap = topo_heap_cols[1:]
+    
     win_sq = window_size * window_size
     
-    # 3. Define Mask Mod using only 1D accesses
-    def composed_mod(b, h, q_idx, kv_idx):
-        # A. Document Masking
-        # Access 1D tensor -> Scalar
-        q_doc = doc_ids[q_idx]
-        k_doc = doc_ids[kv_idx]
-        same_doc = (q_doc == k_doc)
+    # 4. Build Physical Mask Mod (PURE FUNCTIONAL)
+    def physical_mask_mod(b, h, q_idx, kv_idx):
+        """
+        Pure functional mask - all operations are tensor ops.
+        """
+        # Document matching
+        q_doc = doc_ids_active_t[q_idx]
+        k_doc = doc_ids_heap_t[kv_idx]
+        same_doc = (q_doc == k_doc) & (k_doc >= 0)
         
-        # B. Causal Highway Masking
-        # Access 1D tensor -> Scalar
-        q_time = highway_col[q_idx]
-        k_time = highway_col[kv_idx]
+        # Causal constraint
+        q_time = highway_active[q_idx]
+        k_time = highway_heap[kv_idx]
         causal = q_time >= k_time
         
-        # C. Spatial Sliding Window (N-Dimensional)
-        # Compute Squared Euclidean Distance via scalar accumulation
-        dist_sq = 0.0
-        for col in spatial_cols:
-            d = col[q_idx] - col[kv_idx]
+        # Spatial window
+        dist_sq = torch.tensor(0.0, device=q_time.device, dtype=q_time.dtype)
+        for q_col, k_col in zip(spatial_active, spatial_heap):
+            d = q_col[q_idx] - k_col[kv_idx]
             dist_sq = dist_sq + (d * d)
-            
-        return same_doc & causal & (dist_sq < win_sq)
+        
+        spatial_ok = dist_sq < win_sq
+        
+        return same_doc & causal & spatial_ok
     
-    # 4. Create logical mask
-    logical_mask = create_block_mask(
-        composed_mod,
+    # 5. Create Physical Mask
+    physical_mask = create_block_mask(
+        physical_mask_mod,
         B=None, H=None,
-        Q_LEN=len(doc_ids),
-        KV_LEN=len(doc_ids)
-    )
-    
-    # 4. Convert to physical mask
-    physical_mask = page_table.convert_logical_block_mask(
-        logical_mask,
-        batch_idx
+        Q_LEN=L_active,
+        KV_LEN=L_heap
     )
     
     return physical_mask

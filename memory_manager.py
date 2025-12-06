@@ -31,17 +31,10 @@ class Block:
         self.block_hash = -1
 
 class BlockManager:
-    """
-    Manages the lifecycle of Physical Block IDs based on Content Hashes.
-    Implements Prefix Caching via Causal Hashing.
-    """
     def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.blocks: List[Block] = [Block(i) for i in range(num_blocks)]
-        
-        # Maps a (PrefixHash + ContentHash) -> PhysicalBlockID
         self.hash_to_block_id: Dict[int, int] = {}
-        
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         
     def _allocate_block(self) -> Block:
@@ -58,36 +51,22 @@ class BlockManager:
         if block.block_hash != -1:
             if self.hash_to_block_id.get(block.block_hash) == block_id:
                 del self.hash_to_block_id[block.block_hash]
-        
         block.reset()
         self.free_block_ids.append(block_id)
 
     @staticmethod
     def compute_block_hash(content_hashes: Union[List[int], np.ndarray], prefix_hash: int = -1) -> int:
-        """
-        Computes a unique hash for a block based on its content and its predecessor.
-        This enables 'Prefix Caching'.
-        """
         h = xxhash.xxh64()
         if prefix_hash != -1:
             h.update(prefix_hash.to_bytes(8, 'little'))
-        
-        # Assume content_hashes is a list/array of 64-bit integers
         if isinstance(content_hashes, list):
             content_hashes = np.array(content_hashes, dtype=np.int64)
         h.update(content_hashes.tobytes())
         return h.intdigest()
 
     def allocate(self, content_stream: List[int]) -> Tuple[List[int], List[int]]:
-        """
-        Processes a stream of atomic content hashes.
-        Returns:
-            block_table: List of Physical Block IDs covering the stream.
-            newly_allocated: List of Block IDs that are fresh (need data writing).
-        """
         num_items = len(content_stream)
         num_blocks = (num_items + self.block_size - 1) // self.block_size
-        
         block_table = []
         newly_allocated = []
         prefix_hash = -1
@@ -96,38 +75,30 @@ class BlockManager:
             start = i * self.block_size
             end = min(start + self.block_size, num_items)
             chunk = content_stream[start:end]
-            
-            # Only cache full blocks
             is_full = (len(chunk) == self.block_size)
             
-            # Compute Candidate Hash
             if is_full:
                 current_hash = self.compute_block_hash(chunk, prefix_hash)
             else:
                 current_hash = -1
                 
-            # Check Cache
             block_id = -1
             if current_hash != -1:
                 block_id = self.hash_to_block_id.get(current_hash, -1)
                 
             if block_id != -1:
-                # HIT
                 self.blocks[block_id].ref_count += 1
                 block_table.append(block_id)
-                prefix_hash = current_hash # Continue chain
+                prefix_hash = current_hash 
             else:
-                # MISS
                 block = self._allocate_block()
                 block_id = block.block_id
-                
                 if is_full:
                     block.link(current_hash)
                     self.hash_to_block_id[current_hash] = block_id
                     prefix_hash = current_hash
                 else:
                     prefix_hash = -1
-                
                 block_table.append(block_id)
                 newly_allocated.append(block_id)
                 
@@ -271,6 +242,48 @@ class PageTable:
         # We retain BLOCK_SIZE and other metadata from logical_mask
         
         return physical_mask
+        
+    def convert_flattened_block_mask(
+        self,
+        logical_mask: BlockMask,
+        flat_page_table: torch.Tensor,     # [Total_Logical_Blocks] -> Phys_Block
+        inverse_page_table: torch.Tensor   # [Capacity_Blocks] -> Log_Block
+    ) -> BlockMask:
+        """
+        Teleports a BlockMask from Logical Space to Physical Space for B=1 (Flattened) execution.
+        """
+        # 1. Map Logical Indices to Physical Indices (Sparse)
+        # logical_mask.kv_indices has shape [1, H, Q_blocks, K_sparse_blocks]
+        phys_kv_indices = flat_page_table[logical_mask.kv_indices.long()]
+        
+        # 2. Map Full Blocks (Dense)
+        phys_full_kv_indices = flat_page_table[logical_mask.full_kv_indices.long()]
+
+        # 3. Wrap Mask Mod
+        original_mod = logical_mask.mask_mod
+        
+        def physical_mask_mod(b, h, q_idx, k_phys_idx):
+            # Map Physical Heap Index -> Logical Sequence Index
+            phys_block = k_phys_idx // self.block_size
+            offset = k_phys_idx % self.block_size
+            
+            # Lookup
+            log_block = inverse_page_table[phys_block]
+            
+            # Reconstruct Logical Index
+            log_k_idx = log_block * self.block_size + offset
+            
+            return original_mod(b, h, q_idx, log_k_idx)
+
+        # 4. Construct New BlockMask
+        physical_mask = copy.copy(logical_mask)
+        physical_mask.kv_indices = phys_kv_indices.int()
+        physical_mask.full_kv_indices = phys_full_kv_indices.int()
+        physical_mask.mask_mod = physical_mask_mod
+        
+        return physical_mask
+
+
 
 # =========================================================
 # 2. KVT MANAGER (Tensor Container)
@@ -281,6 +294,7 @@ class KVTManager:
     Holds the Physical Memory Tensors and delegates allocation to BlockManager.
     Does NOT know about geometry, spans, or embedding logic.
     """
+
     def __init__(self, 
                  max_blocks: int, 
                  block_size: int, 
@@ -300,13 +314,14 @@ class KVTManager:
         # Feature Cache (Split K and V to prevent overwrite)
         self.head_dim = kv_dim // heads
         
-        # [Layers, Max_Blocks, Heads, Block_Size, Head_Dim]
+        # CHANGED: Layout is now [Layers, Heads, Max_Blocks, Block_Size, Head_Dim]
+        # This allows zero-copy flattening of (Blocks, Block_Size) -> Capacity
         self.k_cache = torch.zeros(
-            (layers, max_blocks, heads, block_size, self.head_dim),
+            (layers, heads, max_blocks, block_size, self.head_dim),
             dtype=self.dtype, device=device
         )
         self.v_cache = torch.zeros(
-            (layers, max_blocks, heads, block_size, self.head_dim),
+            (layers, heads, max_blocks, block_size, self.head_dim),
             dtype=self.dtype, device=device
         )
         
@@ -399,6 +414,23 @@ class KVTManager:
         """Decrements ref counts and recycles blocks."""
         self.block_manager.free(block_table)
     
+    def free_request(self, req_id: int):
+        """
+        Completely frees a request and cleans up all metadata.
+        This is the proper way to release a request after inference.
+        """
+        if req_id not in self.req_tables:
+            # Already freed or never allocated
+            return
+        
+        # Free the blocks
+        block_table = self.req_tables[req_id]
+        self.block_manager.free(block_table)
+        
+        # Clean up metadata
+        del self.req_tables[req_id]
+        del self.req_lengths[req_id]
+        del self.req_highway_offset[req_id]
     
     def get_attention_inputs(
         self,
@@ -464,33 +496,37 @@ class KVTManager:
         
         return result
     
-    # In KVTManager class...
     def get_flat_kv_view(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns a flattened [1, 1, Total_Capacity, Dim] view of K and V caches
-        for a specific layer, satisfying FlexAttention's input requirements.
-        """
-        # Retrieve split K and V caches
-        k_cache = self.k_cache[layer_idx] # [Blocks, Heads, Block_Size, Head_Dim]
-        v_cache = self.v_cache[layer_idx]
-        
-        # Permute to bring Heads out
-        # [Blocks, Heads, Block_Size, D] -> [Heads, Blocks, Block_Size, D]
-        k_cache = k_cache.permute(1, 0, 2, 3) 
-        v_cache = v_cache.permute(1, 0, 2, 3)
-        
-        # Flatten Blocks and Block_Size -> Total_Capacity
-        # [Heads, Total_Capacity, Head_Dim]
-        k_flat = k_cache.flatten(1, 2)        
-        v_flat = v_cache.flatten(1, 2)
-        
-        # Expand Batch dim to 1
-        # [1, Heads, Total_Capacity, Head_Dim]
-        k_out = k_flat.unsqueeze(0) 
-        v_out = v_flat.unsqueeze(0)
-        
-        return k_out, v_out
+        # View: [Heads, Blocks, Block_Size, Dim] -> [Heads, Capacity, Dim] -> [1, Heads, Capacity, Dim]
+        # This view is compatible with BlockMask (Capacity) and flex_attention (B=1)
+        k_cache = self.k_cache[layer_idx].flatten(1, 2).unsqueeze(0)
+        v_cache = self.v_cache[layer_idx].flatten(1, 2).unsqueeze(0)
+        return k_cache, v_cache
 
+    def get_flat_page_mapping(self, req_ids: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Creates 1D Page Tables for Flattened Execution (B=1).
+        
+        Returns:
+            flat_page_table: [Total_Logical_Blocks] -> Physical_ID
+            inverse_page_table: [Capacity] -> Logical_ID (or -1)
+        """
+        # 1. Concatenate all logical block tables
+        all_blocks = []
+        for rid in req_ids:
+            all_blocks.extend(self.req_tables[rid])
+            
+        flat_page_table = torch.tensor(all_blocks, dtype=torch.long, device=self.device)
+        
+        # 2. Build Inverse (Heap -> Logical)
+        capacity = len(self.block_manager.blocks)
+        inverse_page_table = torch.full((capacity,), -1, dtype=torch.long, device=self.device)
+        
+        # Scatter logical indices (0, 1, 2...) into the physical slots
+        logical_indices = torch.arange(len(all_blocks), device=self.device)
+        inverse_page_table.index_copy_(0, flat_page_table, logical_indices)
+        
+        return flat_page_table, inverse_page_table
 
     def get_batch_mappings(self, req_ids: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -524,20 +560,13 @@ class KVTManager:
             
         return page_table, phys_to_log
         
-        
     def get_slot_mapping(self, block_tables: List[List[int]], seq_lengths: List[int]) -> torch.Tensor:
-        """
-        Generates flat physical token indices for scatter writes.
-        """
         slots = []
         for table, length in zip(block_tables, seq_lengths):
             for token_idx in range(length):
                 block_idx_in_table = token_idx // self.block_size
                 offset = token_idx % self.block_size
-                
                 physical_block_id = table[block_idx_in_table]
                 physical_slot = physical_block_id * self.block_size + offset
-                
                 slots.append(physical_slot)
-        
         return torch.tensor(slots, dtype=torch.int64, device=self.device)
