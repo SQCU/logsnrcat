@@ -92,9 +92,14 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
         for rid in req_ids:
             kvt_manager.free_request(rid)
     
-    context = CacheContext(req_ids=req_ids, cleanup_fn=cleanup)
+    #context = CacheContext(req_ids=req_ids, cleanup_fn=cleanup)
+
+        # 4. Create cleanup callback
+    def cleanup():
+        for rid in req_ids:
+            kvt_manager.free_request(rid)
     
-    return v_final, aux_loss, context
+    return v_final, aux_loss, cleanup
 
 def run_forward_step(
     components, 
@@ -558,7 +563,7 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     
     # === A. FINE TRAJECTORY (The Target) ===
     # Step 1: Start -> Mid
-    v_start, aux_start, ctx1 = predict_velocity_field_with_context(
+    v_start, aux_start, ctx1 = predict_velocity_field(
         components, z_start, l_start, spans, mode
     )
     contexts.append(ctx1)
@@ -566,7 +571,7 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     z_mid_gen = euler_reverse_step(z_start, v_start, l_start, l_mid)
     
     # Step 2: Mid -> End
-    v_mid_gen, aux_mid, ctx2 = predict_velocity_field_with_context(
+    v_mid_gen, aux_mid, ctx2 = predict_velocity_field(
         components, z_mid_gen.detach(), l_mid, spans, mode
     )
     contexts.append(ctx2)
@@ -587,7 +592,7 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     
     # Get Teacher Prediction (at real state)
     with torch.no_grad():
-        v_mid_real, _, ctx3 = predict_velocity_field_with_context(
+        v_mid_real, _, ctx3 = predict_velocity_field(
             components, z_mid_real, l_mid, spans, mode
         )
         # Free immediately since we're in no_grad context

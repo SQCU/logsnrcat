@@ -671,8 +671,9 @@ def build_composed_mask(
     highway_heap = topo_heap_cols[0]
     spatial_heap = topo_heap_cols[1:]
     
-    win_sq = window_size * window_size
+    win_sq = torch.tensor(window_size * window_size, device=device, dtype=topo_active.dtype)
     
+    # 4. Build Physical Mask Mod (PURE FUNCTIONAL)
     # 4. Build Physical Mask Mod (PURE FUNCTIONAL)
     def physical_mask_mod(b, h, q_idx, kv_idx):
         """
@@ -689,7 +690,9 @@ def build_composed_mask(
         causal = q_time >= k_time
         
         # Spatial window
-        dist_sq = torch.tensor(0.0, device=q_time.device, dtype=q_time.dtype)
+        # FIX: Use python float 0.0 instead of torch.tensor(0.0).
+        # Creating 0-d tensors inside mask_mod confuses Inductor/Triton compilation.
+        dist_sq = 0.0
         for q_col, k_col in zip(spatial_active, spatial_heap):
             d = q_col[q_idx] - k_col[kv_idx]
             dist_sq = dist_sq + (d * d)
