@@ -469,7 +469,7 @@ def plot_comparison_grid(samples_before, samples_after, resolutions):
 ### crunchy stuff!!!
 
 @torch.no_grad()
-def sample_viz(components, res, num_samples=8):
+def sample_viz(components, res, num_samples=8, mode='naive'):
     model, span_emb, span_unemb, kvt, pt = components
     model.eval()
     
@@ -481,21 +481,15 @@ def sample_viz(components, res, num_samples=8):
         t = ts[i]; t_n = ts[i+1]
         logsnr = get_schedule(torch.full((num_samples,), t, device='cuda'))
         
-        # Forward
-        z_out_flat, _, span_objs = run_forward_step(
-            model, span_emb, kvt, pt, z, logsnr, base_spans
+        # Use predict_velocity_field (handles both modes)
+        v_pred, aux_loss, cleanup_fn = predict_velocity_field(
+            components, z, logsnr, base_spans, mode
         )
         
-        outputs = span_unemb.decode(z_out_flat, span_objs)
-        v_pred_raw = torch.stack(outputs['image_vpreds'])
-        l_pred = torch.stack(outputs['image_logsnrs']).mean(dim=[2,3])
+        # Cleanup immediately (no gradients needed)
+        cleanup_fn()
         
-        # Sampler Logic
-        # (Assuming 'factorized' check can be inferred or passed. Defaulting to raw for viz)
-        # Hack: Check if model wrapper has mode? We passed components tuple.
-        # Let's assume naive for viz unless we stored mode.
-        v_pred = v_pred_raw # Simplify for viz
-        
+        # Euler step
         logsnr_n = get_schedule(torch.full((num_samples,), t_n, device='cuda'))
         alpha, sigma = get_alpha_sigma(logsnr)
         alpha_n, sigma_n = get_alpha_sigma(logsnr_n)
@@ -552,62 +546,46 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     B = x0.shape[0]
     device = x0.device
 
-    # Track all contexts for cleanup
-    contexts = []
+    # Track all cleanup functions
+    cleanup_fns = []
 
-    # 1. Setup Trajectory Points
+    # 1. Sample noise levels
     l_start, l_mid, l_end = sample_logsnr_triplet(B, device, min_logsnr, max_logsnr)
     
-    # Create Starting State (Noisy)
+    # 2. Create noisy starting state
     a_start, s_start = logsnr_to_alpha_sigma(l_start)
     z_start = x0 * a_start.view(-1,1,1,1) + torch.randn_like(x0) * s_start.view(-1,1,1,1)
     
-    # === A. FINE TRAJECTORY (The Target) ===
-    # Step 1: Start -> Mid
-    v_start, aux_start, ctx1 = predict_velocity_field(
+    # === A. 1-STEP TRAJECTORY (Teacher): start → end ===
+    v_start, aux1, cleanup1 = predict_velocity_field(
         components, z_start, l_start, spans, mode
     )
-    contexts.append(ctx1)
+    cleanup_fns.append(cleanup1)
     
-    z_mid_gen = euler_reverse_step(z_start, v_start, l_start, l_mid)
-    
-    # Step 2: Mid -> End
-    v_mid_gen, aux_mid, ctx2 = predict_velocity_field(
-        components, z_mid_gen.detach(), l_mid, spans, mode
-    )
-    contexts.append(ctx2)
-    
-    z_end_fine = euler_reverse_step(z_mid_gen, v_mid_gen, l_mid, l_end)
-    
-    # === B. COARSE TRAJECTORY (The Student) ===
-    # Start -> End (Directly using v_start)
-    z_end_coarse = euler_reverse_step(z_start, v_start, l_start, l_end)
-    
-    # LOSS 1: Trajectory Consistency
-    loss_traj = F.mse_loss(z_end_coarse, z_end_fine.detach())
-    
-    # === C. DRIFT CORRECTION ===
-    # Create Ground Truth Mid State
-    a_mid, s_mid = logsnr_to_alpha_sigma(l_mid)
-    z_mid_real = x0 * a_mid.view(-1,1,1,1) + torch.randn_like(x0) * s_mid.view(-1,1,1,1)
-    
-    # Get Teacher Prediction (at real state)
     with torch.no_grad():
-        v_mid_real, _, ctx3 = predict_velocity_field(
-            components, z_mid_real, l_mid, spans, mode
-        )
-        # Free immediately since we're in no_grad context
-        ctx3.cleanup_fn()
+        z_end_teacher = euler_reverse_step(z_start, v_start, l_start, l_end)
     
-    # LOSS 2: Drift / Denoising Consistency
-    loss_drift = F.mse_loss(v_mid_gen, v_mid_real)
+    # === B. 2-STEP TRAJECTORY (Student): start → mid → end ===
+    # Step 1: start → mid (uses same v_start)
+    z_mid_student = euler_reverse_step(z_start, v_start, l_start, l_mid)
     
-    # Create unified cleanup function
-    def cleanup():
-        for ctx in contexts:
-            ctx.cleanup_fn()
+    # Step 2: mid → end (this is where gradients flow)
+    v_mid, aux2, cleanup2 = predict_velocity_field(
+        components, z_mid_student, l_mid, spans, mode
+    )
+    cleanup_fns.append(cleanup2)
     
-    return loss_traj + loss_drift, aux_start + aux_mid, cleanup
+    z_end_student = euler_reverse_step(z_mid_student, v_mid, l_mid, l_end)
+    
+    # === C. CONSISTENCY LOSS ===
+    loss = F.mse_loss(z_end_student, z_end_teacher.detach())
+    
+    # Create unified cleanup
+    def cleanup_all():
+        for fn in cleanup_fns:
+            fn()
+    
+    return loss, aux1 + aux2, cleanup_all
 
 
 def distill_multires(components, mode, buckets, steps=1000, logger=None):
@@ -621,7 +599,8 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
     iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
     manager = BucketManager(buckets_distill)
     history = []
-    scaler = torch.amp.GradScaler('cuda')
+    #disable cast for now
+    #scaler = torch.amp.GradScaler('cuda')
     
     pbar = tqdm(range(steps), desc=f"distill-{mode}")
     for i in pbar:
@@ -631,25 +610,26 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
         spans = get_image_spans(res)
         
-        with torch.amp.autocast('cuda'):
-            # 1. Consistency Loss
-            loss_c, cleanup_fn_con = compute_consistency_loss(
-                components, x0, spans, mode=mode,
-                min_logsnr=-4.0, max_logsnr=4.0
-            )
-            
-            # 2. Denoising Regularization (Prevent drift)
-            t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
-            l_den = get_schedule(t)
-            a, s = logsnr_to_alpha_sigma(l_den)
-            eps = torch.randn_like(x0)
-            z_t = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
-            v_t = a.view(-1,1,1,1)*eps - s.view(-1,1,1,1)*x0
-            
-            v_pred, aux_loss, cleanup_fn_den = predict_velocity_field(components, z_t, l_den, spans, mode)
-            
-            loss_d = F.mse_loss(v_pred, v_t)
-            loss = loss_c + 0.1 * loss_d + aux_loss
+        #disable cast for now
+        #with torch.amp.autocast('cuda'):
+        # 1. Consistency Loss
+        loss_c, cleanup_fn_con = compute_consistency_loss(
+            components, x0, spans, mode=mode,
+            min_logsnr=-4.0, max_logsnr=4.0
+        )
+        
+        # 2. Denoising Regularization (Prevent drift)
+        t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
+        l_den = get_schedule(t)
+        a, s = logsnr_to_alpha_sigma(l_den)
+        eps = torch.randn_like(x0)
+        z_t = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
+        v_t = a.view(-1,1,1,1)*eps - s.view(-1,1,1,1)*x0
+        
+        v_pred, aux_loss, cleanup_fn_den = predict_velocity_field(components, z_t, l_den, spans, mode)
+        
+        loss_d = F.mse_loss(v_pred, v_t)
+        loss = loss_c + 0.1 * loss_d + aux_loss
             
         # CRITICAL: Backward BEFORE cleanup
         scaler.scale(loss).backward()
@@ -718,6 +698,9 @@ if __name__ == "__main__":
 
     BUCKETS = [(16, 128), (32, 64)]
     STEPS = 500
+    DISTILL_STEPS = 500
+    RESOLUTIONS = [16, 32]
+    
     
     # 1. Singleton Stack
     print("🔧 Initializing Singleton Model Stack...")
@@ -776,4 +759,59 @@ if __name__ == "__main__":
     df_f = train_multires(components, 'factorized', BUCKETS, STEPS, logger)
     params_fact = model.dump()
     
-    print("✅ Done.")
+    print("\n📈 Plotting training losses...")
+    plot_detailed_loss(df_n, df_f, logger)
+
+    # 3. Sample BEFORE distillation
+    print("\n🎨 Sampling (Before Distillation)...")
+    samples_before = []
+    for res in RESOLUTIONS:
+        model.param_load(params_naive)
+        s_n = sample_viz(components, res, mode='naive')
+        
+        model.param_load(params_fact)
+        s_f = sample_viz(components, res, mode='factorized')
+        
+        samples_before.append((f"Naive {res}px", s_n))
+        samples_before.append((f"Fact {res}px", s_f))
+    
+    plot_sample_grid(samples_before, logger, "before_distillation")
+    
+    # 4. Distillation phase
+    print("\n🔮 Phase 2: Distillation")
+    
+    model.param_load(params_naive)
+    df_n_dist = distill_multires(components, 'naive', BUCKETS, DISTILL_STEPS, logger)
+    params_naive_dist = model.dump()
+    
+    model.param_load(params_fact)
+    df_f_dist = distill_multires(components, 'factorized', BUCKETS, DISTILL_STEPS, logger)
+    params_fact_dist = model.dump()
+    
+    print("\n📈 Plotting distillation losses...")
+    plot_distillation_loss(df_n_dist, df_f_dist, logger)
+
+    # 5. Sample AFTER distillation
+    print("\n🎨 Sampling (After Distillation)...")
+    samples_after = []
+    for res in RESOLUTIONS:
+        model.param_load(params_naive_dist)
+        s_n = sample_viz(components, res, mode='naive')
+        
+        model.param_load(params_fact_dist)
+        s_f = sample_viz(components, res, mode='factorized')
+        
+        samples_after.append((f"Naive {res}px", s_n))
+        samples_after.append((f"Fact {res}px", s_f))
+    
+    plot_sample_grid(samples_after, logger, "after_distillation")
+    
+    # 6. Comparison plot
+    fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
+    logger.save_figure(fig_compare, "before_after_comparison")
+    
+    # 7. Plot all losses
+    plot_detailed_loss(df_n, df_f, logger)
+    plot_distillation_loss(df_n_dist, df_f_dist, logger)
+    
+    print(f"\n✅ Done. Check {logger.run_dir}")
