@@ -15,27 +15,33 @@ def update_kv_cache(
     slot_mapping: torch.Tensor
 ):
     """
-    k_new: [B*L, H, 1, D]
-    k_cache: [1, H, Capacity, D]
-    slot_mapping: [B*L]
+    Writes new KV tokens into the persistent cache using scatter/indexing.
+    
+    Args:
+        k_new: [B*L, H, 1, D] - Incoming K tokens
+        v_new: [B*L, H, 1, D] - Incoming V tokens
+        k_cache: [1, H, Capacity, D] - Physical Heap
+        v_cache: [1, H, Capacity, D] - Physical Heap
+        slot_mapping: [B*L] - Physical indices for the incoming stream
     """
-    #oops haha
-    with torch.no_grad():
-        BL, H, _, D = k_new.shape
-        # Squeeze time dim: [B*L, H, 1, D] -> [B*L, H, D]
-        k_src = k_new.squeeze(2)
-        v_src = v_new.squeeze(2)
-        
-        # Expand slot_mapping for heads: [B*L] -> [B*L, H]
-        # Then flatten to [B*L*H]
-        slots_expanded = slot_mapping.unsqueeze(1).expand(-1, H).flatten()
-        
-        # Flatten k_src to [B*L*H, D]
-        k_flat = k_src.reshape(-1, D)
-        v_flat = v_src.reshape(-1, D)
-        
-        # Scatter write (heads are independent)
-        for h in range(H):
-            head_slots = slot_mapping  # Same slots for all heads
-            k_cache[0, h, head_slots, :] = k_src[:, h, :].to(k_cache.dtype)
-            v_cache[0, h, head_slots, :] = v_src[:, h, :].to(v_cache.dtype)
+    # Squeeze time dim: [B*L, H, 1, D] -> [B*L, H, D]
+    k_src = k_new.squeeze(2)
+    v_src = v_new.squeeze(2)
+    
+    # We want to write to k_cache[0, :, slot_mapping, :]
+    # k_cache[0] shape: [H, Capacity, D]
+    # k_src shape:      [BL, H, D] -> Permute to [H, BL, D] for alignment
+    
+    k_src_p = k_src.permute(1, 0, 2).to(k_cache.dtype)
+    v_src_p = v_src.permute(1, 0, 2).to(v_cache.dtype)
+    
+    # Vectorized advanced indexing:
+    # Dim 0 (H): Selects all heads (implicit broadcasting or slice)
+    # Dim 1 (Capacity): Selects specific slots via slot_mapping
+    # Dim 2 (D): Selects all features
+    
+    # Note: k_cache is [1, H, Cap, D], so we index at [0] first.
+    # usage of slice(None) is equivalent to ':'
+    
+    k_cache[0, :, slot_mapping, :] = k_src_p
+    v_cache[0, :, slot_mapping, :] = v_src_p

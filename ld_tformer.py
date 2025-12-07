@@ -762,8 +762,8 @@ class LDTformerAttention(nn.Module):
         # 3. Cache Write (Side Effect)
         # Transform from [B, H, L, D] -> [B*L, H, 1, D] semantics for scatter writer
         # We treat the batch as a flat stream of writes.
-        k_write = k.transpose(1, 2).reshape(B * L, self.num_heads, 1, self.head_dim)
-        v_write = v.transpose(1, 2).reshape(B * L, self.num_heads, 1, self.head_dim)
+        k_write = k.transpose(1, 2).reshape(B * L, self.num_heads, 1, self.head_dim).clone()
+        v_write = v.transpose(1, 2).reshape(B * L, self.num_heads, 1, self.head_dim).clone()
         
         update_kv_cache(k_write, v_write, k_cache, v_cache, slot_mapping)
         
