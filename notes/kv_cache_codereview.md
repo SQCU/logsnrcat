@@ -1,6 +1,7 @@
 #### user
 
 `The issue: cleanup() frees cache blocks, but those blocks hold K/V tensors that still have live gradients during backward pass. When kvt_manager.free_request() runs, it:` 
+
 be really careful reading lines like these.
 the callback is passed out of the function so that lines of script which needed to use an optimizer and also clear the cache could do their own history and state management, and we actually successfully trained two models in a row in a k_cached.nograd, v_cached.nograd variation. then sampled a bunch of images to 50 samples depth per noisy latent (no memory access conflicts!) and rendered them (they look like rainbow confetti but they aren't all black from all-zero underflows or all NaN under/overflows!)  so actually the code and programming method used were too smart to be stopped by blocking problems that should have stopped a normal implementation far earlier.
 the literal problems experienced are on a different level of abstraction: 
@@ -10,14 +11,17 @@ the literal problems experienced are on a different level of abstraction:
 """
 │ ATTENTION ROUTER │ │ (NEW - Mode Dispatch)
 """
+
 you're kind of close to it but actually in machine learning you can't write branched or routed code ever. we can only do masked + vectorized code because that's ontologically weaker than actual branching and makes compilation-into-optimal-and-sparse execution paths attainable instead of impossible. so the only way we can do this stuff is by:
 
+```
 TWO ENTIRE ASS MODELS:
-                                           │
+             │
  ┌───────────┴───────────┐ 
- │                                                                                 │ 
-▼                                                                               ▼
-LDTformercached                               LDTformercacheless
+ │                       │ 
+▼                        ▼
+LDTformercached          LDTformercacheless
+```
 
 any training context which uses autoregression loads 2 different models.
 models != parameters.
