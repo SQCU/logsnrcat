@@ -78,3 +78,32 @@ This project uses `uv` for fast and reliable dependency management.
 7. **why am i reading notes about 'vllm at home'**
 
     to find out more about 'vllm at home' please refer the poster behind this thread, @sameqcu or sqcu.dev for contact, to a technical recruiter or better yet something like a residency at one of the labs offering one right now.
+
+    supporting materials on the kv-caching and paged attention rempapping are attached in `notes/` for convenience. try running them and the project's source code through your favorite language models for review!
+
+8. **is a diffusion model and language model a diffusion language model?**
+
+    this is *almost* the case! the main missing functionality to get 'diffusion language model' behavior out of this code is...
+    well. hm. you would input some 'image latents' as 1 dimensional spans of the length of your token continuation, and you would use the same noise schedule rules and training objective as the image patch latents, really.
+    the result would be a 'span' of embeddings or hidden states which should have sensible logit values when queried through a textLM head. 
+    
+    surprisingly, this methodology would actually use the same kind of learned `token -> embedding` layer used by a logit head! the overall training flow would be: 
+    ```
+    train:
+    tokenize text -token_embed_layer->
+    text embeddings -forwards_noise_schedule->
+    noisy_text_embeddings -model.forwards(z_t)->
+    nte_vpred -diffusion_loss-> backprop -> optim_step -> repeat
+
+    eval:
+    tokenize text -token_embed_layer->
+    text embeddings -forwards_noise_schedule->
+    noisy_text_embeddings -model.forwards(z_t)->
+    nte_vpred -reverse_noise_schedule-> 
+    denoised_text_embeddings -text_lm_head->
+    logits of shape [Length, Vocabulary] -sample_logits->
+    diffusion denoised text.
+    ```
+    further details are attached in `notes/`. 
+    try running them and the project's source code through your favorite language models for review!
+
