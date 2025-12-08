@@ -1,2 +1,5 @@
 .venv
 uv.lock
+
+.inductor_cache
+__pycache__
