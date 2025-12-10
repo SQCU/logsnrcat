@@ -986,7 +986,7 @@ class coolerLDTformerKVC(nn.Module):
         self.load_state_dict(state_dict)
 
 
-class coolerLDTformerKVC(nn.Module):
+class coolerLDTformerZC(nn.Module):
     def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536):
         super().__init__()
         

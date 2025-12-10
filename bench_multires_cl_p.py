@@ -17,7 +17,7 @@ from diffusion_utils import get_schedule, get_alpha_sigma, BucketManager
 from dataset import CompositeIterator
 #from model import HybridGemmaDiT
 
-from ld_tformer import coolerLDTformer, SpanEmbedder, SpanUnembedder, build_composed_mask
+from ld_tformer import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, build_composed_mask
 from ld_tformer_embedding_functional import render_topology_embeddings
 from memory_manager import KVTManager, PageTable
 from kv_cache_allocator import allocate_kv_cache_safely
@@ -94,7 +94,7 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     
     return v_final, aux_loss, cleanup
 
-def run_forward_step(
+def run_forward_step_kvc(
     components, 
     z, 
     logsnr, 
@@ -196,6 +196,94 @@ def run_forward_step(
     )
     
     return z_out.squeeze(0), aux_loss, span_objects, req_ids
+
+def run_forward_step(
+    components, 
+    z, 
+    logsnr, 
+    base_spans,
+    suppress_logsnr_input: bool = False
+):
+    """
+    Zero-Cache Forward Step (ZC Mode).
+    
+    CRITICAL CHANGE: This generates a mask for the EPHEMERAL batch tensor,
+    not the persistent KVT heap.
+    
+    1. Embeds Spans -> Flat Tensor (Contiguous)
+    2. Generates Identity Topology (Logical Block i -> Physical Block i)
+    3. Runs Model with mask sized to L_active, not Capacity.
+    """
+    model, span_embedder, _, kvt_manager, page_table = components
+    B, C, H, W = z.shape
+    device = z.device
+    
+    # 1. Prepare Metadata & Inputs
+    batch_spans_meta = []
+    images = [z[i] for i in range(B)]
+    
+    if suppress_logsnr_input:
+        zero_map = torch.zeros((1, H, W), device=device)
+        logsnr_maps = [zero_map] * B
+    else:
+        if logsnr.dim() == 1:
+            logsnr_spatial = logsnr.view(B, 1, 1, 1).expand(B, 1, H, W)
+            logsnr_maps = [logsnr_spatial[i] for i in range(B)]
+        elif logsnr.dim() == 4:
+            logsnr_maps = [logsnr[i] for i in range(B)]
+        else:
+            raise ValueError(f"Invalid logsnr shape: {logsnr.shape}")
+
+    for i in range(B):
+        item_spans = [s.copy() for s in base_spans]
+        for s in item_spans: s['id'] = f"req_{i}" 
+        batch_spans_meta.extend(item_spans)
+
+    # 2. Embed -> z_flat [Total_L, D]
+    z_flat, span_objects, _ = span_embedder.embed(
+        batch_spans_meta,
+        text_tokens=[None] * B,
+        images=images,
+        logsnr_maps=logsnr_maps
+    )
+    
+    # 3. Render Topology
+    # topo_embeds: [Total_L, Topo_Dim]
+    topo_embeds, _ = render_topology_embeddings(batch_spans_meta, 3, device)
+    
+    # 4. Identity Mapping (The "Virtual" Page Table)
+    # The tensor is contiguous. Logical Block i is Physical Block i.
+    L_total = z_flat.shape[0]
+    block_size = page_table.block_size
+    num_blocks = (L_total + block_size - 1) // block_size
+    
+    # Identity mapping: [0, 1, 2, ... num_blocks-1]
+    flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
+    
+    # 5. Build Mask
+    # CRITICAL FIX: Use topo_embeds as topo_heap. 
+    # In ZC mode, the "Heap" is exactly the "Active Batch".
+    # This ensures Q_LEN == KV_LEN == L_total, matching flex_attention inputs.
+    block_mask = build_composed_mask(
+        span_objects,
+        topo_active=topo_embeds,
+        topo_heap=topo_embeds,      # <--- FIX: Heap == Active
+        page_table=page_table,      # Used for block_size param
+        flat_page_table=flat_page_table,
+        inverse_page_table=None     # Not needed for ZC
+    )
+    
+    # 6. Forward Pass
+    # coolerLDTformerZC expects flattened inputs [1, L, D]
+    z_out, aux_loss = model(
+        z_flat.unsqueeze(0),
+        topo_embeds.unsqueeze(0),
+        slot_mapping=None,          # ZC ignores this
+        block_mask=block_mask
+    )
+    
+    # No request IDs to cleanup in ZC mode
+    return z_out.squeeze(0), aux_loss, span_objects, []
 
 
 def logsnr_to_alpha_sigma(logsnr):
@@ -729,7 +817,8 @@ if __name__ == "__main__":
     print("🔧 Initializing Singleton Model Stack...")
     embed_dim = 256; depth = 4
     
-    model = coolerLDTformer(dim=embed_dim, depth=depth, num_heads=8, topo_dim=3).to(device)
+    #prefixed ZC for your safety
+    model = coolerLDTformerZC(dim=embed_dim, depth=depth, num_heads=8, topo_dim=3).to(device)
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
     
