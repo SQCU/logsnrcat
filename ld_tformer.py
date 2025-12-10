@@ -83,60 +83,83 @@ class HouseholderOrthogonal(nn.Module):
         return x @ Q.t() if inverse else x @ Q
 
 class RnRoPE(nn.Module):
-    """
-    Generalized RoPE for R^n.
-    Projects Topological Embeddings (Highway + Spatial) -> Rotation Frequencies.
-    """
-    def __init__(self, head_dim: int, topo_dim: int, num_reflections: int = 4):
+    def __init__(self, head_dim: int, topo_dim: int, rope_base: float = 10000.0):
         super().__init__()
         self.head_dim = head_dim
-        # We project the [Topo_Dim] coordinate vector into [Head_Dim/2] logical pairs.
-        # We use the Householder Orthogonal matrix to ensure this projection 
-        # preserves the geometric structure of the manifold.
-        self.ortho_proj = HouseholderOrthogonal(topo_dim, num_reflections)
+        self.topo_dim = topo_dim
+        self.freq_dim = head_dim // 2
         
-        # We need to map from Topo Space to Frequency Space.
-        # If Topo_Dim != Head_Dim/2, we need a Linear adapter.
-        # Or, strictly following the paper, we might just learn a mixing.
-        # Here we use a Linear layer initialized to project relevant dims.
-        self.freq_linear = nn.Linear(topo_dim, head_dim // 2, bias=False)
+        # Householder rotation for latent space projection
+        self.orthogonal = HouseholderOrthogonal(head_dim, num_reflections=head_dim//2)
+        
+        # Standard RoPE frequency bands
+        self.register_buffer(
+            'inv_freq',
+            1.0 / (rope_base ** (torch.arange(0, self.freq_dim, 2).float() / self.freq_dim))
+        )
+        
         self.param_init()
-
+    
     def param_init(self):
-        self.ortho_proj.param_init()
-        # Initialize frequency projection
-        init_linear(self.freq_linear)
-
-    def forward(self, x: torch.Tensor, topo_embeds: torch.Tensor) -> torch.Tensor:
+        self.orthogonal.param_init()
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor, topo_embeds: torch.Tensor):
         """
         Args:
-            x: [B, H, L, D]
-            topo_embeds: [B, L, Topo_Dim]
+            q: [B, H, L, D]
+            k: [B, H, L, D]
+            topo_embeds: [B, L, Topo_Dim] - absolute positions in topology space
         """
-        # 1. Project Coordinates to Frequencies
-        # topo_embeds is [B, L, T]. We want [B, L, D/2].
-        # We assume topo_embeds are 'log-space' coordinates (linear distance).
-        # We want to convert them to angular velocities.
-        freqs = self.freq_linear(topo_embeds.float())
+        B, H, L, D = q.shape
         
-        # 2. Construct Complex Rotations
-        # [B, L, D/2] -> [B, 1, L, D/2] for broadcasting over Heads
-        freqs = freqs.unsqueeze(1)
+        # 1. Rotate into frequency-friendly space
+        q = self.orthogonal(q.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D)
+        k = self.orthogonal(k.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D)
         
-        cos = freqs.cos()
-        sin = freqs.sin()
+        # 2. Compute frequencies from positions (Standard RoPE)
+        # For each topology dimension, compute outer product with frequency bands
+        freqs_list = []
+        for d in range(min(self.topo_dim, self.freq_dim)):
+            pos_d = topo_embeds[:, :, d]  # [B, L]
+            # Outer product: position × frequency bands
+            freq_d = torch.einsum('bl,f->blf', pos_d, self.inv_freq)
+            freqs_list.append(freq_d)
         
-        # 3. Apply Rotation (Standard pairs)
-        # x: [..., D] -> x1 (even), x2 (odd)
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
+        # Concatenate all dimensions
+        if freqs_list:
+            full_freqs = torch.cat(freqs_list, dim=-1)  # [B, L, ?]
+        else:
+            full_freqs = torch.zeros(B, L, self.freq_dim, device=q.device)
         
-        y1 = x1 * cos - x2 * sin
-        y2 = x1 * sin + x2 * cos
+        # Pad or truncate to freq_dim
+        if full_freqs.shape[-1] < self.freq_dim:
+            pad_size = self.freq_dim - full_freqs.shape[-1]
+            full_freqs = F.pad(full_freqs, (0, pad_size))
+        else:
+            full_freqs = full_freqs[..., :self.freq_dim]
         
-        # Interleave back
-        y = torch.stack([y1, y2], dim=-1).flatten(-2)
-        return y.to(x.dtype)
+        # 3. Create rotation matrices
+        # Duplicate for (cos, sin) on both halves
+        cos = full_freqs.cos().unsqueeze(1)  # [B, 1, L, freq_dim]
+        sin = full_freqs.sin().unsqueeze(1)
+        
+        # Expand to full head_dim by duplicating
+        cos = cos.repeat(1, 1, 1, 2)[..., :D]
+        sin = sin.repeat(1, 1, 1, 2)[..., :D]
+        
+        # 4. Apply rotary embedding
+        def rotate_half(x):
+            x1, x2 = x[..., :D//2], x[..., D//2:]
+            return torch.cat([-x2, x1], dim=-1)
+        
+        q_rot = (q * cos) + (rotate_half(q) * sin)
+        k_rot = (k * cos) + (rotate_half(k) * sin)
+        
+        # 5. Rotate back to original space
+        q_out = self.orthogonal(q_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D)
+        k_out = self.orthogonal(k_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D)
+        
+        return q_out, k_out
 
 # --- FFN & Blocks ---
 
@@ -863,8 +886,7 @@ class LDTformerAttentionKVC(nn.Module):
         # Apply RoPE using GLOBAL coordinates
         # topo_active[i] contains the ABSOLUTE highway position + spatial coords
         # So token at position 336 in the sequence gets highway=336, not highway=0
-        q = self.rope(q, topo_active)  # Uses global positions
-        k = self.rope(k, topo_active)  # Uses global positions
+        q, k = self.rope(q, k, topo_active)  # Uses global positions
         
         # 3. Cache Write (Side Effect)
         # Transform from [B, H, L, D] -> [B*L, H, 1, D] semantics for scatter writer
@@ -924,8 +946,7 @@ class LDTformerAttentionZC(nn.Module):
         # Apply RoPE using GLOBAL coordinates
         # topo_active[i] contains the ABSOLUTE highway position + spatial coords
         # So token at position 336 in the sequence gets highway=336, not highway=0
-        q = self.rope(q, topo_active)  # Uses global positions
-        k = self.rope(k, topo_active)  # Uses global positions
+        q, k = self.rope(q, k, topo_active)  # Uses global positions
         
         # Attention uses HEAP topology (via the mask)
         # The mask_mod already captures distances in the full heap
