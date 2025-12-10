@@ -417,6 +417,7 @@ def sample_viz(components, res, num_samples=8, mode='naive'):
     model.train()
     return z.cpu().clamp(0, 1)
 
+#why does this distillation loss always get written backwards then also called teacher-student distillation???
 def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsnr=-5.0, max_logsnr=5.0):
     B = x0.shape[0]
     device = x0.device
@@ -424,17 +425,16 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     a_start, s_start = logsnr_to_alpha_sigma(l_start)
     z_start = x0 * a_start.view(-1,1,1,1) + torch.randn_like(x0) * s_start.view(-1,1,1,1)
     
-    # 1. Teacher (Start -> End)
-    v_start, aux1, _ = predict_velocity_field(components, z_start, l_start, spans, mode)
-    with torch.no_grad():
-        z_end_teacher = euler_reverse_step(z_start, v_start, l_start, l_end)
+    # 1. coarse (Start -> End)
+    v_start_coarse, aux1, _ = predict_velocity_field(components, z_start, l_start, spans, mode)
+    z_end_coarse = euler_reverse_step(z_start, v_start_coarse, l_start, l_end)
     
-    # 2. Student (Start -> Mid -> End)
-    z_mid_student = euler_reverse_step(z_start, v_start, l_start, l_mid)
-    v_mid, aux2, _ = predict_velocity_field(components, z_mid_student, l_mid, spans, mode)
-    z_end_student = euler_reverse_step(z_mid_student, v_mid, l_mid, l_end)
+    # 2. fine (Start -> Mid -> End)
+    z_mid_fine = euler_reverse_step(z_start, v_start_coarse, l_start, l_mid)
+    v_mid_fine, aux2, _ = predict_velocity_field(components, z_mid_fine, l_mid, spans, mode)
+    z_end_fine = euler_reverse_step(z_mid_fine, v_mid_fine, l_mid, l_end)
     
-    loss = F.mse_loss(z_end_student, z_end_teacher.detach())
+    loss = F.mse_loss(z_end_coarse, z_end_fine.detach())
     return loss, aux1 + aux2, lambda: None
 
 def distill_multires(components, mode, buckets, steps=1000, logger=None):

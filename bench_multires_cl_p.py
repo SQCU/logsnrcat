@@ -633,40 +633,20 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     """
     B = x0.shape[0]
     device = x0.device
-
-    # Track all cleanup functions
-    cleanup_fns = []
-
-    # 1. Sample noise levels
     l_start, l_mid, l_end = sample_logsnr_triplet(B, device, min_logsnr, max_logsnr)
-    
-    # 2. Create noisy starting state
     a_start, s_start = logsnr_to_alpha_sigma(l_start)
     z_start = x0 * a_start.view(-1,1,1,1) + torch.randn_like(x0) * s_start.view(-1,1,1,1)
     
-    # === A. 1-STEP TRAJECTORY (Teacher): start → end ===
-    v_start, aux1, cleanup1 = predict_velocity_field(
-        components, z_start, l_start, spans, mode
-    )
-    cleanup_fns.append(cleanup1)
+    # 1. coarse (Start -> End)
+    v_start_coarse, aux1, _ = predict_velocity_field(components, z_start, l_start, spans, mode)
+    z_end_coarse = euler_reverse_step(z_start, v_start_coarse, l_start, l_end)
     
-    with torch.no_grad():
-        z_end_teacher = euler_reverse_step(z_start, v_start, l_start, l_end)
+    # 2. fine (Start -> Mid -> End)
+    z_mid_fine = euler_reverse_step(z_start, v_start_coarse, l_start, l_mid)
+    v_mid_fine, aux2, _ = predict_velocity_field(components, z_mid_fine, l_mid, spans, mode)
+    z_end_fine = euler_reverse_step(z_mid_fine, v_mid_fine, l_mid, l_end)
     
-    # === B. 2-STEP TRAJECTORY (Student): start → mid → end ===
-    # Step 1: start → mid (uses same v_start)
-    z_mid_student = euler_reverse_step(z_start, v_start, l_start, l_mid)
-    
-    # Step 2: mid → end (this is where gradients flow)
-    v_mid, aux2, cleanup2 = predict_velocity_field(
-        components, z_mid_student, l_mid, spans, mode
-    )
-    cleanup_fns.append(cleanup2)
-    
-    z_end_student = euler_reverse_step(z_mid_student, v_mid, l_mid, l_end)
-    
-    # === C. CONSISTENCY LOSS ===
-    loss = F.mse_loss(z_end_student, z_end_teacher.detach())
+    loss = F.mse_loss(z_end_coarse, z_end_fine.detach())
     
     # Create unified cleanup
     def cleanup_all():
