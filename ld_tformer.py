@@ -711,7 +711,7 @@ def build_composed_mask(
     
     return physical_mask
 
-class LDTformerAttention(nn.Module):
+class LDTformerAttentionKVC(nn.Module):
     def __init__(self, dim: int, num_heads: int, topo_dim: int):
         super().__init__()
         self.num_heads = num_heads
@@ -775,12 +775,65 @@ class LDTformerAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, L, D)
         return self.proj(out)
 
-class LDTformerBlock(nn.Module):
+class LDTformerAttentionZC(nn.Module):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.rope = RnRoPE(self.head_dim, topo_dim)
+        # Initialize immediately
+        self.param_init()
+
+    def param_init(self):
+        init_linear(self.qkv)
+        init_linear(self.proj)
+        self.rope.param_init()
+
+    # In LDTformerAttention.forward():
+    def forward(
+        self,
+        x: torch.Tensor,           # [B, L, D] - ACTIVE tokens only
+        topo_active: torch.Tensor, # [B, L_active, Topo_Dim] - GLOBAL COORDS
+        slot_mapping: torch.Tensor,
+        block_mask: object         # Already composed using HEAP topology
+    ):
+        """
+        Stateless Attention:
+        1. Projects Inputs
+        2. Applies RoPE using Topology
+        3. Commits New Data to Paged Heap
+        4. Attends over Paged Heap using Physical Mask
+        """
+        B, L, D = x.shape
+        
+        # 1. Compute Q, K, V for NEW/ACTIVE tokens
+        qkv = self.qkv(x)
+        qkv = qkv.reshape(B, L, 3, self.num_heads, self.head_dim)
+        # [B, L, 3, H, D_head] -> [3, B, H, L, D_head]
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        
+        # Apply RoPE using GLOBAL coordinates
+        # topo_active[i] contains the ABSOLUTE highway position + spatial coords
+        # So token at position 336 in the sequence gets highway=336, not highway=0
+        q = self.rope(q, topo_active)  # Uses global positions
+        k = self.rope(k, topo_active)  # Uses global positions
+        
+        # Attention uses HEAP topology (via the mask)
+        # The mask_mod already captures distances in the full heap
+        out = flex_attention(q, k, v, block_mask=block_mask)
+        
+        # 5. Projection
+        out = out.transpose(1, 2).reshape(B, L, D)
+        return self.proj(out)
+
+class LDTformerBlockKVC(nn.Module):
     def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0):
         super().__init__()
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.attn = LDTformerAttention(dim, num_heads, topo_dim)
-        
+        self.attn = LDTformerAttentionKVC(dim, num_heads, topo_dim)        
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
         
         # Using SigmoidMoE for FFN
@@ -810,9 +863,44 @@ class LDTformerBlock(nn.Module):
         
         return x, aux_loss
 
+class LDTformerBlockZC(nn.Module):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
+        self.attn = LDTformerAttentionZC(dim, num_heads, topo_dim)
+        
+        self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
+        
+        # Using SigmoidMoE for FFN
+        hidden_dim = int(dim * mlp_ratio)
+        self.moe = SigmoidMoE(dim, hidden_dim, num_experts=8, num_active=3, ) # Defaults: 8 experts, 3 active
+        self.gate_proj = nn.Linear(dim, dim)
+        # Initialize immediately
+        self.param_init()
+
+    def param_init(self):
+        init_layer_norm(self.norm1)
+        self.attn.param_init()
+        init_layer_norm(self.norm2)
+        self.moe.param_init()
+        init_linear(self.gate_proj)
+
+    def forward(self, x, topo, slots, mask):
+        # Attention Sub-block
+        h = self.norm1(x)
+        h = self.attn(h, topo, slots, mask)
+        gh = torch.sigmoid(self.gate_proj(h))
+        x = x + (h*gh)
+        
+        # MoE Sub-block
+        h_moe, aux_loss = self.moe(self.norm2(x))
+        x = x + h_moe
+        
+        return x, aux_loss
+
 # ===== INSIDE MODEL: Metadata-Agnostic =====
 
-class coolerLDTformer(nn.Module):
+class coolerLDTformerKVC(nn.Module):
     def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536):
         super().__init__()
         
@@ -826,7 +914,7 @@ class coolerLDTformer(nn.Module):
         
         # Transformer trunk
         self.layers = nn.ModuleList([
-            LDTformerBlock(dim, num_heads, topo_dim) for _ in range(depth)
+            LDTformerBlockKVC(dim, num_heads, topo_dim) for _ in range(depth)
         ])
         
         # Output heads (used by SpanUnembedder)
@@ -841,7 +929,6 @@ class coolerLDTformer(nn.Module):
         # Initialize everything
         self.param_init()
     
-
     def param_init(self):
         # Top level params
         torch.nn.init.normal_(self.text_embed.weight, mean=0.0, std=0.02)
@@ -875,6 +962,91 @@ class coolerLDTformer(nn.Module):
         
         for i, layer in enumerate(self.layers):
             x, aux = layer(x, topo_embeds, k_caches[i], v_caches[i], 
+                          slot_mapping, block_mask)
+            total_aux += aux
+        
+        x = self.final_norm(x)
+        return x, total_aux
+
+    # === LIFECYCLE METHODS ===
+    
+    def dump(self) -> Dict[str, torch.Tensor]:
+        """Return reference to parameters (no move)."""
+        return {k: v.clone() for k, v in self.state_dict().items()}
+
+    def flush(self):
+        """Zero out all parameters and gradients to simulate fresh state."""
+        for p in self.parameters():
+            p.data.zero_()
+            if p.grad is not None:
+                p.grad.zero_()
+        
+    def param_load(self, state_dict):
+        """Load a specific parameter set."""
+        self.load_state_dict(state_dict)
+
+
+class coolerLDTformerKVC(nn.Module):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536):
+        super().__init__()
+        
+        # Embedding heads (used by SpanEmbedder)
+        self.text_embed = nn.Embedding(vocab_size, dim)
+        self.patch_embedder = ContextualPatchEmbedder(
+            input_channels=3,
+            embed_dim=dim,
+            patch_size=2
+        )
+        
+        # Transformer trunk
+        self.layers = nn.ModuleList([
+            LDTformerBlockZC(dim, num_heads, topo_dim) for _ in range(depth)
+        ])
+        
+        # Output heads (used by SpanUnembedder)
+        self.text_head = nn.Linear(dim, vocab_size)
+        self.patch_unembedder = ContextualPatchUnembedder(
+            output_channels=3,
+            embed_dim=dim,
+            patch_size=2
+        )
+        
+        self.final_norm = nn.LayerNorm(dim)
+        # Initialize everything
+        self.param_init()
+    
+
+    def param_init(self):
+        # Top level params
+        torch.nn.init.normal_(self.text_embed.weight, mean=0.0, std=0.02)
+        init_linear(self.text_head)
+        init_layer_norm(self.final_norm)
+        
+        # Recursively init custom modules
+        self.patch_embedder.param_init()
+        self.patch_unembedder.param_init()
+        for layer in self.layers:
+            layer.param_init()
+
+    def forward(
+        self,
+        z: torch.Tensor,           # [B, L_total, D] - FLAT
+        topo_embeds: torch.Tensor, # [B, L_total, Topo_Dim] - FLAT
+        slot_mapping: torch.Tensor,
+        block_mask: object
+    ) -> Tuple[torch.Tensor, float]:
+        """
+        Pure transformer pass. No span logic.
+        
+        Returns:
+            z_out: [B, L_total, D] - transformed features
+            aux_loss: scalar
+        """
+        x = z
+        total_aux = 0.0
+        
+        for i, layer in enumerate(self.layers):
+            x, aux = layer(x, topo_embeds,
                           slot_mapping, block_mask)
             total_aux += aux
         

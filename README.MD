@@ -106,4 +106,3 @@ This project uses `uv` for fast and reliable dependency management.
     ```
     further details are attached in `notes/`. 
     try running them and the project's source code through your favorite language models for review!
-
