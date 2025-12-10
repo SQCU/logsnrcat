@@ -19,7 +19,7 @@ from dataset import CompositeIterator
 
 # NOTE: Importing the ZC (Zero-Cache) variant for training
 from ld_tformer import coolerLDTformerZC as coolerLDTformer
-from ld_tformer import SpanEmbedder, SpanUnembedder, build_composed_mask
+from ld_tformer import SpanEmbedder, SpanUnembedder, build_dual_masks
 from ld_tformer_embedding_functional import render_topology_embeddings
 from memory_manager import KVTManager, PageTable
 from kv_cache_allocator import allocate_kv_cache_safely
@@ -166,14 +166,16 @@ def run_forward_step_kvc(
     seq_lengths = [kvt_manager.req_lengths[rid] for rid in req_ids]
     slot_mapping = kvt_manager.get_slot_mapping(block_tables, seq_lengths)
 
-    # 7. Build Physical Mask
-    block_mask = build_composed_mask(
+    # 7. Build Dual Masks (Local + Global)
+    # Returns tuple (local_mask, global_mask)
+    # Note: Using topo_embeds as topo_heap for ZC mode (Identity Heap)
+    block_masks = build_dual_masks(
         span_objects,
         topo_active=topo_embeds,
-        topo_heap=kvt_manager.get_topo_view(),
+        topo_heap=topo_embeds,
         page_table=page_table,
         flat_page_table=flat_page_table,
-        inverse_page_table=inverse_page_table,
+        inverse_page_table=None
     )
     
     # 8. Forward Pass
@@ -191,7 +193,7 @@ def run_forward_step_kvc(
         k_caches=k_views,
         v_caches=v_views,
         slot_mapping=slot_mapping,
-        block_mask=block_mask
+        block_mask=block_masks
     )
     
     return z_out.squeeze(0), aux_loss, span_objects, req_ids
@@ -259,26 +261,25 @@ def run_forward_step(
     # Identity mapping: [0, 1, 2, ... num_blocks-1]
     flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
     
-    # 5. Build Mask
-    # CRITICAL FIX: Use topo_embeds as topo_heap. 
-    # In ZC mode, the "Heap" is exactly the "Active Batch".
-    # This ensures Q_LEN == KV_LEN == L_total, matching flex_attention inputs.
-    block_mask = build_composed_mask(
+    # 5. Build Dual Masks (Local + Global)
+    # Returns tuple (local_mask, global_mask)
+    # Note: Using topo_embeds as topo_heap for ZC mode (Identity Heap)
+    block_masks = build_dual_masks(
         span_objects,
         topo_active=topo_embeds,
-        topo_heap=topo_embeds,      # <--- FIX: Heap == Active
-        page_table=page_table,      # Used for block_size param
+        topo_heap=topo_embeds,
+        page_table=page_table,
         flat_page_table=flat_page_table,
-        inverse_page_table=None     # Not needed for ZC
+        inverse_page_table=None
     )
     
     # 6. Forward Pass
-    # coolerLDTformerZC expects flattened inputs [1, L, D]
+    # coolerLDTformerZC now expects 'block_masks' (tuple), not 'block_mask'
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
-        slot_mapping=None,          # ZC ignores this
-        block_mask=block_mask
+        slot_mapping=None,
+        block_masks=block_masks  # <--- CHANGED ARGUMENT
     )
     
     # No request IDs to cleanup in ZC mode
@@ -439,7 +440,7 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
 def distill_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Distilling: {mode.upper()} ---")
     model = components[0]
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.1)  #why were you a different value?
     # Scaled down buckets for distillation memory
     buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
     
@@ -532,11 +533,18 @@ if __name__ == "__main__":
     logger = ExperimentLogger(output_dir="./experiments_mix")
     device = torch.device('cuda')
 
+    """    
     BUCKETS = [(16, 128), (32, 64), (64, 16)]
     STEPS = 2000
     DISTILL_STEPS = 2000
     RESOLUTIONS = [16, 32, 64]
-    
+    """
+    BUCKETS = [(16, 128), (32, 64), (64, 16)]
+    STEPS = 500
+    DISTILL_STEPS = 500
+    RESOLUTIONS = [16, 32, 64]
+
+
     
     print("🔧 Initializing ZC Model Stack...")
     embed_dim = 256; depth = 4; num_heads=8; topo_dim = 3 

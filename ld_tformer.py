@@ -600,6 +600,117 @@ class SpanUnembedder:
         # hehe :)
         return outputs
 
+def build_dual_masks(
+    spans: List[Span],
+    topo_active: torch.Tensor,
+    topo_heap: torch.Tensor,
+    page_table: Optional[PageTable] = None,
+    flat_page_table: Optional[torch.Tensor] = None,
+    inverse_page_table: Optional[torch.Tensor] = None,
+    window_size: float = 10.0
+) -> Tuple[BlockMask, BlockMask]:
+    """
+    Returns (local_mask, global_mask).
+    Global mask ignores spatial constraints but respects Document/Causal boundaries.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+    
+    device = topo_active.device
+    L_active = topo_active.shape[0]
+    L_heap = topo_heap.shape[0]
+    block_size = page_table.block_size
+    
+    # 1. Build doc_ids for ACTIVE tokens
+    doc_ids_active = []
+    for i, span in enumerate(spans):
+        doc_ids_active.extend([i] * (span.end_idx - span.start_idx))
+    doc_ids_active_t = torch.tensor(doc_ids_active, dtype=torch.long, device=device)
+    
+    # 2. Build doc_ids for HEAP (EFFICIENT VERSION)
+    # Initialize heap as unallocated
+    doc_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=device)
+    
+    # For each span, compute which physical slots it occupies
+    cursor = 0
+    for rid, span in enumerate(spans):
+        span_len = span.end_idx - span.start_idx
+        
+        # Get logical block range for this span
+        start_block = cursor // block_size
+        end_block = (cursor + span_len - 1) // block_size + 1
+        
+        # Map logical blocks -> physical slots
+        for log_block_idx in range(start_block, end_block):
+            if log_block_idx >= len(flat_page_table):
+                break
+                
+            phys_block = flat_page_table[log_block_idx].item()
+            
+            # Calculate which tokens in this span map to this physical block
+            block_start_in_span = max(0, log_block_idx * block_size - cursor)
+            block_end_in_span = min(span_len, (log_block_idx + 1) * block_size - cursor)
+            
+            # Physical slot range
+            offset_start = (cursor + block_start_in_span) % block_size
+            offset_end = offset_start + (block_end_in_span - block_start_in_span)
+            
+            phys_start = phys_block * block_size + offset_start
+            phys_end = phys_block * block_size + offset_end
+            
+            # Mark these slots as belonging to this document
+            doc_ids_heap_t[phys_start:phys_end] = rid
+        
+        cursor += span_len
+    
+    # 3. Decompose Topology
+    topo_active_cols = topo_active.unbind(dim=-1)
+    highway_active = topo_active_cols[0]
+    spatial_active = topo_active_cols[1:]
+    
+    topo_heap_cols = topo_heap.unbind(dim=-1)
+    highway_heap = topo_heap_cols[0]
+    spatial_heap = topo_heap_cols[1:]
+    
+    win_sq = torch.tensor(window_size * window_size, device=device, dtype=topo_active.dtype)
+
+    # 1. The Core Connectivity Logic (Shared)
+    def base_connectivity(q_idx, kv_idx):
+        q_doc = doc_ids_active_t[q_idx]
+        k_doc = doc_ids_heap_t[kv_idx]
+        same_doc = (q_doc == k_doc) & (k_doc >= 0)
+        
+        q_time = highway_active[q_idx]
+        k_time = highway_heap[kv_idx]
+        causal = q_time >= k_time
+        
+        return same_doc & causal
+
+    # 2. Local Mod (Spatial Window)
+    def mask_mod_local(b, h, q_idx, kv_idx):
+        base = base_connectivity(q_idx, kv_idx)
+        
+        dist_sq = 0.0
+        for q_col, k_col in zip(spatial_active, spatial_heap):
+            d = q_col[q_idx] - k_col[kv_idx]
+            dist_sq = dist_sq + (d * d)
+            
+        spatial_ok = dist_sq < win_sq
+        return base & spatial_ok
+
+    # 3. Global Mod (Infinite Window)
+    def mask_mod_global(b, h, q_idx, kv_idx):
+        return base_connectivity(q_idx, kv_idx)
+
+    # 4. Compile
+    local_mask = create_block_mask(
+        mask_mod_local, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
+    )
+    global_mask = create_block_mask(
+        mask_mod_global, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
+    )
+    
+    return local_mask, global_mask
+
 def build_composed_mask(
     spans: List[Span],
     topo_active: torch.Tensor,      # [L_active, Topo_Dim] - Active tokens only
@@ -712,7 +823,7 @@ def build_composed_mask(
     return physical_mask
 
 class LDTformerAttentionKVC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, is_global=False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -780,7 +891,6 @@ class LDTformerAttentionZC(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
         self.rope = RnRoPE(self.head_dim, topo_dim)
@@ -830,8 +940,9 @@ class LDTformerAttentionZC(nn.Module):
         return self.proj(out)
 
 class LDTformerBlockKVC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False):
         super().__init__()
+        self.is_global = is_global
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.attn = LDTformerAttentionKVC(dim, num_heads, topo_dim)        
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
@@ -864,11 +975,11 @@ class LDTformerBlockKVC(nn.Module):
         return x, aux_loss
 
 class LDTformerBlockZC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False):
         super().__init__()
+        self.is_global = is_global
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
         self.attn = LDTformerAttentionZC(dim, num_heads, topo_dim)
-        
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
         
         # Using SigmoidMoE for FFN
@@ -901,10 +1012,11 @@ class LDTformerBlockZC(nn.Module):
 # ===== INSIDE MODEL: Metadata-Agnostic =====
 
 class coolerLDTformerKVC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
+        self.global_layer_interval = global_layer_interval
         self.text_embed = nn.Embedding(vocab_size, dim)
         self.patch_embedder = ContextualPatchEmbedder(
             input_channels=3,
@@ -914,7 +1026,7 @@ class coolerLDTformerKVC(nn.Module):
         
         # Transformer trunk
         self.layers = nn.ModuleList([
-            LDTformerBlockKVC(dim, num_heads, topo_dim) for _ in range(depth)
+            LDTformerBlockKVC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0)) for i in range(depth)
         ])
         
         # Output heads (used by SpanUnembedder)
@@ -948,7 +1060,7 @@ class coolerLDTformerKVC(nn.Module):
         k_caches: list,
         v_caches: list,
         slot_mapping: torch.Tensor,
-        block_mask: object
+        block_masks: Tuple[object, object] # Receives (Local, Global)
     ) -> Tuple[torch.Tensor, float]:
         """
         Pure transformer pass. No span logic.
@@ -957,10 +1069,12 @@ class coolerLDTformerKVC(nn.Module):
             z_out: [B, L_total, D] - transformed features
             aux_loss: scalar
         """
+        mask_local, mask_global = block_masks
         x = z
         total_aux = 0.0
         
         for i, layer in enumerate(self.layers):
+            block_mask = mask_global if layer.is_global else mask_local
             x, aux = layer(x, topo_embeds, k_caches[i], v_caches[i], 
                           slot_mapping, block_mask)
             total_aux += aux
@@ -987,10 +1101,11 @@ class coolerLDTformerKVC(nn.Module):
 
 
 class coolerLDTformerZC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
+        self.global_layer_interval = global_layer_interval
         self.text_embed = nn.Embedding(vocab_size, dim)
         self.patch_embedder = ContextualPatchEmbedder(
             input_channels=3,
@@ -1000,7 +1115,7 @@ class coolerLDTformerZC(nn.Module):
         
         # Transformer trunk
         self.layers = nn.ModuleList([
-            LDTformerBlockZC(dim, num_heads, topo_dim) for _ in range(depth)
+            LDTformerBlockZC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0)) for i in range(depth)
         ])
         
         # Output heads (used by SpanUnembedder)
@@ -1033,7 +1148,7 @@ class coolerLDTformerZC(nn.Module):
         z: torch.Tensor,           # [B, L_total, D] - FLAT
         topo_embeds: torch.Tensor, # [B, L_total, Topo_Dim] - FLAT
         slot_mapping: torch.Tensor,
-        block_mask: object
+        block_masks: Tuple[object, object] # Receives (Local, Global)
     ) -> Tuple[torch.Tensor, float]:
         """
         Pure transformer pass. No span logic.
@@ -1042,14 +1157,15 @@ class coolerLDTformerZC(nn.Module):
             z_out: [B, L_total, D] - transformed features
             aux_loss: scalar
         """
+        mask_local, mask_global = block_masks
         x = z
         total_aux = 0.0
         
         for i, layer in enumerate(self.layers):
+            block_mask = mask_global if layer.is_global else mask_local
             x, aux = layer(x, topo_embeds,
                           slot_mapping, block_mask)
             total_aux += aux
-        
         x = self.final_norm(x)
         return x, total_aux
 
