@@ -92,6 +92,51 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     # 4. Cleanup (No-op for ZC/Cacheless)
     return v_final, aux_loss, lambda: None
 
+def compute_nll_loss(v_pred_mean, v_pred_logvar, v_target):
+    """
+    Computes Heteroscedastic Gaussian NLL.
+    
+    Args:
+        v_pred_mean: The predicted velocity vector.
+        v_pred_logvar: Predicted log-variance (uncertainty).
+        v_target: The ground truth velocity.
+    """
+    # 1. The Precision Term (MSE weighted by uncertainty)
+    # If logvar is high (uncertain), this term shrinks.
+    # We use exp(-logvar) for numerical stability.
+    precision = torch.exp(-v_pred_logvar)
+    mse = (v_pred_mean - v_target) ** 2
+    loss_precision = 0.5 * precision * mse
+    
+    # 2. The Entropy Term (Penalty for being uncertain)
+    # This prevents the model from predicting infinite variance to cheat.
+    loss_uncertainty = 0.5 * v_pred_logvar
+    
+    # Total Loss per pixel
+    loss = loss_precision + loss_uncertainty
+    
+    return loss.mean()
+
+def predict_probabilistic_field(components, z, logsnr, spans):
+    model, _, span_unemb, _, _ = components
+    
+    # Run Forward
+    z_flat, aux_loss, objs, _ = run_forward_step(components, z, logsnr, spans)
+    decoded = span_unemb.decode(z_flat, objs)
+    
+    # Unpack Prediction
+    v_mean = torch.stack([d['image_vpreds'] for d in decoded])
+    
+    # Interpret the 'logsnr' head as the Model's Uncertainty regarding v
+    # High predicted LogSNR = Low Variance (Confident)
+    # Low predicted LogSNR = High Variance (Uncertain)
+    pred_logsnr = torch.stack([d['image_logsnrs'] for d in decoded])
+    
+    # Variance = 1 / SNR, so LogVar = -LogSNR
+    # We allow the model to learn a shift/scale on this if needed
+    v_logvar = -pred_logsnr 
+    
+    return v_mean, v_logvar, aux_loss
 
 def run_forward_step_kvc(
     components, 
@@ -390,6 +435,50 @@ def plot_comparison_grid(samples_before, samples_after, resolutions):
     plt.tight_layout()
     return fig
 
+
+def plot_three_way_loss(df_naive, df_fact, df_nll, logger):
+    """
+    Plots Naive vs Factorized vs NLL training curves.
+    Note: NLL loss scale is different (can be negative), so we plot it on secondary axis or separate subplot.
+    """
+    df_naive = df_naive.interpolate()
+    df_fact = df_fact.interpolate()
+    df_nll = df_nll.interpolate()
+    
+    resolutions = sorted(df_naive['res'].unique())
+    
+    fig, axes = plt.subplots(len(resolutions), 1, figsize=(10, 4 * len(resolutions)))
+    if len(resolutions) == 1: axes = [axes]
+    
+    for r_idx, res in enumerate(resolutions):
+        ax1 = axes[r_idx]
+        ax2 = ax1.twinx() # Second axis for NLL
+        
+        n_res = df_naive[df_naive['res'] == res]
+        f_res = df_fact[df_fact['res'] == res]
+        nll_res = df_nll[df_nll['res'] == res]
+        
+        # Plot MSE models on Left Axis
+        if not n_res.empty:
+            ax1.plot(n_res['step'], n_res['loss_total'].rolling(20).mean(), label='Naive (MSE)', color='tab:blue')
+        if not f_res.empty:
+            ax1.plot(f_res['step'], f_res['loss_total'].rolling(20).mean(), label='Fact (MSE)', color='tab:orange')
+            
+        # Plot NLL model on Right Axis
+        if not nll_res.empty:
+            ax2.plot(nll_res['step'], nll_res['loss_total'].rolling(20).mean(), label='NLL (LogProb)', color='tab:green', linestyle='--')
+            
+        ax1.set_title(f"Training Loss @ {res}px")
+        ax1.set_ylabel("MSE Loss")
+        ax2.set_ylabel("NLL Loss")
+        
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+        
+    plt.tight_layout()
+    logger.save_figure(fig, "three_way_training_loss")
+
 ### Sampling & Training
 
 @torch.no_grad()
@@ -469,7 +558,7 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         v_pred, aux_loss, _ = predict_velocity_field(components, z_t, l_den, spans, mode)
         loss_d = F.mse_loss(v_pred, v_t)
         
-        loss_t = loss_c + 0.1 * loss_d + aux_loss + aux_loss_con
+        loss_t = (1.0+loss_c) * 1.0 * loss_d + aux_loss + aux_loss_con
         loss_t.backward()
         opt.step()
         
@@ -478,6 +567,70 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         history.append(step_stats)
         if i % 50 == 0:
             pbar.set_postfix({'cons': f'{loss_c.item():.4f}', 'den': f'{loss_d.item():.4f}'})
+            
+    return pd.DataFrame(history)
+
+def distill_nll(components, mode, buckets, steps=1000, logger=None):
+    """
+    Distillation where the 'Dataset' signal is the NLL Loss.
+    This combines Generation Gradients (Consistency) with Probabilistic Data Gradients (NLL).
+    """
+    print(f"\n--- Distilling: Probabilistic (NLL + Consistency) ---")
+    model = components[0]
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.1)
+    
+    # Use reduced batch size for distillation memory overhead
+    buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
+    
+    iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
+    manager = BucketManager(buckets_distill)
+    history = []
+    
+    pbar = tqdm(range(steps), desc="distill-prob")
+    for i in pbar:
+        opt.zero_grad()
+        res, bs = manager.next_bucket()
+        
+        # Data
+        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
+        spans = get_image_spans(res)
+        
+        # 1. Consistency Loss (Generation Gradient)
+        # We stick to MSE for the trajectory itself to force a deterministic path
+        loss_c, aux_c, _ = compute_consistency_loss(components, x0, spans, mode=mode)
+        
+        # 2. Denoising Loss (Dataset Gradient via NLL)
+        # We need a fresh noise sample for the "Denoising" objective to ensure independence
+        t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
+        l_den = get_schedule(t)
+        a, s = logsnr_to_alpha_sigma(l_den)
+        eps = torch.randn_like(x0)
+        z_t = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
+        v_true = a.view(-1,1,1,1)*eps - s.view(-1,1,1,1)*x0
+        
+        # Get Mean and Variance estimates
+        v_mean, v_logvar, aux_d = predict_probabilistic_field(components, z_t, l_den, spans)
+        
+        # Compute NLL
+        loss_nll = compute_nll_loss(v_mean, v_logvar, v_true)
+        
+        # 3. The "Agreement Gate"
+        # If Consistency is bad, force high Likelihood on the data.
+        # If Consistency is good, just maintain Likelihood.
+        loss_t = (1.0 + loss_c) * loss_nll + aux_c+aux_d
+        
+        loss_t.backward()
+        opt.step()
+        
+        step_stats = {
+            'step': i, 'res': res, 
+            'loss_consistency': loss_c.item(),
+            'loss_nll': loss_nll.item(),
+            'loss_total': loss_t.item()
+        }
+        history.append(step_stats)
+        if i % 50 == 0:
+            pbar.set_postfix({'cons': f'{loss_c.item():.4f}', 'nll': f'{loss_nll.item():.4f}'})
             
     return pd.DataFrame(history)
 
@@ -528,26 +681,81 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
             
     return pd.DataFrame(history)
 
+def train_nll(components, mode, buckets, steps=1000, logger=None):
+    """
+    Trains using Heteroscedastic Gaussian NLL.
+    Ignores 'mode' parameter logic for output scaling, uses probabilistic field directly.
+    """
+    print(f"\n--- Training: NLL (Base) ---")
+    model = components[0]
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+    
+    iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
+    manager = BucketManager(buckets)
+    history = []
+    
+    pbar = tqdm(range(steps), desc="nll-train")
+    for i in pbar:
+        opt.zero_grad()
+        res, bs = manager.next_bucket()
+        
+        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
+        t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
+        logsnr = get_schedule(t)
+        alpha, sigma = get_alpha_sigma(logsnr)
+        
+        eps = torch.randn_like(x0)
+        z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
+        v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
+
+        base_spans = get_image_spans(res)
+        
+        # 1. Get Probabilistic Prediction (Mean, LogVar)
+        # Note: We don't use predict_velocity_field here because we need the raw logsnr head
+        v_mean, v_logvar, aux_loss = predict_probabilistic_field(components, z_t, logsnr, base_spans)
+        
+        # 2. Compute NLL Loss
+        # This replaces MSE. The model learns to output high v_logvar when error is high.
+        loss_nll = compute_nll_loss(v_mean, v_logvar, v_true)
+        total_loss = loss_nll + aux_loss
+        total_loss.backward()
+        opt.step()
+
+        # Logging (NLL is not directly comparable to MSE, but we log it)
+        step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
+        history.append(step_stats)
+        if i % 100 == 0:
+            pbar.set_postfix({'nll': f'{loss_nll.item():.4f}', 'res': res})
+            
+    return pd.DataFrame(history)
+
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
     logger = ExperimentLogger(output_dir="./experiments_mix")
     device = torch.device('cuda')
 
-    """    
+    """
     BUCKETS = [(16, 128), (32, 64), (64, 16)]
     STEPS = 2000
     DISTILL_STEPS = 2000
     RESOLUTIONS = [16, 32, 64]
     """
-    BUCKETS = [(16, 128), (32, 64), (64, 16)]
+    
+    BUCKETS = [(16, 128)]
     STEPS = 500
     DISTILL_STEPS = 500
     RESOLUTIONS = [16, 32, 64]
-
+    
+    """
+    BUCKETS = [(128,4)]
+    STEPS = 2000
+    DISTILL_STEPS = 2000
+    RESOLUTIONS = [16, 32, 64, 128]
+    """
 
     
     print("🔧 Initializing ZC Model Stack...")
-    embed_dim = 256; depth = 4; num_heads=8; topo_dim = 3 
+    embed_dim = 512; depth = 4; num_heads=16; topo_dim = 3 
     
     # 1. Initialize ZC Model (Cacheless)
     model = coolerLDTformer(dim=embed_dim, depth=depth, num_heads=num_heads, topo_dim=topo_dim).to(device)
@@ -597,6 +805,24 @@ if __name__ == "__main__":
     df_f = train_multires(components, 'factorized', BUCKETS, STEPS, logger)
     params_fact = model.dump()
     
+    
+    # 3.5 Run C: NLL
+    print("🚀 Run C: NLL")
+    model.flush()
+    model.param_init()
+    # NLL training doesn't use the 'mode' param for loss calculation (it uses the custom loop)
+    # but we pass 'factorized' to prediction helpers later if we want to test that decoding path,
+    # or 'naive' if we want raw output. For NLL, the model predicts mean directly.
+    df_nll = train_nll(components, 'factorized', BUCKETS, STEPS, logger)
+    params_nll = model.dump()
+
+    print("\n📈 Plotting 3-way training losses...")
+    plot_three_way_loss(df_n, df_f, df_nll, logger)
+
+    # 4. Sample BEFORE distillation (Updated to include NLL)
+    print("\n🎨 Sampling (Before Distillation)...")
+    samples_before = []
+
     print("\n📈 Plotting training losses...")
     plot_detailed_loss(df_n, df_f, logger)
 
@@ -612,8 +838,13 @@ if __name__ == "__main__":
         
         samples_before.append((f"Naive {res}px", s_n))
         samples_before.append((f"Fact {res}px", s_f))
+
+        model.param_load(params_nll)
+        s_nll = sample_viz(components, res, mode='naive') # Mode 'naive' interprets output as raw v
+        samples_before.append((f"NLL {res}px", s_nll))
     
-    plot_sample_grid(samples_before, logger, "before_distillation")
+    plot_sample_grid(samples_before, logger, "before_distillation_3way")
+    #plot_sample_grid(samples_before, logger, "before_distillation")
     
     # 5. Distillation phase
     print("\n🔮 Phase 2: Distillation")
@@ -625,8 +856,15 @@ if __name__ == "__main__":
     df_f_dist = distill_multires(components, 'factorized', BUCKETS, DISTILL_STEPS, logger)
     params_fact_dist = model.dump()
     
+    # 5.5 Distill NLL
+    print("...Distilling NLL...")
+    model.param_load(params_nll)
+    df_nll_dist = distill_nll(components, 'naive', BUCKETS, DISTILL_STEPS, logger)
+    params_nll_dist = model.dump()
+
     print("\n📈 Plotting distillation losses...")
     plot_distillation_loss(df_n_dist, df_f_dist, logger)
+    plot_three_way_loss(df_n_dist, df_f_dist, df_nll_dist , logger)
 
     # 6. Sample AFTER distillation
     print("\n🎨 Sampling (After Distillation)...")
@@ -638,10 +876,14 @@ if __name__ == "__main__":
         model.param_load(params_fact_dist)
         s_f = sample_viz(components, res, mode='factorized')
         
+        model.param_load(params_nll_dist)
+        s_nll = sample_viz(components, res, mode='naive')
+
         samples_after.append((f"Naive {res}px", s_n))
         samples_after.append((f"Fact {res}px", s_f))
+        samples_after.append((f"NLL {res}px", s_nll))
     
-    plot_sample_grid(samples_after, logger, "after_distillation")
+    plot_sample_grid(samples_after, logger, "after_distillation_3way")
     fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
     logger.save_figure(fig_compare, "before_after_comparison")
     

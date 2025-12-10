@@ -291,87 +291,83 @@ class FourierScaleDecoder(nn.Module):
 # latent unembedding units
 
 class ContextualPatchEmbedder(nn.Module):
-    """
-    Tokenizes a single continuous latent raster + spatial logsnr map.
-    Removes batch assumptions. Operates on [C, H, W].
-    """
     def __init__(
         self, 
         input_channels: int = 3, 
         fourier_dim: int = 16, 
         embed_dim: int = 256, 
-        patch_size: int = 2, 
+        context_size: int = 4,
+        stride: int = 2,
         mlp_depth: int = 1
     ):
         super().__init__()
-        self.patch_size = patch_size
+        self.context_size = context_size
+        self.stride = stride
+        self.padding = (context_size - stride) // 2
         self.fourier_dim = fourier_dim
-        # Patch Flat Dim: (C * P * P) + Fourier_Dim
-        self.patch_flat_dim = (patch_size ** 2) * input_channels
-        self.input_dim = self.patch_flat_dim + fourier_dim
         
-        # 1. LogSNR Encoder
+        # Fourier encoder for scalar logsnr -> feature vector
         self.fourier_enc = FourierFeatures(fourier_dim=fourier_dim)
         
-        # 2. Input Projection        
-        self.input_proj = nn.Linear(self.input_dim, embed_dim)
+        # Input: RGB patches (C*K*K) + logsnr features (F)
+        # Think of it as: (C+F)*K*K flattened
+        self.patch_flat_dim = (context_size ** 2) * input_channels
+        self.input_dim = self.patch_flat_dim + fourier_dim
         
+        self.input_proj = nn.Linear(self.input_dim, embed_dim)
         self.res_blocks = nn.Sequential(*[
             MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))
         ])
         self.param_init()
 
     def param_init(self):
-        init_linear(self.input_proj)
         for block in self.res_blocks:
             block.param_init()
+        init_linear(self.input_proj)
 
     def forward(
         self, 
-        x: torch.Tensor, 
-        logsnr_map: torch.Tensor
+        x: torch.Tensor,           # [C, H, W]
+        logsnr_map: torch.Tensor   # [1, H, W] ← SPATIAL field!
     ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
-        Args:
-            x: [C, H, W]
-            logsnr_map: [1, H, W]
-            
-        Returns:
-            z: [Num_Tokens, Embed_Dim]
-            shape: (Grid_H, Grid_W)
+        Treats logsnr_map as an additional 'channel' to concatenate to RGB.
         """
         C, H, W = x.shape
-        P = self.patch_size
         
-        if H % P != 0 or W % P != 0:
-            raise ValueError(f"Input shape {H}x{W} not divisible by patch size {P}")
+        # 1. Pad both tensors
+        x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), 
+                      mode='reflect')
+        logsnr_pad = F.pad(logsnr_map, (self.padding, self.padding, self.padding, self.padding), 
+                           mode='reflect')
         
-        # 1. Raster Patching
-        # Unfold spatial dims: [C, H, W] -> [C, GH, GW, P, P]
-        # Dim 1 is H, Dim 2 is W
-        patches = x.unfold(1, P, P).unfold(2, P, P)
+        # 2. Extract overlapping patches from IMAGE
+        # [C, H_pad, W_pad] -> [C, GH, GW, K, K]
+        patches_img = x_pad.unfold(1, self.context_size, self.stride) \
+                           .unfold(2, self.context_size, self.stride)
+        GH, GW = patches_img.shape[1], patches_img.shape[2]
         
-        GH, GW = patches.shape[1], patches.shape[2]
+        # Flatten spatial: [C, GH, GW, K, K] -> [GH*GW, C*K*K]
+        patches_img = patches_img.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1)
         
-        # Permute to [GH, GW, C, P, P] -> Flatten to [GH*GW, C*P*P]
-        patches = patches.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1)
+        # 3. Extract overlapping patches from LOGSNR MAP
+        # [1, H_pad, W_pad] -> [1, GH, GW, K, K]
+        patches_logsnr = logsnr_pad.unfold(1, self.context_size, self.stride) \
+                                   .unfold(2, self.context_size, self.stride)
         
-        # 2. LogSNR Pooling & Encoding
-        # [1, H, W] -> AvgPool -> [1, GH, GW]
-        # We need 4D input for avg_pool2d usually, or 3D works? 
-        # F.avg_pool2d supports [C, H, W] or [B, C, H, W].
-        logsnr_pooled = F.avg_pool2d(logsnr_map, kernel_size=P, stride=P)
+        # Average pool each patch's logsnr (or could use center pixel)
+        # [1, GH, GW, K, K] -> [GH*GW, 1]
+        patches_logsnr = patches_logsnr.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1).mean(dim=-1, keepdim=True)
         
-        # Flatten: [1, GH, GW] -> [GH*GW, 1]
-        logsnr_flat = logsnr_pooled.view(1, GH * GW).permute(1, 0)
+        # 4. Encode logsnr with Fourier features
+        # [GH*GW, 1] -> [GH*GW, fourier_dim]
+        logsnr_features = self.fourier_enc(patches_logsnr)
         
-        # Fourier: [GH*GW, F]
-        logsnr_emb = self.fourier_enc(logsnr_flat)
+        # 5. Concatenate: Image patch + Noise level features
+        # Think: "RGB patch + noise channel"
+        raw_input = torch.cat([patches_img, logsnr_features], dim=-1)
         
-        # 3. Concatenate
-        raw_input = torch.cat([patches, logsnr_emb], dim=-1)
-        
-        # 4. Embed
+        # 6. Project & process
         h = self.input_proj(raw_input)
         z = self.res_blocks(h)
         
@@ -940,7 +936,7 @@ class LDTformerAttentionZC(nn.Module):
         return self.proj(out)
 
 class LDTformerBlockKVC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False, num_experts=8, num_active=3,):
         super().__init__()
         self.is_global = is_global
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
@@ -949,7 +945,7 @@ class LDTformerBlockKVC(nn.Module):
         
         # Using SigmoidMoE for FFN
         hidden_dim = int(dim * mlp_ratio)
-        self.moe = SigmoidMoE(dim, hidden_dim, num_experts=8, num_active=3, ) # Defaults: 8 experts, 3 active
+        self.moe = SigmoidMoE(dim, hidden_dim, num_experts=num_experts, num_active=num_active, ) # Defaults: 8 experts, 3 active
         self.gate_proj = nn.Linear(dim, dim)
         # Initialize immediately
         self.param_init()
@@ -975,7 +971,7 @@ class LDTformerBlockKVC(nn.Module):
         return x, aux_loss
 
 class LDTformerBlockZC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False, num_experts=8, num_active=3):
         super().__init__()
         self.is_global = is_global
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
@@ -984,7 +980,7 @@ class LDTformerBlockZC(nn.Module):
         
         # Using SigmoidMoE for FFN
         hidden_dim = int(dim * mlp_ratio)
-        self.moe = SigmoidMoE(dim, hidden_dim, num_experts=8, num_active=3, ) # Defaults: 8 experts, 3 active
+        self.moe = SigmoidMoE(dim, hidden_dim, num_experts=num_experts, num_active=num_active, ) # Defaults: 8 experts, 3 active
         self.gate_proj = nn.Linear(dim, dim)
         # Initialize immediately
         self.param_init()
@@ -1012,7 +1008,7 @@ class LDTformerBlockZC(nn.Module):
 # ===== INSIDE MODEL: Metadata-Agnostic =====
 
 class coolerLDTformerKVC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1021,12 +1017,14 @@ class coolerLDTformerKVC(nn.Module):
         self.patch_embedder = ContextualPatchEmbedder(
             input_channels=3,
             embed_dim=dim,
-            patch_size=2
+            context_size= 4,  # ← Add this back!
+            stride= 2,         # ← Add this back!
+            mlp_depth= 1
         )
         
         # Transformer trunk
         self.layers = nn.ModuleList([
-            LDTformerBlockKVC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0)) for i in range(depth)
+            LDTformerBlockKVC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0), num_experts=num_experts, num_active=num_active) for i in range(depth) 
         ])
         
         # Output heads (used by SpanUnembedder)
@@ -1101,7 +1099,7 @@ class coolerLDTformerKVC(nn.Module):
 
 
 class coolerLDTformerZC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1110,12 +1108,14 @@ class coolerLDTformerZC(nn.Module):
         self.patch_embedder = ContextualPatchEmbedder(
             input_channels=3,
             embed_dim=dim,
-            patch_size=2
+            context_size= 4,  # ← Add this back!
+            stride= 2,         # ← Add this back!
+            mlp_depth= 1
         )
         
         # Transformer trunk
         self.layers = nn.ModuleList([
-            LDTformerBlockZC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0)) for i in range(depth)
+            LDTformerBlockZC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0), num_experts=num_experts, num_active=num_active) for i in range(depth) 
         ])
         
         # Output heads (used by SpanUnembedder)
