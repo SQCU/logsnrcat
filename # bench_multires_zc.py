@@ -1,4 +1,4 @@
-# bench_multires_cl_p.py
+# bench_multires_cl_zc.py
 import os
 import sys
 import math
@@ -92,6 +92,110 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     # 4. Cleanup (No-op for ZC/Cacheless)
     return v_final, aux_loss, lambda: None
 
+
+def run_forward_step_kvc(
+    components, 
+    z, 
+    logsnr, 
+    base_spans,
+    suppress_logsnr_input: bool = False
+):
+    """
+    Returns:
+        z_out: [L_total, D]
+        aux_loss: Scalar
+        span_objects: List[Span]
+        req_ids: List[int] - Allocated request IDs (caller must free!)
+    """
+    model, span_embedder, _, kvt_manager, page_table = components
+    B, C, H, W = z.shape
+    device = z.device
+    num_layers = len(model.layers)
+    
+    # 1. Prepare Metadata & Inputs
+    batch_spans_meta = []
+    images = [z[i] for i in range(B)]
+    
+    if suppress_logsnr_input:
+        zero_map = torch.zeros((1, H, W), device=device)
+        logsnr_maps = [zero_map] * B
+    else:
+        # ✅ FIX: Handle both scalar and spatial logsnr
+        if logsnr.dim() == 1:  # Scalar per sample: [B]
+            # Broadcast to spatial map: [B] -> [B, 1, H, W]
+            logsnr_spatial = logsnr.view(B, 1, 1, 1).expand(B, 1, H, W)
+            logsnr_maps = [logsnr_spatial[i] for i in range(B)]
+        elif logsnr.dim() == 4:  # Already spatial: [B, 1, H, W]
+            logsnr_maps = [logsnr[i] for i in range(B)]
+        else:
+            raise ValueError(f"Invalid logsnr shape: {logsnr.shape}")
+
+    for i in range(B):
+        item_spans = [s.copy() for s in base_spans]
+        for s in item_spans: s['id'] = f"req_{i}" 
+        batch_spans_meta.extend(item_spans)
+
+    # 2. Embed
+    z_flat, span_objects, content_hashes = span_embedder.embed(
+        batch_spans_meta,
+        text_tokens=[None] * B,
+        images=images,
+        logsnr_maps=logsnr_maps
+    )
+    
+    # 3. Render Topology
+    from ld_tformer_embedding_functional import render_topology_embeddings
+    topo_embeds, _ = render_topology_embeddings(batch_spans_meta, 3, device)
+    
+    # 4. Allocate KV Cache
+    req_ids = list(range(B))
+    tokens_per_req = sum(s['len'] for s in base_spans)
+    
+    cursor = 0
+    for rid in req_ids:
+        chunk_hashes = content_hashes[cursor : cursor + tokens_per_req]
+        chunk_topo = topo_embeds[cursor : cursor + tokens_per_req]
+        kvt_manager.allocate_and_write_sequence(rid, chunk_hashes, chunk_topo)
+        cursor += tokens_per_req
+
+    # 5. Get Physical Mappings
+    flat_page_table, inverse_page_table = kvt_manager.get_flat_page_mapping(req_ids)
+    
+    # 6. Get Slot Mapping
+    block_tables = [kvt_manager.req_tables[rid] for rid in req_ids]
+    seq_lengths = [kvt_manager.req_lengths[rid] for rid in req_ids]
+    slot_mapping = kvt_manager.get_slot_mapping(block_tables, seq_lengths)
+
+    # 7. Build Physical Mask
+    block_mask = build_composed_mask(
+        span_objects,
+        topo_active=topo_embeds,
+        topo_heap=kvt_manager.get_topo_view(),
+        page_table=page_table,
+        flat_page_table=flat_page_table,
+        inverse_page_table=inverse_page_table,
+    )
+    
+    # 8. Forward Pass
+    # CHANGED: Retrieve flattened views [1, H, Capacity, D] from manager
+    k_views = []
+    v_views = []
+    for i in range(num_layers):
+        k, v = kvt_manager.get_flat_kv_view(i)
+        k_views.append(k)
+        v_views.append(v)
+
+    z_out, aux_loss = model(
+        z_flat.unsqueeze(0),
+        topo_embeds.unsqueeze(0),
+        k_caches=k_views,
+        v_caches=v_views,
+        slot_mapping=slot_mapping,
+        block_mask=block_mask
+    )
+    
+    return z_out.squeeze(0), aux_loss, span_objects, req_ids
+
 def run_forward_step(
     components, 
     z, 
@@ -100,12 +204,16 @@ def run_forward_step(
     suppress_logsnr_input: bool = False
 ):
     """
-    Zero-Cache Forward Step:
-    1. Embeds Spans -> Flat Tensor
-    2. Generates Identity Topology
-    3. Runs Model
+    Zero-Cache Forward Step (ZC Mode).
+    
+    CRITICAL CHANGE: This generates a mask for the EPHEMERAL batch tensor,
+    not the persistent KVT heap.
+    
+    1. Embeds Spans -> Flat Tensor (Contiguous)
+    2. Generates Identity Topology (Logical Block i -> Physical Block i)
+    3. Runs Model with mask sized to L_active, not Capacity.
     """
-    model, span_embedder, _, _, page_table = components
+    model, span_embedder, _, kvt_manager, page_table = components
     B, C, H, W = z.shape
     device = z.device
     
@@ -117,10 +225,10 @@ def run_forward_step(
         zero_map = torch.zeros((1, H, W), device=device)
         logsnr_maps = [zero_map] * B
     else:
-        if logsnr.dim() == 1:  # Scalar per sample: [B]
+        if logsnr.dim() == 1:
             logsnr_spatial = logsnr.view(B, 1, 1, 1).expand(B, 1, H, W)
             logsnr_maps = [logsnr_spatial[i] for i in range(B)]
-        elif logsnr.dim() == 4:  # Already spatial
+        elif logsnr.dim() == 4:
             logsnr_maps = [logsnr[i] for i in range(B)]
         else:
             raise ValueError(f"Invalid logsnr shape: {logsnr.shape}")
@@ -143,7 +251,7 @@ def run_forward_step(
     topo_embeds, _ = render_topology_embeddings(batch_spans_meta, 3, device)
     
     # 4. Identity Mapping (The "Virtual" Page Table)
-    # Because z_flat is contiguous, Logical Block i maps to Physical Block i.
+    # The tensor is contiguous. Logical Block i is Physical Block i.
     L_total = z_flat.shape[0]
     block_size = page_table.block_size
     num_blocks = (L_total + block_size - 1) // block_size
@@ -152,25 +260,28 @@ def run_forward_step(
     flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
     
     # 5. Build Mask
-    # Note: topo_heap is just topo_embeds because Heap == Active in ZC mode
+    # CRITICAL FIX: Use topo_embeds as topo_heap. 
+    # In ZC mode, the "Heap" is exactly the "Active Batch".
+    # This ensures Q_LEN == KV_LEN == L_total, matching flex_attention inputs.
     block_mask = build_composed_mask(
         span_objects,
         topo_active=topo_embeds,
-        topo_heap=topo_embeds,
+        topo_heap=topo_embeds,      # <--- FIX: Heap == Active
         page_table=page_table,      # Used for block_size param
         flat_page_table=flat_page_table,
         inverse_page_table=None     # Not needed for ZC
     )
     
-    # 6. Forward Pass (No K/V Caches needed)
-    # Unsqueeze to [1, L, D] because model expects flattened batch dim
+    # 6. Forward Pass
+    # coolerLDTformerZC expects flattened inputs [1, L, D]
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
-        slot_mapping=None,  # ZC ignores this
+        slot_mapping=None,          # ZC ignores this
         block_mask=block_mask
     )
     
+    # No request IDs to cleanup in ZC mode
     return z_out.squeeze(0), aux_loss, span_objects, []
 
 def logsnr_to_alpha_sigma(logsnr):

@@ -1,33 +1,35 @@
-# bench_multires_cl_p.py
+# bench_multires_cl_zc.py
 import os
+import sys
+import math
+from pathlib import Path
+from typing import List, Tuple, Dict, Any, Optional, Callable
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Any, Optional, Callable
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
-import sys
-from pathlib import Path
-from dataclasses import dataclass
 
 from diffusion_utils import get_schedule, get_alpha_sigma, BucketManager
 from dataset import CompositeIterator
-#from model import HybridGemmaDiT
 
-from ld_tformer import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, build_composed_mask
+# NOTE: Importing the ZC (Zero-Cache) variant for training
+from ld_tformer import coolerLDTformerZC as coolerLDTformer
+from ld_tformer import SpanEmbedder, SpanUnembedder, build_composed_mask
 from ld_tformer_embedding_functional import render_topology_embeddings
 from memory_manager import KVTManager, PageTable
 from kv_cache_allocator import allocate_kv_cache_safely
+# KVTManager and Allocator are no longer needed for ZC training
 
 # Hook the ZMQ compiler backend immediately if available
 try:
     import inductor_cas_client
     inductor_cas_client.install_cas_client()
 except ImportError:
-    print("we tried to import inductor_cas_client but mom won't let us")
     pass
 
 class ExperimentLogger:
@@ -56,20 +58,20 @@ class ExperimentLogger:
         self.figure_count += 1
         return filepath
 
-### wowie this is where we put diffusion helpers!!!!
+### Diffusion Helpers
 
 def predict_velocity_field(components, z, logsnr, spans, mode):
     """
     Returns:
         v_final: [B, C, H, W] - Velocity field
         aux_loss: Scalar
-        context: CacheContext - Must be kept alive until after backward()
+        cleanup: Callable - No-op for ZC mode
     """
-    model, _, span_unemb, kvt_manager, _ = components
+    model, _, span_unemb, _, _ = components
     
-    # 1. Forward Pass (DO NOT FREE)
+    # 1. Forward Pass
     suppress = (mode == 'naive')
-    z_flat, aux_loss, objs, req_ids = run_forward_step(
+    z_flat, aux_loss, objs, _ = run_forward_step(
         components, z, logsnr, spans, 
         suppress_logsnr_input=suppress
     )
@@ -87,12 +89,9 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     else:
         v_final = v_raw
     
-        # 4. Create cleanup callback
-    def cleanup():
-        for rid in req_ids:
-            kvt_manager.free_request(rid)
-    
-    return v_final, aux_loss, cleanup
+    # 4. Cleanup (No-op for ZC/Cacheless)
+    return v_final, aux_loss, lambda: None
+
 
 def run_forward_step_kvc(
     components, 
@@ -285,280 +284,116 @@ def run_forward_step(
     # No request IDs to cleanup in ZC mode
     return z_out.squeeze(0), aux_loss, span_objects, []
 
-
 def logsnr_to_alpha_sigma(logsnr):
-    """Convert log(SNR) to (alpha, sigma) for noise schedule."""
-    # logsnr = log(alpha^2 / sigma^2)
-    # SNR = alpha^2 / sigma^2
     snr = torch.exp(logsnr)
-    # alpha^2 = SNR / (1 + SNR), sigma^2 = 1 / (1 + SNR)
     alpha_sq = snr / (1.0 + snr)
     sigma_sq = 1.0 / (1.0 + snr)
     return torch.sqrt(alpha_sq), torch.sqrt(sigma_sq)
 
 def sample_logsnr_triplet(batch_size, device, min_logsnr=-10.0, max_logsnr=0.0, min_gap=1.0):
-    """
-    Sample three noise levels at least min_gap apart.
-    Returns: (logsnr_low, logsnr_mid, logsnr_high) where low > mid > high
-    """
-    # Sample lowest (least noisy, highest logsnr)
     logsnr_low = torch.rand(batch_size, device=device) * (max_logsnr - min_logsnr) + min_logsnr
-    
-    # Sample mid: 1-4 logsnr units below low
     gap_mid = torch.rand(batch_size, device=device) * 3.0 + min_gap
     logsnr_mid = (logsnr_low - gap_mid).clamp(min=min_logsnr)
-    
-    # Sample high: 1-4 logsnr units below mid
     gap_high = torch.rand(batch_size, device=device) * 3.0 + min_gap
     logsnr_high = (logsnr_mid - gap_high).clamp(min=min_logsnr)
-    
     return logsnr_low, logsnr_mid, logsnr_high
 
 def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
-    """
-    Take one deterministic reverse diffusion step using v-prediction.
-    
-    Args:
-        z_t: Current noisy latent [B, C, H, W]
-        v_pred: Model's v-prediction [B, C, H, W]
-        logsnr_from: Current log(SNR) [B]
-        logsnr_to: Target log(SNR) [B]
-    
-    Returns:
-        z_to: Denoised latent at target noise level [B, C, H, W]
-    """
     alpha_from, sigma_from = logsnr_to_alpha_sigma(logsnr_from)
     alpha_to, sigma_to = logsnr_to_alpha_sigma(logsnr_to)
-    
-    # v-prediction: v = alpha * eps - sigma * x0
-    # Solve for x0: x0 = (alpha * z_t - sigma * v) / (alpha^2 + sigma^2)
-    # But alpha^2 + sigma^2 = 1, so:
     x0_pred = alpha_from.view(-1,1,1,1) * z_t - sigma_from.view(-1,1,1,1) * v_pred
-    
-    # eps prediction: eps = (sigma * z_t + alpha * v) / (alpha^2 + sigma^2) = sigma * z_t + alpha * v
     eps_pred = sigma_from.view(-1,1,1,1) * z_t + alpha_from.view(-1,1,1,1) * v_pred
-    
-    # DDIM step (deterministic): z_to = alpha_to * x0_pred + sigma_to * eps_pred
     z_to = alpha_to.view(-1,1,1,1) * x0_pred + sigma_to.view(-1,1,1,1) * eps_pred
-    
     return z_to
 
-### metadata helpers!!!
-
-@dataclass
-class CacheContext:
-    """
-    Tracks allocated requests that must stay alive during backward pass.
-    """
-    req_ids: List[int]
-    cleanup_fn: Callable[[], None]
-
 def get_image_spans(resolution):
-    """
-    Helper to generate span metadata for a single 2D continuous latent (image).
-    """
-    # PATCH FIX: Adjust for model stride
     latent_res = resolution // 2
     length = latent_res * latent_res
-    # Standard format: 1 span, not causal (bidirectional), with 2D shape
-    # e.g. 72px^2 image of 12x6px-> 6x3 flat embedding of len 18.
-    # [{'len': 18, 'shape': (6, 3), 'causal': False}]
-    # e.g. 3 separate 480px^2 images of 20x24px, 16x30px, 30x16px
-    # -> 10x12, 8x15, 15x8 embeddings of len 120, 120, 120.
-    # [{'len': 120, 'shape': (10, 12), 'causal': False},
-    #{'len': 120, 'shape': (8, 15), 'causal': False},
-    #{'len': 120, 'shape': (15, 8), 'causal': False}]
     return [{'type': 'latent', 'len': length, 'shape': (latent_res, latent_res), 'causal': False}]
 
-### plotting and historiography helpers!!
-
-def visualize_dataset_samples(iterator, resolutions, samples_per_res=8):
-    """
-    Generate samples from the composite iterator and label them.
-    """
-    fig, axes = plt.subplots(len(resolutions), samples_per_res, 
-                            figsize=(samples_per_res * 1.5, len(resolutions) * 1.8))
-    
-    # Handle single resolution case (axes is 1D)
-    if len(resolutions) == 1: 
-        axes = axes.reshape(1, -1)
-    
-    for row_idx, res in enumerate(resolutions):
-        # Generate batch
-        samples = iterator.generate_batch(samples_per_res, res, num_tiles=4.0)
-        labels = iterator.last_labels.cpu().numpy()
-        samples = samples.cpu()
-        
-        for col_idx in range(samples_per_res):
-            ax = axes[row_idx, col_idx]
-            ax.imshow(samples[col_idx].permute(1, 2, 0).clamp(0, 1))
-            ax.axis('off')
-            
-            # Get label name
-            lbl_idx = labels[col_idx]
-            lbl_name = iterator.label_map.get(lbl_idx, "Unknown")
-            
-            if col_idx == 0:
-                ax.set_title(f"{res}px\n{lbl_name}", fontsize=8, loc='left')
-            else:
-                ax.set_title(f"{lbl_name}", fontsize=7)
-                
-    plt.suptitle("Composite Dataset Samples", fontsize=14)
-    plt.tight_layout()
-    return fig
+### Plotting Helpers
 
 def plot_detailed_loss(df_naive, df_fact, logger):
-    """
-    Generates a grid dynamically based on resolutions found in history.
-    Rows: Resolution
-    Cols: Dataset Type
-    """
     df_naive = df_naive.interpolate()
     df_fact = df_fact.interpolate()
-    
     resolutions = sorted(df_naive['res'].unique())
     datasets = ['checkerboard', 'torus']
     
     fig, axes = plt.subplots(len(resolutions), len(datasets), 
                             figsize=(12, 4 * len(resolutions)))
-    
-    # Handle single resolution case (axes is 1D)
-    if len(resolutions) == 1: 
-        axes = axes.reshape(1, -1)
+    if len(resolutions) == 1: axes = axes.reshape(1, -1)
         
     for r_idx, res in enumerate(resolutions):
         n_res = df_naive[df_naive['res'] == res]
         f_res = df_fact[df_fact['res'] == res]
-        
         for d_idx, dtype in enumerate(datasets):
             ax = axes[r_idx, d_idx]
             col_name = f'loss_{dtype}'
-            
-            roll_win = 20
-            
             if col_name in n_res.columns:
-                line_n = n_res[col_name].rolling(roll_win).mean()
-                ax.plot(n_res['step'], line_n, label='Naive', color='tab:blue', alpha=0.8)
-                
+                ax.plot(n_res['step'], n_res[col_name].rolling(20).mean(), label='Naive')
             if col_name in f_res.columns:
-                line_f = f_res[col_name].rolling(roll_win).mean()
-                ax.plot(f_res['step'], line_f, label='Factorized', color='tab:orange', alpha=0.8)
-            
+                ax.plot(f_res['step'], f_res[col_name].rolling(20).mean(), label='Factorized')
             ax.set_title(f"{dtype.capitalize()} @ {res}px")
             ax.set_yscale('log')
-            ax.grid(True, which='both', alpha=0.2)
-            if r_idx == 0 and d_idx == 0:
-                ax.legend()
-    
+            if r_idx == 0 and d_idx == 0: ax.legend()
     plt.tight_layout()
     logger.save_figure(fig, "loss_breakdown_res_vs_type")
 
 def plot_sample_grid(samples_list, logger, string="final_samples"):
-    """
-    Dynamically plots a list of sample batches.
-    Args:
-        samples_list: List of tuples (Title, TensorBatch)
-    """
-    num_rows = len(samples_list)
-    cols = 8 # Fixed sample count per batch
-    
+    num_rows = len(samples_list); cols = 8
     fig, axes = plt.subplots(num_rows, cols, figsize=(cols * 2, num_rows * 2))
-    
-    # Handle single row case
-    if num_rows == 1:
-        axes = axes.reshape(1, -1)
+    if num_rows == 1: axes = axes.reshape(1, -1)
     
     for r, (name, batch) in enumerate(samples_list):
         for c in range(cols):
             if c < batch.shape[0]:
                 axes[r, c].imshow(batch[c].permute(1,2,0).cpu().numpy())
             axes[r, c].axis('off')
-            if c == 0: 
-                axes[r, c].set_title(name, fontsize=10, loc='left')
-            
-    plt.suptitle("Unconditional Generation (Mixed Distribution)", fontsize=16)
+            if c == 0: axes[r, c].set_title(name, fontsize=10, loc='left')
     plt.tight_layout()
     logger.save_figure(fig, string)
 
 def plot_distillation_loss(df_naive, df_fact, logger):
-    """Plot consistency loss curves."""
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    
-    # Consistency loss
     ax = axes[0]
-    ax.plot(df_naive['step'], df_naive['loss_consistency'].rolling(20).mean(), 
-            label='Naive', color='tab:blue')
-    ax.plot(df_fact['step'], df_fact['loss_consistency'].rolling(20).mean(), 
-            label='Factorized', color='tab:orange')
-    ax.set_title("Trajectory Consistency Loss")
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Loss")
-    ax.set_yscale('log')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.plot(df_naive['step'], df_naive['loss_consistency'].rolling(20).mean(), label='Naive')
+    ax.plot(df_fact['step'], df_fact['loss_consistency'].rolling(20).mean(), label='Factorized')
+    ax.set_title("Trajectory Consistency Loss"); ax.set_yscale('log'); ax.legend()
     
-    # Denoising loss (for reference)
     ax = axes[1]
-    ax.plot(df_naive['step'], df_naive['loss_denoise'].rolling(20).mean(), 
-            label='Naive', color='tab:blue', alpha=0.7)
-    ax.plot(df_fact['step'], df_fact['loss_denoise'].rolling(20).mean(), 
-            label='Factorized', color='tab:orange', alpha=0.7)
-    ax.set_title("Denoising Loss (Auxiliary)")
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Loss")
-    ax.set_yscale('log')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
+    ax.plot(df_naive['step'], df_naive['loss_denoise'].rolling(20).mean(), label='Naive')
+    ax.plot(df_fact['step'], df_fact['loss_denoise'].rolling(20).mean(), label='Factorized')
+    ax.set_title("Denoising Loss (Auxiliary)"); ax.set_yscale('log'); ax.legend()
     plt.tight_layout()
     logger.save_figure(fig, "distillation_loss")
 
 def plot_comparison_grid(samples_before, samples_after, resolutions):
-    """
-    Create a before/after comparison grid.
-    
-    Layout:
-    - Rows: [Naive 16px Before, Naive 16px After, Fact 16px Before, Fact 16px After, ...]
-    - Cols: 8 samples
-    """
-    num_rows = len(samples_before) + len(samples_after)  # Interleaved
+    num_rows = len(samples_before) + len(samples_after)
     cols = 8
-    
     fig, axes = plt.subplots(num_rows, cols, figsize=(cols * 2, num_rows * 1.5))
-    
     row_idx = 0
     for i, (name_before, batch_before) in enumerate(samples_before):
         name_after, batch_after = samples_after[i]
-        
-        # Plot "Before" row
         for c in range(cols):
             if c < batch_before.shape[0]:
                 axes[row_idx, c].imshow(batch_before[c].permute(1,2,0).cpu().numpy())
             axes[row_idx, c].axis('off')
-            if c == 0:
-                axes[row_idx, c].set_title(f"{name_before}\n(Before)", 
-                                          fontsize=9, loc='left')
+            if c == 0: axes[row_idx, c].set_title(f"{name_before}\n(Before)", fontsize=9, loc='left')
         row_idx += 1
-        
-        # Plot "After" row
         for c in range(cols):
             if c < batch_after.shape[0]:
                 axes[row_idx, c].imshow(batch_after[c].permute(1,2,0).cpu().numpy())
             axes[row_idx, c].axis('off')
-            if c == 0:
-                axes[row_idx, c].set_title(f"{name_after}\n(After)", 
-                                          fontsize=9, loc='left', color='green')
+            if c == 0: axes[row_idx, c].set_title(f"{name_after}\n(After)", fontsize=9, loc='left', color='green')
         row_idx += 1
-    
-    plt.suptitle("Trajectory Consistency Distillation: Before vs After", fontsize=16)
     plt.tight_layout()
     return fig
 
-### crunchy stuff!!!
+### Sampling & Training
 
 @torch.no_grad()
 def sample_viz(components, res, num_samples=8, mode='naive'):
-    model, span_emb, span_unemb, kvt, pt = components
+    model, span_emb, span_unemb, _, _ = components
     model.eval()
     
     z = torch.randn(num_samples, 3, res, res, device='cuda')
@@ -568,16 +403,8 @@ def sample_viz(components, res, num_samples=8, mode='naive'):
     for i in range(49):
         t = ts[i]; t_n = ts[i+1]
         logsnr = get_schedule(torch.full((num_samples,), t, device='cuda'))
+        v_pred, _, _ = predict_velocity_field(components, z, logsnr, base_spans, mode)
         
-        # Use predict_velocity_field (handles both modes)
-        v_pred, aux_loss, cleanup_fn = predict_velocity_field(
-            components, z, logsnr, base_spans, mode
-        )
-        
-        # Cleanup immediately (no gradients needed)
-        cleanup_fn()
-        
-        # Euler step
         logsnr_n = get_schedule(torch.full((num_samples,), t_n, device='cuda'))
         alpha, sigma = get_alpha_sigma(logsnr)
         alpha_n, sigma_n = get_alpha_sigma(logsnr_n)
@@ -589,125 +416,48 @@ def sample_viz(components, res, num_samples=8, mode='naive'):
     model.train()
     return z.cpu().clamp(0, 1)
 
-def warmup_model(model, buckets):
-    print("🔥 Warming up compilation cache...")
-    # 1. Warmup Training Graph
-    model.train()
-    for res, bs in buckets:
-        print(f"   ...compiling train graph for {res}px")
-        # Create dummy inputs
-        z = torch.randn(bs, 3, res, res, device='cuda')
-        t = torch.rand(bs, device='cuda')
-        logsnr = get_schedule(t)
-        spans = get_image_spans(res)
-        
-        # Run one step (Forward + Backward)
-        opt = torch.optim.AdamW(model.parameters())
-        opt.zero_grad()
-        out, _, _ = model(z, logsnr, spans)
-        loss = out.mean()
-        loss.backward()
-        opt.step()
-        opt.zero_grad() # cleanup
-
-    # 2. Warmup Inference Graph
-    model.eval()
-    with torch.no_grad():
-        for res, _ in buckets: # BS doesn't strictly matter for shape generalization usually
-            print(f"   ...compiling inference graph for {res}px")
-            z = torch.randn(2, 3, res, res, device='cuda') # Small batch
-            logsnr = get_schedule(torch.rand(2, device='cuda'))
-            spans = get_image_spans(res)
-            model(z, logsnr, spans)
-    model.train()
-    print("✅ Warmup complete. No more stalls expected.")
-
 def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsnr=-5.0, max_logsnr=5.0):
-    """
-    Consolidated Consistency Loss with proper cache lifecycle management.
-    
-    Returns:
-        loss: Total loss tensor
-        aux_loss: Auxiliary loss (MoE balancing, etc)
-        cleanup_fn: Callable that must be called AFTER backward()
-    """
     B = x0.shape[0]
     device = x0.device
-
-    # Track all cleanup functions
-    cleanup_fns = []
-
-    # 1. Sample noise levels
     l_start, l_mid, l_end = sample_logsnr_triplet(B, device, min_logsnr, max_logsnr)
-    
-    # 2. Create noisy starting state
     a_start, s_start = logsnr_to_alpha_sigma(l_start)
     z_start = x0 * a_start.view(-1,1,1,1) + torch.randn_like(x0) * s_start.view(-1,1,1,1)
     
-    # === A. 1-STEP TRAJECTORY (Teacher): start → end ===
-    v_start, aux1, cleanup1 = predict_velocity_field(
-        components, z_start, l_start, spans, mode
-    )
-    cleanup_fns.append(cleanup1)
-    
+    # 1. Teacher (Start -> End)
+    v_start, aux1, _ = predict_velocity_field(components, z_start, l_start, spans, mode)
     with torch.no_grad():
         z_end_teacher = euler_reverse_step(z_start, v_start, l_start, l_end)
     
-    # === B. 2-STEP TRAJECTORY (Student): start → mid → end ===
-    # Step 1: start → mid (uses same v_start)
+    # 2. Student (Start -> Mid -> End)
     z_mid_student = euler_reverse_step(z_start, v_start, l_start, l_mid)
-    
-    # Step 2: mid → end (this is where gradients flow)
-    v_mid, aux2, cleanup2 = predict_velocity_field(
-        components, z_mid_student, l_mid, spans, mode
-    )
-    cleanup_fns.append(cleanup2)
-    
+    v_mid, aux2, _ = predict_velocity_field(components, z_mid_student, l_mid, spans, mode)
     z_end_student = euler_reverse_step(z_mid_student, v_mid, l_mid, l_end)
     
-    # === C. CONSISTENCY LOSS ===
     loss = F.mse_loss(z_end_student, z_end_teacher.detach())
-    
-    # Create unified cleanup
-    def cleanup_all():
-        for fn in cleanup_fns:
-            fn()
-    
-    return loss, aux1 + aux2, cleanup_all
-
+    return loss, aux1 + aux2, lambda: None
 
 def distill_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Distilling: {mode.upper()} ---")
     model = components[0]
     opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-    
-    # Halve batch size for memory safety (student + teacher forwards)
+    # Scaled down buckets for distillation memory
     buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
     
     iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
     manager = BucketManager(buckets_distill)
     history = []
-    #disable cast for now
-    #scaler = torch.amp.GradScaler('cuda')
     
     pbar = tqdm(range(steps), desc=f"distill-{mode}")
     for i in pbar:
         opt.zero_grad()
         res, bs = manager.next_bucket()
-        
         x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
         spans = get_image_spans(res)
         
-        #disable cast for now
-        #with torch.amp.autocast('cuda'):
         # 1. Consistency Loss
-
-        loss_c, aux_loss_con, cleanup_fn_con = compute_consistency_loss(
-            components, x0, spans, mode=mode,
-            min_logsnr=-4.0, max_logsnr=4.0
-        )
+        loss_c, aux_loss_con, _ = compute_consistency_loss(components, x0, spans, mode=mode)
         
-        # 2. Denoising Regularization (Prevent drift)
+        # 2. Denoising Reg
         t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
         l_den = get_schedule(t)
         a, s = logsnr_to_alpha_sigma(l_den)
@@ -715,30 +465,15 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         z_t = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
         v_t = a.view(-1,1,1,1)*eps - s.view(-1,1,1,1)*x0
         
-        v_pred, aux_loss, cleanup_fn_den = predict_velocity_field(components, z_t, l_den, spans, mode)
-        
+        v_pred, aux_loss, _ = predict_velocity_field(components, z_t, l_den, spans, mode)
         loss_d = F.mse_loss(v_pred, v_t)
-        loss_t = loss_c + 0.1 * loss_d + aux_loss+aux_loss_con
-            
-        # CRITICAL: Backward BEFORE cleanup
-        #scaler.scale(loss).backward()
-        #scaler.step(opt)
-        #scaler.update()
+        
+        loss_t = loss_c + 0.1 * loss_d + aux_loss + aux_loss_con
         loss_t.backward()
         opt.step()
         
-        # NOW it's safe to free cache blocks
-        cleanup_fn_con()
-        cleanup_fn_den()
-
-        # Logging
-        step_stats = {
-            'step': i, 
-            'res': res, 
-            'loss_consistency': loss_c.item(),
-            'loss_denoise': loss_d.item(),
-            'loss_total': loss_t.item()
-        }
+        step_stats = {'step': i, 'res': res, 'loss_consistency': loss_c.item(), 
+                      'loss_denoise': loss_d.item(), 'loss_total': loss_t.item()}
         history.append(step_stats)
         if i % 50 == 0:
             pbar.set_postfix({'cons': f'{loss_c.item():.4f}', 'den': f'{loss_d.item():.4f}'})
@@ -759,7 +494,6 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         opt.zero_grad()
         res, bs = manager.next_bucket()
         
-        # Data
         x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
         t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
         logsnr = get_schedule(t)
@@ -771,29 +505,20 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
 
         base_spans = get_image_spans(res)
         
-        # === Unified Prediction Call ===
-        v_pred, aux_loss, cleanup_fn = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
+        v_pred, aux_loss, _ = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
             
         loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
         total_loss = loss_elem.mean() + aux_loss
         
-        # Backward BEFORE cleanup
         total_loss.backward()
         opt.step()
 
-        # NOW free the cache
-        cleanup_fn()
-        
-        # CHANGED: Extract per-dataset loss for detailed plotting
         step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
-        
-        # Use last_labels from iterator to segregate loss
         if hasattr(iterator, 'last_labels') and hasattr(iterator, 'label_map'):
             labels = iterator.last_labels
             for lbl_idx, lbl_name in iterator.label_map.items():
                 mask = (labels == lbl_idx)
                 if mask.any():
-                    # Compute mean loss for this dataset type in this batch
                     step_stats[f'loss_{lbl_name}'] = loss_elem[mask].mean().item()
         
         history.append(step_stats)
@@ -813,12 +538,11 @@ if __name__ == "__main__":
     RESOLUTIONS = [16, 32, 64]
     
     
-    # 1. Singleton Stack
-    print("🔧 Initializing Singleton Model Stack...")
-    embed_dim = 256; depth = 4
+    print("🔧 Initializing ZC Model Stack...")
+    embed_dim = 256; depth = 4; num_heads=8; topo_dim = 3 
     
-    #prefixed ZC for your safety
-    model = coolerLDTformerZC(dim=embed_dim, depth=depth, num_heads=8, topo_dim=3).to(device)
+    # 1. Initialize ZC Model (Cacheless)
+    model = coolerLDTformer(dim=embed_dim, depth=depth, num_heads=num_heads, topo_dim=topo_dim).to(device)
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
     
@@ -837,16 +561,7 @@ if __name__ == "__main__":
         verbose=True
     )
 
-    kvt_manager = KVTManager(
-        max_blocks=max_blocks,
-        block_size=128,
-        kv_dim=embed_dim,
-        layers=depth,
-        heads=8,
-        topo_dim=3,
-        device=device
-    )
-
+    # 2. Dummy PageTable for constant retrieval (block_size)
     page_table = PageTable(
         num_blocks=max_blocks,
         block_size=128,
@@ -854,27 +569,30 @@ if __name__ == "__main__":
         max_logical_blocks=max_logical_blocks,
         device=device
     )
+
     print("🔥 Compiling Model (dynamic=True)...")
     model = torch.compile(model, dynamic=True)
-    components = (model, span_emb, span_unemb, kvt_manager, page_table)
+    
+    # Components now excludes KVTManager
+    components = (model, span_emb, span_unemb, None, page_table)
     
     # 2. Run A (Naive)
     print("🚀 Run A: Naive")
-    model.param_init() # Fresh Init
+    model.param_init()
     df_n = train_multires(components, 'naive', BUCKETS, STEPS, logger)
     params_naive = model.dump() 
     
     # 3. Run B (Factorized)
     print("🚀 Run B: Factorized")
-    model.flush() # Zero
-    model.param_init() # Re-Init
+    model.flush()
+    model.param_init()
     df_f = train_multires(components, 'factorized', BUCKETS, STEPS, logger)
     params_fact = model.dump()
     
     print("\n📈 Plotting training losses...")
     plot_detailed_loss(df_n, df_f, logger)
 
-    # 3. Sample BEFORE distillation
+    # 4. Sample BEFORE distillation
     print("\n🎨 Sampling (Before Distillation)...")
     samples_before = []
     for res in RESOLUTIONS:
@@ -889,9 +607,8 @@ if __name__ == "__main__":
     
     plot_sample_grid(samples_before, logger, "before_distillation")
     
-    # 4. Distillation phase
+    # 5. Distillation phase
     print("\n🔮 Phase 2: Distillation")
-    
     model.param_load(params_naive)
     df_n_dist = distill_multires(components, 'naive', BUCKETS, DISTILL_STEPS, logger)
     params_naive_dist = model.dump()
@@ -903,7 +620,7 @@ if __name__ == "__main__":
     print("\n📈 Plotting distillation losses...")
     plot_distillation_loss(df_n_dist, df_f_dist, logger)
 
-    # 5. Sample AFTER distillation
+    # 6. Sample AFTER distillation
     print("\n🎨 Sampling (After Distillation)...")
     samples_after = []
     for res in RESOLUTIONS:
@@ -917,13 +634,7 @@ if __name__ == "__main__":
         samples_after.append((f"Fact {res}px", s_f))
     
     plot_sample_grid(samples_after, logger, "after_distillation")
-    
-    # 6. Comparison plot
     fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
     logger.save_figure(fig_compare, "before_after_comparison")
-    
-    # 7. Plot all losses
-    plot_detailed_loss(df_n, df_f, logger)
-    plot_distillation_loss(df_n_dist, df_f_dist, logger)
     
     print(f"\n✅ Done. Check {logger.run_dir}")
