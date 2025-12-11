@@ -422,7 +422,7 @@ class ContextualPatchUnembedder(nn.Module):
         ])
         
         self.output_proj = nn.Sequential(
-            nn.LayerNorm(embed_dim), 
+            nn.LayerNorm(embed_dim, elementwise_affine=False), 
             nn.Linear(embed_dim, total_out_dim)
         )
         #i don't care if 256 is too big, having magic numbers is bad
@@ -1042,7 +1042,7 @@ class LDTformerBlockZC(nn.Module):
 # ===== INSIDE MODEL: Metadata-Agnostic =====
 
 class coolerLDTformerKVC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base: int = 500):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, mlp_depth=1, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base: int = 500):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1053,7 +1053,7 @@ class coolerLDTformerKVC(nn.Module):
             embed_dim=dim,
             context_size= 4,  # ← Add this back!
             stride= 2,         # ← Add this back!
-            mlp_depth= 1
+            mlp_depth=mlp_depth
         )
         
         # Transformer trunk
@@ -1066,10 +1066,11 @@ class coolerLDTformerKVC(nn.Module):
         self.patch_unembedder = ContextualPatchUnembedder(
             output_channels=3,
             embed_dim=dim,
-            patch_size=2
+            patch_size=2,
+            mlp_depth=mlp_depth
         )
         
-        self.final_norm = nn.LayerNorm(dim)
+        self.final_norm = nn.LayerNorm(dim, elementwise_affine=False)
         # Initialize everything
         self.param_init()
     
@@ -1134,7 +1135,7 @@ class coolerLDTformerKVC(nn.Module):
 
 
 class coolerLDTformerZC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base:int = 500):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, mlp_depth=1, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base:int = 500):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1145,7 +1146,7 @@ class coolerLDTformerZC(nn.Module):
             embed_dim=dim,
             context_size= 4,  # ← Add this back!
             stride= 2,         # ← Add this back!
-            mlp_depth= 1
+            mlp_depth=mlp_depth
         )
         
         # Transformer trunk
@@ -1158,10 +1159,11 @@ class coolerLDTformerZC(nn.Module):
         self.patch_unembedder = ContextualPatchUnembedder(
             output_channels=3,
             embed_dim=dim,
-            patch_size=2
+            patch_size=2,
+            mlp_depth=mlp_depth
         )
         
-        self.final_norm = nn.LayerNorm(dim)
+        self.final_norm = nn.LayerNorm(dim, elementwise_affine=False)
         # Initialize everything
         self.param_init()
     

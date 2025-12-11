@@ -63,8 +63,9 @@ class ExperimentLogger:
 
 ### Diffusion Helpers
 
-def get_schedule(t, schedule_bounds: tuple = (5,-1)):
+def get_schedule(t, schedule_bounds: tuple = (5,-4)):
     return schedule_bounds[0]-t*(schedule_bounds[1]-schedule_bounds[0])
+    # old default from old trainer:
     #return 20.0 - 40.0 * t
 
 def predict_velocity_field(components, z, logsnr, spans, mode):
@@ -77,21 +78,22 @@ def predict_velocity_field(components, z, logsnr, spans, mode):
     model, _, span_unemb, _, _ = components
     
     # 1. Forward Pass
-    suppress = (mode == 'naive')
-    z_flat, aux_loss, objs, _ = run_forward_step(
-        components, z, logsnr, spans, 
-        suppress_logsnr_input=suppress
-    )
-    
-    # 2. Unembed
-    decoded = span_unemb.decode(z_flat, objs)
-    
+    z_flat, span_objects, topo_embeds = run_embed_step(components, 
+    z, 
+    logsnr, 
+    spans)
+
+    v_flat, aux_loss, _ = run_forward_step(components, 
+    z_flat, span_objects, topo_embeds,
+    logsnr)
+    # 2. Unembed    
+    v_raw, pred_logsnr = run_unembed_step(z_flat, span_objects)
+
     # 3. Stack & Parse
-    v_raw = torch.stack([d['image_vpreds'] for d in decoded])
-    
+    #v_raw = torch.stack([d['image_vpreds'] for d in decoded])
     if mode == 'factorized':
-        l_maps = torch.stack([d['image_logsnrs'] for d in decoded])
-        sigma_p = torch.sqrt(torch.sigmoid(-l_maps))
+        #l_maps = torch.stack([d['image_logsnrs'] for d in decoded])
+        sigma_p = torch.sqrt(torch.sigmoid(-pred_logsnr))
         v_final = v_raw * sigma_p
     else:
         v_final = v_raw
@@ -127,17 +129,18 @@ def compute_nll_loss(v_pred_mean, v_pred_logvar, v_target):
 def predict_probabilistic_field(components, z, logsnr, spans):
     model, _, span_unemb, _, _ = components
     
-    # Run Forward
-    z_flat, aux_loss, objs, _ = run_forward_step(components, z, logsnr, spans)
-    decoded = span_unemb.decode(z_flat, objs)
-    
-    # Unpack Prediction
-    v_mean = torch.stack([d['image_vpreds'] for d in decoded])
-    
-    # Interpret the 'logsnr' head as the Model's Uncertainty regarding v
-    # High predicted LogSNR = Low Variance (Confident)
-    # Low predicted LogSNR = High Variance (Uncertain)
-    pred_logsnr = torch.stack([d['image_logsnrs'] for d in decoded])
+    # embed 
+    z_flat, span_objects, topo_embeds = run_embed_step(components, 
+    z, 
+    logsnr, 
+    spans)
+
+    # Run Forward  
+    v_flat, aux_loss, _ = run_forward_step(components, 
+    z_flat, span_objects, topo_embeds,
+    logsnr)
+    # unembed
+    v_mean, pred_logsnr = run_unembed_step(z_flat, span_objects)
     
     # Variance = 1 / SNR, so LogVar = -LogSNR
     # We allow the model to learn a shift/scale on this if needed
@@ -255,42 +258,31 @@ def run_forward_step_kvc(
     
     return z_out.squeeze(0), aux_loss, span_objects, req_ids
 
-def run_forward_step(
+def run_embed_step(
     components, 
     z, 
     logsnr, 
     base_spans,
     suppress_logsnr_input: bool = False
 ):
-    """
-    Zero-Cache Forward Step (ZC Mode).
-    
-    CRITICAL CHANGE: This generates a mask for the EPHEMERAL batch tensor,
-    not the persistent KVT heap.
-    
-    1. Embeds Spans -> Flat Tensor (Contiguous)
-    2. Generates Identity Topology (Logical Block i -> Physical Block i)
-    3. Runs Model with mask sized to L_active, not Capacity.
-    """
     model, span_embedder, _, kvt_manager, page_table = components
     B, C, H, W = z.shape
     device = z.device
-    
     # 1. Prepare Metadata & Inputs
     batch_spans_meta = []
     images = [z[i] for i in range(B)]
     
-    if suppress_logsnr_input:
-        zero_map = torch.zeros((1, H, W), device=device)
-        logsnr_maps = [zero_map] * B
+    #if suppress_logsnr_input:
+    #    zero_map = torch.zeros((1, H, W), device=device)
+    #    logsnr_maps = [zero_map] * B
+    #else:
+    if logsnr.dim() == 1:
+        logsnr_spatial = logsnr.view(B, 1, 1, 1).expand(B, 1, H, W)
+        logsnr_maps = [logsnr_spatial[i] for i in range(B)]
+    elif logsnr.dim() == 4:
+        logsnr_maps = [logsnr[i] for i in range(B)]
     else:
-        if logsnr.dim() == 1:
-            logsnr_spatial = logsnr.view(B, 1, 1, 1).expand(B, 1, H, W)
-            logsnr_maps = [logsnr_spatial[i] for i in range(B)]
-        elif logsnr.dim() == 4:
-            logsnr_maps = [logsnr[i] for i in range(B)]
-        else:
-            raise ValueError(f"Invalid logsnr shape: {logsnr.shape}")
+        raise ValueError(f"Invalid logsnr shape: {logsnr.shape}")
 
     for i in range(B):
         item_spans = [s.copy() for s in base_spans]
@@ -304,11 +296,41 @@ def run_forward_step(
         images=images,
         logsnr_maps=logsnr_maps
     )
-    
     # 3. Render Topology
     # topo_embeds: [Total_L, Topo_Dim]
     topo_embeds, _ = render_topology_embeddings(batch_spans_meta, 3, device)
+
+    return z_flat, span_objects, topo_embeds
+
+def run_unembed_step(v_flat, span_objs):
+    model, _, span_unemb, _, _ = components
+    decoded = span_unemb.decode(v_flat, span_objs)
+    # Unpack Prediction
+    pred_v = torch.stack([d['image_vpreds'] for d in decoded])
+    pred_logsnr = torch.stack([d['image_logsnrs'] for d in decoded])
+
+    return pred_v, pred_logsnr
+
+def run_forward_step(
+    components, 
+    z_flat, span_objects, topo_embeds, 
+    logsnr,
+    suppress_logsnr_input: bool = False
+):
+    """
+    Zero-Cache Forward Step (ZC Mode).
     
+    CRITICAL CHANGE: This generates a mask for the EPHEMERAL batch tensor,
+    not the persistent KVT heap.
+    
+    1. Embeds Spans -> Flat Tensor (Contiguous)
+    2. Generates Identity Topology (Logical Block i -> Physical Block i)
+    3. Runs Model with mask sized to L_active, not Capacity.
+    """
+    model, span_embedder, _, kvt_manager, page_table = components
+    B, C = z_flat.shape
+    device = z_flat.device
+   
     # 4. Identity Mapping (The "Virtual" Page Table)
     # The tensor is contiguous. Logical Block i is Physical Block i.
     L_total = z_flat.shape[0]
@@ -345,7 +367,7 @@ def run_forward_step(
     )
     
     # No request IDs to cleanup in ZC mode
-    return z_out.squeeze(0), aux_loss, span_objects, []
+    return z_out.squeeze(0), aux_loss, []
 
 def logsnr_to_alpha_sigma(logsnr):
     alpha = torch.sqrt(torch.sigmoid(logsnr))
@@ -375,7 +397,7 @@ def get_image_spans(resolution):
 
 ### Plotting Helpers
 
-def plot_detailed_loss(df_naive, df_fact, logger):
+def plot_detailed_loss(df_naive, df_fact, logger, strang="loss_breakdown_res_vs_type"):
     df_naive = df_naive.interpolate()
     df_fact = df_fact.interpolate()
     resolutions = sorted(df_naive['res'].unique())
@@ -399,7 +421,7 @@ def plot_detailed_loss(df_naive, df_fact, logger):
             ax.set_yscale('log')
             if r_idx == 0 and d_idx == 0: ax.legend()
     plt.tight_layout()
-    logger.save_figure(fig, "loss_breakdown_res_vs_type")
+    logger.save_figure(fig, strang)
 
 def plot_sample_grid(samples_list, logger, string="final_samples"):
     num_rows = len(samples_list); cols = 8
@@ -666,18 +688,23 @@ def plot_dset_reconstruction(result_dict, logger, name="reconstruction"):
     plt.tight_layout()
     logger.save_figure(fig, name)
 
-def compute_autoembed_loss(components, x0, min_logsnr=-10.0):
+def compute_autoembed_loss(components, x0, eps, very_middle_logsnr=0.0):
     """
     Tests: Can embedder→unembedder roundtrip clean images?
-    Uses minimum logsnr (cleanest state) as the noise annotation.
+    hell naw! we need to roundtrip a fixed point where the noised latent z_t ~= v_real
+    that's only true... for one very special logsnr value...
+    Uses middle logsnr (vpreddiest state) as the noise annotation.
     """
     model, span_emb, span_unemb, _, _ = components
     B = x0.shape[0]
     device = x0.device
     
-    # Annotate with "very clean" logsnr
-    logsnr_clean = torch.full((B,), min_logsnr, device=device)
-    logsnr_map = logsnr_clean.view(B, 1, 1, 1).expand_as(x0[:, :1])
+    # Annotate with "very middle" logsnr
+    # very_middle_logsnr where torch.sigmoid(logsnr) ~= torch.sigmoid(-logsnr)
+    logsnr_mid = torch.full((B,), very_middle_logsnr, device=device)
+    logsnr_map = logsnr_mid.view(B, 1, 1, 1).expand_as(x0[:, :1])
+    alpha, sigma = get_alpha_sigma(logsnr_mid)
+    v_quine = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
     
     base_spans = get_image_spans(x0.shape[-1])
     
@@ -693,26 +720,18 @@ def compute_autoembed_loss(components, x0, min_logsnr=-10.0):
     )
     
     # Unembed directly
-    decoded = span_unemb.decode(z_flat, span_objects)
-    x0_recon = torch.stack([d['image_vpreds'] for d in decoded])
+    v_stacked, _ = run_unembed_step(z_flat, span_objects)
     
     # MSE on image reconstruction
-    return F.mse_loss(x0_recon, x0)
+    return F.mse_loss(v_stacked, v_quine, reduction='none')
 
-def compute_unembed_loss(components, z_t, logsnr_true, base_spans):
+def compute_unembed_loss(components, z_flat, span_objects, logsnr_true):
     """
     Tests: Can the model predict the noise level of its input?
     This is implicit in diffusion - the model NEEDS to know how noisy z_t is.
     """
-    model, span_emb, span_unemb, _, _ = components
-    
-    # Full forward pass (includes transformer)
-    z_flat, _, objs, cleanup = run_forward_step(
-        components, z_t, logsnr_true, base_spans
-    )
-    
-    decoded = span_unemb.decode(z_flat, objs)
-    logsnr_pred = torch.stack([d['image_logsnrs'] for d in decoded])
+    model, _, span_unemb, _, _ = components
+    v_field, logsnr_pred = run_unembed_step(z_flat, span_objects)
     
     # Expand ground truth
     if logsnr_true.dim() == 1:
@@ -857,6 +876,61 @@ def distill_nll(components, mode, buckets, steps=1000, logger=None):
             
     return pd.DataFrame(history)
 
+# lets get dumb in here
+def train_autoembed(components, mode, buckets, steps=1000, logger=None):
+    print(f"\n--- Training: {mode.upper()} embeddahs ---")
+    model = components[0]
+    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+    scheduler_main = OneCycleLR(opt, max_lr=1e-4, total_steps=steps, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
+    
+    iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
+    manager = BucketManager(buckets)
+    history = []
+    
+    pbar = tqdm(range(steps), desc=f"{mode}")
+    for i in pbar:
+        opt.zero_grad()
+        res, bs = manager.next_bucket()
+        
+        x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
+        t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
+        logsnr = get_schedule(t)
+        alpha, sigma = get_alpha_sigma(logsnr)
+        
+        eps = torch.randn_like(x0)
+        z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
+        v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
+
+        base_spans = get_image_spans(res)
+
+        z_flat, span_objects, topo_embeds = run_embed_step(components, 
+        z_t, logsnr, base_spans)
+        #we have to do this funky two stage spatial reduction if we want to log inner features of a batch's loss.
+        #imagine if we'd been socialized into using wandb instead of writing python like this... damn...
+        loss_ae = compute_autoembed_loss(components, x0, eps).mean(dim=[1,2,3])
+        # regularization to try to make lsnr fields at least more representable...
+        loss_unembed = compute_unembed_loss(components, z_flat, span_objects, logsnr)
+        total_loss = loss_ae.mean()+0.001*loss_unembed
+                
+        total_loss.backward()
+        opt.step()
+        scheduler_main.step()
+
+        step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
+        if hasattr(iterator, 'last_labels') and hasattr(iterator, 'label_map'):
+            labels = iterator.last_labels
+            for lbl_idx, lbl_name in iterator.label_map.items():
+                mask = (labels == lbl_idx)
+                if mask.any():
+                    step_stats[f'loss_{lbl_name}'] = loss_ae[mask].mean().item()
+        
+        history.append(step_stats)
+        if i % 100 == 0:
+            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'lae':f'{loss_ae.mean().item()}', 'res': res})
+            
+    return pd.DataFrame(history)
+
 def train_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Training: {mode.upper()} ---")
     model = components[0]
@@ -883,13 +957,19 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
 
         base_spans = get_image_spans(res)
-        loss_ae = compute_autoembed_loss(components, x0)
+
+        z_flat, span_objects, topo_embeds = run_embed_step(components, 
+        z_t, logsnr, base_spans)
+        #with torch.no_grad():
+        #    loss_ae = compute_autoembed_loss(components, x0, eps).mean()
         
         v_pred, aux_loss, _ = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
-        loss_unembed = compute_unembed_loss(components, z_t, logsnr, base_spans)
+        # can't put this here, forces the single dense decoder layer to estimate lsnr from noisy latent
+        #loss_unembed = compute_unembed_loss(components, z_flat, span_objects, logsnr)
             
         loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
-        total_loss = loss_elem.mean() + aux_loss + loss_ae + loss_unembed
+        #total_loss = loss_elem.mean()*(1+0.1*loss_ae) + aux_loss #+ loss_unembed
+        total_loss = loss_elem.mean() + aux_loss
         
         total_loss.backward()
         opt.step()
@@ -905,7 +985,8 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         
         history.append(step_stats)
         if i % 100 == 0:
-            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'lae':f'{loss_ae}', 'res': res})
+            #pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'lae':f'{loss_ae}', 'res': res})
+            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'res': res})
             
     return pd.DataFrame(history)
 
@@ -989,7 +1070,7 @@ if __name__ == "__main__":
     embed_dim = 256; depth = 8; num_heads=8; topo_dim = 3 
     
     # 1. Initialize ZC Model (Cacheless)
-    model = coolerLDTformer(dim=embed_dim, depth=depth, num_heads=num_heads, topo_dim=topo_dim).to(device)
+    model = coolerLDTformer(dim=embed_dim, depth=depth, num_heads=num_heads, topo_dim=topo_dim, mlp_depth=2).to(device)
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
     
@@ -1026,6 +1107,7 @@ if __name__ == "__main__":
     # 2. Run A (Naive)
     print("🚀 Run A: Naive")
     model.param_init()
+    df_n_ae = train_autoembed(components, 'naive', BUCKETS, STEPS, logger)
     df_n = train_multires(components, 'naive', BUCKETS, STEPS, logger)
     params_naive = model.dump() 
     
@@ -1033,6 +1115,7 @@ if __name__ == "__main__":
     print("🚀 Run B: Factorized")
     model.flush()
     model.param_init()
+    df_f_ae = train_autoembed(components, 'factorized', BUCKETS, STEPS, logger)
     df_f = train_multires(components, 'factorized', BUCKETS, STEPS, logger)
     params_fact = model.dump()
     
@@ -1048,8 +1131,10 @@ if __name__ == "__main__":
     #print("\n📈 Plotting 3-way training losses...")
     #plot_three_way_loss(df_n, df_f, df_nll, logger, string="three_way_denoising_loss")
 
+    plot_detailed_loss(df_n_ae, df_f_ae, logger, strang="ae_loss_res_vs_type")
+
     print("\n📈 Plotting training losses...")
-    plot_detailed_loss(df_n, df_f, logger)
+    plot_detailed_loss(df_n, df_f, logger, "denoise_loss_breakdown_res_vs_type")
 
     eval_iterator = CompositeIterator(device, config={'checkerboard': 0.5, 'torus': 0.5})
     # 4. Sample BEFORE distillation
