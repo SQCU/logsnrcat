@@ -666,6 +666,63 @@ def plot_dset_reconstruction(result_dict, logger, name="reconstruction"):
     plt.tight_layout()
     logger.save_figure(fig, name)
 
+def compute_autoembed_loss(components, x0, min_logsnr=-10.0):
+    """
+    Tests: Can embedder→unembedder roundtrip clean images?
+    Uses minimum logsnr (cleanest state) as the noise annotation.
+    """
+    model, span_emb, span_unemb, _, _ = components
+    B = x0.shape[0]
+    device = x0.device
+    
+    # Annotate with "very clean" logsnr
+    logsnr_clean = torch.full((B,), min_logsnr, device=device)
+    logsnr_map = logsnr_clean.view(B, 1, 1, 1).expand_as(x0[:, :1])
+    
+    base_spans = get_image_spans(x0.shape[-1])
+    
+    # Embed (no transformer pass!)
+    images = [x0[i] for i in range(B)]
+    logsnr_maps = [logsnr_map[i] for i in range(B)]
+    
+    z_flat, span_objects, _ = span_emb.embed(
+        base_spans * B,
+        text_tokens=[None] * B,
+        images=images,
+        logsnr_maps=logsnr_maps
+    )
+    
+    # Unembed directly
+    decoded = span_unemb.decode(z_flat, span_objects)
+    x0_recon = torch.stack([d['image_vpreds'] for d in decoded])
+    
+    # MSE on image reconstruction
+    return F.mse_loss(x0_recon, x0)
+
+def compute_unembed_loss(components, z_t, logsnr_true, base_spans):
+    """
+    Tests: Can the model predict the noise level of its input?
+    This is implicit in diffusion - the model NEEDS to know how noisy z_t is.
+    """
+    model, span_emb, span_unemb, _, _ = components
+    
+    # Full forward pass (includes transformer)
+    z_flat, _, objs, cleanup = run_forward_step(
+        components, z_t, logsnr_true, base_spans
+    )
+    
+    decoded = span_unemb.decode(z_flat, objs)
+    logsnr_pred = torch.stack([d['image_logsnrs'] for d in decoded])
+    
+    # Expand ground truth
+    if logsnr_true.dim() == 1:
+        logsnr_target = logsnr_true.view(-1, 1, 1, 1).expand_as(logsnr_pred)
+    else:
+        logsnr_target = logsnr_true
+    
+    loss = F.mse_loss(logsnr_pred, logsnr_target)
+    return loss
+
 #why does this distillation loss always get written backwards then also called teacher-student distillation???
 def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsnr=-5.0, max_logsnr=5.0):
     B = x0.shape[0]
@@ -826,11 +883,13 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
 
         base_spans = get_image_spans(res)
+        loss_ae = compute_autoembed_loss(components, x0)
         
         v_pred, aux_loss, _ = predict_velocity_field(components, z_t, logsnr, base_spans, mode)
+        loss_unembed = compute_unembed_loss(components, z_t, logsnr, base_spans)
             
         loss_elem = F.mse_loss(v_pred, v_true, reduction='none').mean(dim=[1,2,3])
-        total_loss = loss_elem.mean() + aux_loss
+        total_loss = loss_elem.mean() + aux_loss + loss_ae + loss_unembed
         
         total_loss.backward()
         opt.step()
@@ -846,7 +905,7 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         
         history.append(step_stats)
         if i % 100 == 0:
-            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'res': res})
+            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'lae':f'{loss_ae}', 'res': res})
             
     return pd.DataFrame(history)
 
@@ -978,18 +1037,18 @@ if __name__ == "__main__":
     params_fact = model.dump()
     
     # 3.5 Run C: NLL
-    print("🚀 Run C: NLL")
-    model.flush()
-    model.param_init()
+    #print("🚀 Run C: NLL")
+    #model.flush()
+    #model.param_init()
     # NLL training doesn't use the 'mode' param for loss calculation (it uses the custom loop)
     # but we pass 'factorized' to prediction helpers later if we want to test that decoding path.
-    df_nll = train_nll(components, 'factorized', BUCKETS, STEPS, logger)
-    params_nll = model.dump()
+    #df_nll = train_nll(components, 'factorized', BUCKETS, STEPS, logger)
+    #params_nll = model.dump()
 
-    print("\n📈 Plotting 3-way training losses...")
-    plot_three_way_loss(df_n, df_f, df_nll, logger, string="three_way_denoising_loss")
+    #print("\n📈 Plotting 3-way training losses...")
+    #plot_three_way_loss(df_n, df_f, df_nll, logger, string="three_way_denoising_loss")
 
-    #print("\n📈 Plotting training losses...")
+    print("\n📈 Plotting training losses...")
     plot_detailed_loss(df_n, df_f, logger)
 
     eval_iterator = CompositeIterator(device, config={'checkerboard': 0.5, 'torus': 0.5})
@@ -1012,17 +1071,17 @@ if __name__ == "__main__":
         res_fact = sample_viz_dset(components, eval_iterator, eval_config)
         plot_dset_reconstruction(res_fact, logger, f"eval_dset_factorized_{res}px")
         
-        model.param_load(params_nll)
-        s_nll = sample_viz(components, res, mode='naive')
-        eval_config['mode'] = 'naive'
-        res_nll_naive = sample_viz_dset(components, eval_iterator, eval_config)
-        plot_dset_reconstruction(res_nll_naive, logger, f"eval_dset_nll_naive_{res}px")
+        #model.param_load(params_nll)
+        #s_nll = sample_viz(components, res, mode='naive')
+        #eval_config['mode'] = 'naive'
+        #res_nll_naive = sample_viz_dset(components, eval_iterator, eval_config)
+        #plot_dset_reconstruction(res_nll_naive, logger, f"eval_dset_nll_naive_{res}px")
         
-        model.param_load(params_nll)
-        s_nll = sample_viz(components, res, mode='factorized')
-        eval_config['mode'] = 'factorized'
-        res_nll_fact = sample_viz_dset(components, eval_iterator, eval_config)
-        plot_dset_reconstruction(res_nll_fact, logger, f"eval_dset_nll_factorized_{res}px")
+        #model.param_load(params_nll)
+        #s_nll = sample_viz(components, res, mode='factorized')
+        #eval_config['mode'] = 'factorized'
+        #res_nll_fact = sample_viz_dset(components, eval_iterator, eval_config)
+        #plot_dset_reconstruction(res_nll_fact, logger, f"eval_dset_nll_factorized_{res}px")
     
     #plot_sample_grid(samples_before, logger, "before_distillation_3way")
     #plot_sample_grid(samples_before, logger, "before_distillation")
@@ -1038,14 +1097,14 @@ if __name__ == "__main__":
     params_fact_dist = model.dump()
     
     # 5.5 Distill NLL
-    print("...Distilling NLL...")
-    model.param_load(params_nll)
-    df_nll_dist = distill_nll(components, 'naive', BUCKETS, DISTILL_STEPS, logger)
-    params_nll_dist = model.dump()
+    #print("...Distilling NLL...")
+    #model.param_load(params_nll)
+    #df_nll_dist = distill_nll(components, 'naive', BUCKETS, DISTILL_STEPS, logger)
+    #params_nll_dist = model.dump()
 
     print("\n📈 Plotting distillation losses...")
     plot_distillation_loss(df_n_dist, df_f_dist, logger)
-    plot_three_way_loss(df_n_dist, df_f_dist, df_nll_dist , logger, string="three_way_distillation_loss")
+    #plot_three_way_loss(df_n_dist, df_f_dist, df_nll_dist , logger, string="three_way_distillation_loss")
 
     # 6. Sample AFTER distillation
     print("\n🎨 Sampling (After Distillation)...")
@@ -1069,15 +1128,15 @@ if __name__ == "__main__":
         res_fact = sample_viz_dset(components, eval_iterator, eval_config)
         plot_dset_reconstruction(res_fact, logger, f"eval_distill_dset_factorized_{res}px")
         
-        model.param_load(params_nll_dist)
-        eval_config['mode'] = 'naive'
-        res_nll_naive = sample_viz_dset(components, eval_iterator, eval_config)
-        plot_dset_reconstruction(res_nll_naive, logger, f"eval_distill_dset_nll_naive_{res}px")
+        #model.param_load(params_nll_dist)
+        #eval_config['mode'] = 'naive'
+        #res_nll_naive = sample_viz_dset(components, eval_iterator, eval_config)
+        #plot_dset_reconstruction(res_nll_naive, logger, f"eval_distill_dset_nll_naive_{res}px")
         
-        model.param_load(params_nll_dist)
-        eval_config['mode'] = 'factorized'
-        res_nll_fact = sample_viz_dset(components, eval_iterator, eval_config)
-        plot_dset_reconstruction(res_nll_fact, logger, f"eval_distill_dset_nll_factorized_{res}px")
+        #model.param_load(params_nll_dist)
+        #eval_config['mode'] = 'factorized'
+        #res_nll_fact = sample_viz_dset(components, eval_iterator, eval_config)
+        #plot_dset_reconstruction(res_nll_fact, logger, f"eval_distill_dset_nll_factorized_{res}px")
         #samples_after.append((f"Naive {res}px", s_n))
         #samples_after.append((f"Fact {res}px", s_f))
         #samples_after.append((f"NLL {res}px", s_nll))

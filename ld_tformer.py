@@ -477,7 +477,8 @@ class ContextualPatchUnembedder(nn.Module):
         # 3. Reconstruct LogSNR
         # [L, F] -> [L, 1]
         #oopsie woopsie this prohibited negative logsnr outputs, never program while sleepy
-        #but only because of an exp() call!
+        #weirdly this produces a loss:1 model when used to scale model outputs.
+        #ground truth logsnr field inputs and applying an exp(self.logsnr_decoder) produce decreasing but bad loss.
         logsnr_pred = self.logsnr_decoder(fourier_part)
         #single linear layer, in contrast, produces loss:1 fitted models in both the nll and factorized vpred case!
         #logsnr_pred = self.lambda_head(z)
