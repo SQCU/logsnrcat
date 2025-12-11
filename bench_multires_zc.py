@@ -14,7 +14,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
-from diffusion_utils import get_schedule, get_alpha_sigma, BucketManager
+from torch.optim.lr_scheduler import OneCycleLR
+
+#get_schedule,
+from diffusion_utils import get_alpha_sigma, BucketManager
 from dataset import CompositeIterator
 
 # NOTE: Importing the ZC (Zero-Cache) variant for training
@@ -59,6 +62,10 @@ class ExperimentLogger:
         return filepath
 
 ### Diffusion Helpers
+
+def get_schedule(t, schedule_bounds: tuple = (5,-1)):
+    return schedule_bounds[0]-t*(schedule_bounds[1]-schedule_bounds[0])
+    #return 20.0 - 40.0 * t
 
 def predict_velocity_field(components, z, logsnr, spans, mode):
     """
@@ -146,7 +153,7 @@ def run_forward_step_kvc(
     suppress_logsnr_input: bool = False
 ):
     """
-    Returns:
+    Returns
         z_out: [L_total, D]
         aux_loss: Scalar
         span_objects: List[Span]
@@ -232,13 +239,18 @@ def run_forward_step_kvc(
         k_views.append(k)
         v_views.append(v)
 
+    base_ref_len = 64.0 
+    L_total = z_flat.shape[0]
+    rope_scale = max(1.0, L_total / base_ref_len)
+
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
         k_caches=k_views,
         v_caches=v_views,
         slot_mapping=slot_mapping,
-        block_mask=block_masks
+        block_mask=block_masks,
+        scale=rope_scale
     )
     
     return z_out.squeeze(0), aux_loss, span_objects, req_ids
@@ -318,23 +330,27 @@ def run_forward_step(
         inverse_page_table=None
     )
     
+    base_ref_len = 64.0 
+    L_total = z_flat.shape[0]
+    rope_scale = max(1.0, L_total / base_ref_len)
+
     # 6. Forward Pass
     # coolerLDTformerZC now expects 'block_masks' (tuple), not 'block_mask'
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
         topo_embeds.unsqueeze(0),
         slot_mapping=None,
-        block_masks=block_masks  # <--- CHANGED ARGUMENT
+        block_masks=block_masks,  # <--- CHANGED ARGUMENT
+        scale=rope_scale
     )
     
     # No request IDs to cleanup in ZC mode
     return z_out.squeeze(0), aux_loss, span_objects, []
 
 def logsnr_to_alpha_sigma(logsnr):
-    snr = torch.exp(logsnr)
-    alpha_sq = snr / (1.0 + snr)
-    sigma_sq = 1.0 / (1.0 + snr)
-    return torch.sqrt(alpha_sq), torch.sqrt(sigma_sq)
+    alpha = torch.sqrt(torch.sigmoid(logsnr))
+    sigma = torch.sqrt(torch.sigmoid(-logsnr))
+    return alpha, sigma
 
 def sample_logsnr_triplet(batch_size, device, min_logsnr=-10.0, max_logsnr=0.0, min_gap=1.0):
     logsnr_low = torch.rand(batch_size, device=device) * (max_logsnr - min_logsnr) + min_logsnr
@@ -436,7 +452,7 @@ def plot_comparison_grid(samples_before, samples_after, resolutions):
     return fig
 
 
-def plot_three_way_loss(df_naive, df_fact, df_nll, logger):
+def plot_three_way_loss(df_naive, df_fact, df_nll, logger, string="three_way_loss"):
     """
     Plots Naive vs Factorized vs NLL training curves.
     Note: NLL loss scale is different (can be negative), so we plot it on secondary axis or separate subplot.
@@ -477,7 +493,7 @@ def plot_three_way_loss(df_naive, df_fact, df_nll, logger):
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
         
     plt.tight_layout()
-    logger.save_figure(fig, "three_way_training_loss")
+    logger.save_figure(fig, string)
 
 ### Sampling & Training
 
@@ -506,6 +522,150 @@ def sample_viz(components, res, num_samples=8, mode='naive'):
     model.train()
     return z.cpu().clamp(0, 1)
 
+### Improved Sampling & Visualization Logic
+
+@torch.no_grad()
+def sample_viz_dset(components, iterator, config):
+    """
+    Higher power sampler:
+    1. Fetches real dataset items (GT).
+    2. Noises them to random levels between min_logsnr and max_logsnr.
+    3. Reconstructs them using the model.
+    4. Computes MSE against GT.
+    """
+    model, _, _, _, _ = components
+    model.eval()
+    
+    # 1. Configuration
+    res = config.get('res', 32)
+    n_samples = config.get('num_samples', 8)
+    mode = config.get('mode', 'naive')
+    
+    # User requested uniform sampling between -1 and -14
+    # -4 is very noisy, +1 is somewhat noisy (partial data)
+    min_snr = config.get('min_logsnr', -4.0) 
+    max_snr = config.get('max_logsnr', 1.0)
+    target_clean_snr = 10.0 # High value for "clean" final state
+    
+    device = model.text_embed.weight.device
+    
+    # 2. Get Ground Truth Data
+    # We generate a batch. Since CompositeIterator mixes shapes, we get a mix.
+    x0 = iterator.generate_batch(n_samples, res, num_tiles=4.0).to(device)
+    
+    # 3. Determine Start Times (Stratified)
+    # We assign a random starting noise level to each item in the batch
+    start_logsnrs = torch.rand(n_samples, device=device) * (max_snr - min_snr) + min_snr
+    # Sort for cleaner visualization (Noisiest -> Cleanest)
+    start_logsnrs, sort_idx = torch.sort(start_logsnrs)
+    x0 = x0[sort_idx]
+    
+    # 4. Prepare Solver
+    # We create a global time grid from the absolute noise floor (-15) to clean (+10)
+    # We will "pick up" each sample when the solver passes its specific start_logsnr
+    grid_steps = 64
+    schedule = torch.linspace(-15.0, target_clean_snr, grid_steps, device=device)
+    
+    z = torch.zeros_like(x0)
+    active_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
+    vis_noisy_inputs = torch.zeros_like(x0) # For visualization
+    
+    base_spans = get_image_spans(res)
+    
+    # 5. Sampling Loop (Low SNR -> High SNR)
+    for i in range(grid_steps - 1):
+        t_curr = schedule[i]
+        t_next = schedule[i+1]
+        
+        # A. Injection Phase:
+        # Check which samples should "enter" the simulation now.
+        # Condition: Sample wants to start at S, and t_curr >= S.
+        should_start = (t_curr >= start_logsnrs) & (~active_mask)
+        
+        if should_start.any():
+            # Generate the specific partial noise for these items
+            # We use t_curr as the noise level so they align with the solver grid
+            a, s = logsnr_to_alpha_sigma(torch.full((n_samples,), t_curr, device=device))
+            eps = torch.randn_like(x0)
+            z_injected = x0 * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
+            
+            # Write into state
+            z = torch.where(should_start.view(-1,1,1,1), z_injected, z)
+            vis_noisy_inputs = torch.where(should_start.view(-1,1,1,1), z_injected, vis_noisy_inputs)
+            active_mask = active_mask | should_start
+            
+        if not active_mask.any():
+            continue
+
+        # B. Prediction Phase
+        # We pass t_curr for all, but masking handles the logic validity
+        logsnr_map = torch.full((n_samples,), t_curr, device=device)
+        
+        v_pred, _, _ = predict_velocity_field(components, z, logsnr_map, base_spans, mode)
+        
+        # C. Step Phase
+        z_next = euler_reverse_step(z, v_pred, t_curr, t_next)
+        
+        # Only update items that have actually started
+        z = torch.where(active_mask.view(-1,1,1,1), z_next, z)
+        
+    model.train()
+    
+    # 6. Calc Metrics
+    # Clamp for valid image range before MSE
+    z_final = z.clamp(0, 1)
+    mse_per_sample = F.mse_loss(z_final, x0, reduction='none').mean(dim=[1,2,3])
+    
+    return {
+        'x0': x0,
+        'noisy_input': vis_noisy_inputs,
+        'reconstruction': z_final,
+        'mse': mse_per_sample,
+        'start_snr': start_logsnrs
+    }
+
+def plot_dset_reconstruction(result_dict, logger, name="reconstruction"):
+    """
+    Plots a grid: [Ground Truth] | [Noisy Start] | [Reconstruction]
+    """
+    x0 = result_dict['x0'].cpu()
+    noisy = result_dict['noisy_input'].cpu()
+    recon = result_dict['reconstruction'].cpu()
+    mses = result_dict['mse'].cpu()
+    snrs = result_dict['start_snr'].cpu()
+    
+    n = x0.shape[0]
+    fig, axes = plt.subplots(n, 3, figsize=(10, 2 * n))
+    
+    # Handle single sample case
+    if n == 1: axes = axes.reshape(1, -1)
+    
+    for i in range(n):
+        # 1. GT
+        axes[i, 0].imshow(x0[i].permute(1,2,0).numpy())
+        axes[i, 0].axis('off')
+        if i == 0: axes[i, 0].set_title("Ground Truth (x0)", fontsize=10)
+        
+        # 2. Noisy Input
+        # Remap noisy range for visualization if needed, but raw is usually fine
+        axes[i, 1].imshow(noisy[i].permute(1,2,0).clamp(0,1).numpy())
+        axes[i, 1].axis('off')
+        if i == 0: axes[i, 1].set_title("Input (Noised)", fontsize=10)
+        
+        # 3. Output
+        axes[i, 2].imshow(recon[i].permute(1,2,0).numpy())
+        axes[i, 2].axis('off')
+        if i == 0: axes[i, 2].set_title("Reconstruction (Output)", fontsize=10)
+        
+        # Annotations
+        snr_val = snrs[i].item()
+        mse_val = mses[i].item()
+        axes[i, 1].text(0, -2, f"LogSNR: {snr_val:.1f}", fontsize=8, color='blue')
+        axes[i, 2].text(0, -2, f"MSE: {mse_val:.5f}", fontsize=8, color='red')
+        
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
 #why does this distillation loss always get written backwards then also called teacher-student distillation???
 def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsnr=-5.0, max_logsnr=5.0):
     B = x0.shape[0]
@@ -529,7 +689,9 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
 def distill_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Distilling: {mode.upper()} ---")
     model = components[0]
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.1)  #why were you a different value?
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)  #why were you a different value?
+    scheduler_main = OneCycleLR(opt, max_lr=1e-4, total_steps=steps, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
     # Scaled down buckets for distillation memory
     buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
     
@@ -561,6 +723,7 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         loss_t = (1.0+loss_c) * 1.0 * loss_d + aux_loss + aux_loss_con
         loss_t.backward()
         opt.step()
+        scheduler_main.step()
         
         step_stats = {'step': i, 'res': res, 'loss_consistency': loss_c.item(), 
                       'loss_denoise': loss_d.item(), 'loss_total': loss_t.item()}
@@ -577,7 +740,9 @@ def distill_nll(components, mode, buckets, steps=1000, logger=None):
     """
     print(f"\n--- Distilling: Probabilistic (NLL + Consistency) ---")
     model = components[0]
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.1)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.1)
+    scheduler_main = OneCycleLR(opt, max_lr=1e-4, total_steps=steps, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
     
     # Use reduced batch size for distillation memory overhead
     buckets_distill = [(res, max(1, bs // 2)) for res, bs in buckets]
@@ -621,6 +786,7 @@ def distill_nll(components, mode, buckets, steps=1000, logger=None):
         
         loss_t.backward()
         opt.step()
+        scheduler_main.step()
         
         step_stats = {
             'step': i, 'res': res, 
@@ -638,6 +804,8 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Training: {mode.upper()} ---")
     model = components[0]
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+    scheduler_main = OneCycleLR(opt, max_lr=1e-4, total_steps=steps, 
+                        pct_start=0.1, div_factor=10, final_div_factor=100)
     
     iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
     manager = BucketManager(buckets)
@@ -666,6 +834,7 @@ def train_multires(components, mode, buckets, steps=1000, logger=None):
         
         total_loss.backward()
         opt.step()
+        scheduler_main.step()
 
         step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
         if hasattr(iterator, 'last_labels') and hasattr(iterator, 'label_map'):
@@ -689,6 +858,8 @@ def train_nll(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Training: NLL (Base) ---")
     model = components[0]
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
+    scheduler_main = OneCycleLR(opt, max_lr=1e-4, total_steps=steps, 
+                    pct_start=0.1, div_factor=10, final_div_factor=100)
     
     iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
     manager = BucketManager(buckets)
@@ -720,6 +891,7 @@ def train_nll(components, mode, buckets, steps=1000, logger=None):
         total_loss = loss_nll + aux_loss
         total_loss.backward()
         opt.step()
+        scheduler_main.step()
 
         # Logging (NLL is not directly comparable to MSE, but we log it)
         step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
@@ -741,10 +913,10 @@ if __name__ == "__main__":
     RESOLUTIONS = [16, 32, 64]
     """
     
-    BUCKETS = [(16, 128)]
-    STEPS = 500
-    DISTILL_STEPS = 500
-    RESOLUTIONS = [16, 32, 64]
+    BUCKETS = [(16, 64), (32, 32)]
+    STEPS = 1000
+    DISTILL_STEPS = 1000
+    RESOLUTIONS = [16, 32]
     
     """
     BUCKETS = [(128,4)]
@@ -755,7 +927,7 @@ if __name__ == "__main__":
 
     
     print("🔧 Initializing ZC Model Stack...")
-    embed_dim = 512; depth = 4; num_heads=16; topo_dim = 3 
+    embed_dim = 256; depth = 8; num_heads=8; topo_dim = 3 
     
     # 1. Initialize ZC Model (Cacheless)
     model = coolerLDTformer(dim=embed_dim, depth=depth, num_heads=num_heads, topo_dim=topo_dim).to(device)
@@ -773,7 +945,7 @@ if __name__ == "__main__":
         expected_seq_len=8*8,  # 16px image -> 8×8 after 2×2 pooling
         kv_cache_memory_fraction=0.85,
         safety_margin_gb=1.5,
-        concurrent_requests_multiplier=2.0,  # Allow 2× batch size headroom
+        concurrent_requests_multiplier=1.0,  # Allow 2× batch size headroom
         verbose=True
     )
 
@@ -805,45 +977,54 @@ if __name__ == "__main__":
     df_f = train_multires(components, 'factorized', BUCKETS, STEPS, logger)
     params_fact = model.dump()
     
-    
     # 3.5 Run C: NLL
     print("🚀 Run C: NLL")
     model.flush()
     model.param_init()
     # NLL training doesn't use the 'mode' param for loss calculation (it uses the custom loop)
-    # but we pass 'factorized' to prediction helpers later if we want to test that decoding path,
-    # or 'naive' if we want raw output. For NLL, the model predicts mean directly.
+    # but we pass 'factorized' to prediction helpers later if we want to test that decoding path.
     df_nll = train_nll(components, 'factorized', BUCKETS, STEPS, logger)
     params_nll = model.dump()
 
     print("\n📈 Plotting 3-way training losses...")
-    plot_three_way_loss(df_n, df_f, df_nll, logger)
+    plot_three_way_loss(df_n, df_f, df_nll, logger, string="three_way_denoising_loss")
 
-    # 4. Sample BEFORE distillation (Updated to include NLL)
-    print("\n🎨 Sampling (Before Distillation)...")
-    samples_before = []
-
-    print("\n📈 Plotting training losses...")
+    #print("\n📈 Plotting training losses...")
     plot_detailed_loss(df_n, df_f, logger)
 
+    eval_iterator = CompositeIterator(device, config={'checkerboard': 0.5, 'torus': 0.5})
     # 4. Sample BEFORE distillation
-    print("\n🎨 Sampling (Before Distillation)...")
-    samples_before = []
     for res in RESOLUTIONS:
+        eval_config = {
+            'res': 32,
+            'num_samples': 8,
+            'min_logsnr': -14.0, # Very noisy
+            'max_logsnr': -1.0,  # Partially clean
+        }
+    
         model.param_load(params_naive)
-        s_n = sample_viz(components, res, mode='naive')
+        eval_config['mode'] = 'naive'
+        res_naive = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_naive, logger, f"eval_dset_naive_{res}px")
         
         model.param_load(params_fact)
-        s_f = sample_viz(components, res, mode='factorized')
+        eval_config['mode'] = 'factorized'
+        res_fact = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_fact, logger, f"eval_dset_factorized_{res}px")
         
-        samples_before.append((f"Naive {res}px", s_n))
-        samples_before.append((f"Fact {res}px", s_f))
-
         model.param_load(params_nll)
-        s_nll = sample_viz(components, res, mode='naive') # Mode 'naive' interprets output as raw v
-        samples_before.append((f"NLL {res}px", s_nll))
+        s_nll = sample_viz(components, res, mode='naive')
+        eval_config['mode'] = 'naive'
+        res_nll_naive = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_nll_naive, logger, f"eval_dset_nll_naive_{res}px")
+        
+        model.param_load(params_nll)
+        s_nll = sample_viz(components, res, mode='factorized')
+        eval_config['mode'] = 'factorized'
+        res_nll_fact = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_nll_fact, logger, f"eval_dset_nll_factorized_{res}px")
     
-    plot_sample_grid(samples_before, logger, "before_distillation_3way")
+    #plot_sample_grid(samples_before, logger, "before_distillation_3way")
     #plot_sample_grid(samples_before, logger, "before_distillation")
     
     # 5. Distillation phase
@@ -864,27 +1045,45 @@ if __name__ == "__main__":
 
     print("\n📈 Plotting distillation losses...")
     plot_distillation_loss(df_n_dist, df_f_dist, logger)
-    plot_three_way_loss(df_n_dist, df_f_dist, df_nll_dist , logger)
+    plot_three_way_loss(df_n_dist, df_f_dist, df_nll_dist , logger, string="three_way_distillation_loss")
 
     # 6. Sample AFTER distillation
     print("\n🎨 Sampling (After Distillation)...")
     samples_after = []
     for res in RESOLUTIONS:
+        eval_config = {
+            'res': 32,
+            'num_samples': 8,
+            'min_logsnr': -4.0, # Very noisy
+            'max_logsnr': 1.0,  # Partially clean
+        }
+    
+
         model.param_load(params_naive_dist)
-        s_n = sample_viz(components, res, mode='naive')
+        eval_config['mode'] = 'naive'
+        res_naive = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_naive, logger, f"eval_distill_dset_naive_{res}px")
         
         model.param_load(params_fact_dist)
-        s_f = sample_viz(components, res, mode='factorized')
+        eval_config['mode'] = 'factorized'
+        res_fact = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_fact, logger, f"eval_distill_dset_factorized_{res}px")
         
         model.param_load(params_nll_dist)
-        s_nll = sample_viz(components, res, mode='naive')
-
-        samples_after.append((f"Naive {res}px", s_n))
-        samples_after.append((f"Fact {res}px", s_f))
-        samples_after.append((f"NLL {res}px", s_nll))
+        eval_config['mode'] = 'naive'
+        res_nll_naive = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_nll_naive, logger, f"eval_distill_dset_nll_naive_{res}px")
+        
+        model.param_load(params_nll_dist)
+        eval_config['mode'] = 'factorized'
+        res_nll_fact = sample_viz_dset(components, eval_iterator, eval_config)
+        plot_dset_reconstruction(res_nll_fact, logger, f"eval_distill_dset_nll_factorized_{res}px")
+        #samples_after.append((f"Naive {res}px", s_n))
+        #samples_after.append((f"Fact {res}px", s_f))
+        #samples_after.append((f"NLL {res}px", s_nll))
     
-    plot_sample_grid(samples_after, logger, "after_distillation_3way")
-    fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
-    logger.save_figure(fig_compare, "before_after_comparison")
+    #plot_sample_grid(samples_after, logger, "after_distillation_3way")
+    #fig_compare = plot_comparison_grid(samples_before, samples_after, RESOLUTIONS)
+    #logger.save_figure(fig_compare, "before_after_comparison")
     
     print(f"\n✅ Done. Check {logger.run_dir}")

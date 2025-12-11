@@ -83,7 +83,7 @@ class HouseholderOrthogonal(nn.Module):
         return x @ Q.t() if inverse else x @ Q
 
 class RnRoPE(nn.Module):
-    def __init__(self, head_dim: int, topo_dim: int, rope_base: float = 10000.0):
+    def __init__(self, head_dim: int, topo_dim: int, rope_base: float = 500.0):
         super().__init__()
         self.head_dim = head_dim
         self.topo_dim = topo_dim
@@ -92,10 +92,14 @@ class RnRoPE(nn.Module):
         # Householder rotation for latent space projection
         self.orthogonal = HouseholderOrthogonal(head_dim, num_reflections=head_dim//2)
         
-        # Standard RoPE frequency bands
+        # Calculate how many frequency bands each topology dimension gets.
+        # e.g., Head=64 -> Freq=32. Topo=3 -> 10 bands per dim.
+        # This fixes the utilization issue; previous logic used only half capacity.
+        self.features_per_subspace = self.freq_dim // topo_dim
+        
         self.register_buffer(
             'inv_freq',
-            1.0 / (rope_base ** (torch.arange(0, self.freq_dim, 2).float() / self.freq_dim))
+            1.0 / (rope_base ** (torch.arange(0, self.features_per_subspace).float() / self.features_per_subspace))
         )
         
         self.param_init()
@@ -103,51 +107,48 @@ class RnRoPE(nn.Module):
     def param_init(self):
         self.orthogonal.param_init()
     
-    def forward(self, q: torch.Tensor, k: torch.Tensor, topo_embeds: torch.Tensor):
+    def forward(self, q: torch.Tensor, k: torch.Tensor, topo_embeds: torch.Tensor, scale: float = 1.0):
         """
         Args:
-            q: [B, H, L, D]
-            k: [B, H, L, D]
-            topo_embeds: [B, L, Topo_Dim] - absolute positions in topology space
+            q, k: [B, H, L, D]
+            topo_embeds: [B, L, Topo_Dim]
+            scale: Scaling factor for context length generalization (inv_freq / scale).
         """
         B, H, L, D = q.shape
         
         # 1. Rotate into frequency-friendly space
+        # Collapse B, H, L for efficient matmul
         q = self.orthogonal(q.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D)
         k = self.orthogonal(k.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D)
         
-        # 2. Compute frequencies from positions (Standard RoPE)
-        # For each topology dimension, compute outer product with frequency bands
-        freqs_list = []
-        for d in range(min(self.topo_dim, self.freq_dim)):
-            pos_d = topo_embeds[:, :, d]  # [B, L]
-            # Outer product: position × frequency bands
-            freq_d = torch.einsum('bl,f->blf', pos_d, self.inv_freq)
-            freqs_list.append(freq_d)
+        # 2. Vectorized Frequency Computation
+        # Slice inputs to supported dimensions (handles implicit truncation if input has extra dims)
+        t_embeds = topo_embeds[..., :self.topo_dim] # [B, L, Topo_Dim]
         
-        # Concatenate all dimensions
-        if freqs_list:
-            full_freqs = torch.cat(freqs_list, dim=-1)  # [B, L, ?]
-        else:
-            full_freqs = torch.zeros(B, L, self.freq_dim, device=q.device)
+        # Scale frequencies (Context Generalization)
+        inv_freq_scaled = self.inv_freq / scale # [Subspace_Dim]
         
-        # Pad or truncate to freq_dim
-        if full_freqs.shape[-1] < self.freq_dim:
-            pad_size = self.freq_dim - full_freqs.shape[-1]
-            full_freqs = F.pad(full_freqs, (0, pad_size))
-        else:
-            full_freqs = full_freqs[..., :self.freq_dim]
+        # Compute phases: Outer Product
+        # [B, L, Topo, 1] * [1, 1, 1, Subspace] -> [B, L, Topo, Subspace]
+        freqs = t_embeds.unsqueeze(-1) * inv_freq_scaled.view(1, 1, 1, -1)
         
-        # 3. Create rotation matrices
-        # Duplicate for (cos, sin) on both halves
-        cos = full_freqs.cos().unsqueeze(1)  # [B, 1, L, freq_dim]
-        sin = full_freqs.sin().unsqueeze(1)
+        # Flatten to single frequency vector: [B, L, Topo * Subspace]
+        full_freqs = freqs.view(B, L, -1)
         
-        # Expand to full head_dim by duplicating
-        cos = cos.repeat(1, 1, 1, 2)[..., :D]
-        sin = sin.repeat(1, 1, 1, 2)[..., :D]
+        # 3. Pad to match freq_dim (head_dim // 2)
+        # We prefer padding over branching. If Topo*Subspace < Freq_Dim, we pad zeros.
+        # (Zero freq = No rotation = Identity for those dimensions, which is safe).
+        curr_dim = full_freqs.shape[-1]
+        if curr_dim < self.freq_dim:
+            full_freqs = F.pad(full_freqs, (0, self.freq_dim - curr_dim))
         
-        # 4. Apply rotary embedding
+        # 4. Create Rotation Matrices
+        # [B, L, freq_dim] -> [B, 1, L, freq_dim] -> [B, 1, L, head_dim]
+        # Duplicate for real/imaginary parts
+        cos = full_freqs.cos().unsqueeze(1).repeat(1, 1, 1, 2)[..., :D]
+        sin = full_freqs.sin().unsqueeze(1).repeat(1, 1, 1, 2)[..., :D]
+        
+        # 5. Apply RoPE (Standard Rotate Half)
         def rotate_half(x):
             x1, x2 = x[..., :D//2], x[..., D//2:]
             return torch.cat([-x2, x1], dim=-1)
@@ -155,7 +156,7 @@ class RnRoPE(nn.Module):
         q_rot = (q * cos) + (rotate_half(q) * sin)
         k_rot = (k * cos) + (rotate_half(k) * sin)
         
-        # 5. Rotate back to original space
+        # 6. Rotate back to original basis
         q_out = self.orthogonal(q_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D)
         k_out = self.orthogonal(k_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D)
         
@@ -425,7 +426,9 @@ class ContextualPatchUnembedder(nn.Module):
             nn.Linear(embed_dim, total_out_dim)
         )
         #i don't care if 256 is too big, having magic numbers is bad
+        # dubious dubious dubious!!! be careful!!!
         self.logsnr_decoder = FourierScaleDecoder(fourier_dim, hidden_dim=embed_dim, output_dim=1)
+        self.lambda_head = nn.Linear(embed_dim, 1)
         self.param_init()
 
     def param_init(self):
@@ -433,6 +436,7 @@ class ContextualPatchUnembedder(nn.Module):
             block.param_init()
         init_layer_norm(self.output_proj[0])
         init_linear(self.output_proj[1])
+        init_linear(self.lambda_head)
         self.logsnr_decoder.param_init()
 
     def forward(
@@ -472,7 +476,9 @@ class ContextualPatchUnembedder(nn.Module):
         
         # 3. Reconstruct LogSNR
         # [L, F] -> [L, 1]
-        logsnr_pred = self.logsnr_decoder(fourier_part)
+        #oopsie woopsie this prohibited negative logsnr outputs, never program while sleepy
+        #logsnr_pred = self.logsnr_decoder(fourier_part)
+        logsnr_pred = self.lambda_head(z)
         
         # Reshape to grid [1, GH, GW]
         logsnr_grid = logsnr_pred.view(GH, GW).unsqueeze(0)
@@ -842,14 +848,14 @@ def build_composed_mask(
     return physical_mask
 
 class LDTformerAttentionKVC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, is_global=False):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, is_global=False, rope_base: float = 500.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
-        self.rope = RnRoPE(self.head_dim, topo_dim)
+        self.rope = RnRoPE(self.head_dim, topo_dim, rope_base=rope_base)
         # Initialize immediately
         self.param_init()
 
@@ -866,7 +872,8 @@ class LDTformerAttentionKVC(nn.Module):
         k_cache: torch.Tensor,     # [1, H, Capacity, D] - FULL heap
         v_cache: torch.Tensor,     # [1, H, Capacity, D] - FULL heap
         slot_mapping: torch.Tensor,
-        block_mask: object         # Already composed using HEAP topology
+        block_mask: object,         # Already composed using HEAP topology
+        scale: float = 1.0
     ):
         """
         Stateless Attention:
@@ -886,7 +893,7 @@ class LDTformerAttentionKVC(nn.Module):
         # Apply RoPE using GLOBAL coordinates
         # topo_active[i] contains the ABSOLUTE highway position + spatial coords
         # So token at position 336 in the sequence gets highway=336, not highway=0
-        q, k = self.rope(q, k, topo_active)  # Uses global positions
+        q, k = self.rope(q, k, topo_active, scale=scale)  # Uses global positions
         
         # 3. Cache Write (Side Effect)
         # Transform from [B, H, L, D] -> [B*L, H, 1, D] semantics for scatter writer
@@ -905,13 +912,13 @@ class LDTformerAttentionKVC(nn.Module):
         return self.proj(out)
 
 class LDTformerAttentionZC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, rope_base: float = 500.0):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.qkv = nn.Linear(dim, dim * 3, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
-        self.rope = RnRoPE(self.head_dim, topo_dim)
+        self.rope = RnRoPE(self.head_dim, topo_dim, rope_base=rope_base)
         # Initialize immediately
         self.param_init()
 
@@ -926,7 +933,8 @@ class LDTformerAttentionZC(nn.Module):
         x: torch.Tensor,           # [B, L, D] - ACTIVE tokens only
         topo_active: torch.Tensor, # [B, L_active, Topo_Dim] - GLOBAL COORDS
         slot_mapping: torch.Tensor,
-        block_mask: object         # Already composed using HEAP topology
+        block_mask: object,         # Already composed using HEAP topology
+        scale: float = 1.0
     ):
         """
         Stateless Attention:
@@ -946,7 +954,7 @@ class LDTformerAttentionZC(nn.Module):
         # Apply RoPE using GLOBAL coordinates
         # topo_active[i] contains the ABSOLUTE highway position + spatial coords
         # So token at position 336 in the sequence gets highway=336, not highway=0
-        q, k = self.rope(q, k, topo_active)  # Uses global positions
+        q, k = self.rope(q, k, topo_active, scale=scale)  # Uses global positions
         
         # Attention uses HEAP topology (via the mask)
         # The mask_mod already captures distances in the full heap
@@ -957,11 +965,12 @@ class LDTformerAttentionZC(nn.Module):
         return self.proj(out)
 
 class LDTformerBlockKVC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False, num_experts=8, num_active=3,):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False, num_experts=8, num_active=3, rope_base: float = 500.0):
         super().__init__()
         self.is_global = is_global
+        self.rope_base = rope_base*(100**is_global)
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.attn = LDTformerAttentionKVC(dim, num_heads, topo_dim)        
+        self.attn = LDTformerAttentionKVC(dim, num_heads, topo_dim, rope_base=self.rope_base)        
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
         
         # Using SigmoidMoE for FFN
@@ -978,10 +987,10 @@ class LDTformerBlockKVC(nn.Module):
         self.moe.param_init()
         init_linear(self.gate_proj)
 
-    def forward(self, x, topo, k_cache, v_cache, slots, mask):
+    def forward(self, x, topo, k_cache, v_cache, slots, mask, scale: float = 1.0):
         # Attention Sub-block
         h = self.norm1(x)
-        h = self.attn(h, topo, k_cache, v_cache, slots, mask)
+        h = self.attn(h, topo, k_cache, v_cache, slots, mask, scale=scale)
         gh = torch.sigmoid(self.gate_proj(h))
         x = x + (h*gh)
         
@@ -992,11 +1001,12 @@ class LDTformerBlockKVC(nn.Module):
         return x, aux_loss
 
 class LDTformerBlockZC(nn.Module):
-    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False, num_experts=8, num_active=3):
+    def __init__(self, dim: int, num_heads: int, topo_dim: int, mlp_ratio: float = 4.0, is_global=False, num_experts=8, num_active=3, rope_base: float = 500.0):
         super().__init__()
         self.is_global = is_global
+        self.rope_base = rope_base*(100**is_global)
         self.norm1 = nn.RMSNorm(dim, elementwise_affine=False)
-        self.attn = LDTformerAttentionZC(dim, num_heads, topo_dim)
+        self.attn = LDTformerAttentionZC(dim, num_heads, topo_dim, rope_base=self.rope_base)
         self.norm2 = nn.RMSNorm(dim, elementwise_affine=False)
         
         # Using SigmoidMoE for FFN
@@ -1013,10 +1023,10 @@ class LDTformerBlockZC(nn.Module):
         self.moe.param_init()
         init_linear(self.gate_proj)
 
-    def forward(self, x, topo, slots, mask):
+    def forward(self, x, topo, slots, mask, scale: float = 1.0):
         # Attention Sub-block
         h = self.norm1(x)
-        h = self.attn(h, topo, slots, mask)
+        h = self.attn(h, topo, slots, mask, scale=scale)
         gh = torch.sigmoid(self.gate_proj(h))
         x = x + (h*gh)
         
@@ -1029,7 +1039,7 @@ class LDTformerBlockZC(nn.Module):
 # ===== INSIDE MODEL: Metadata-Agnostic =====
 
 class coolerLDTformerKVC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base: int = 500):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1045,7 +1055,7 @@ class coolerLDTformerKVC(nn.Module):
         
         # Transformer trunk
         self.layers = nn.ModuleList([
-            LDTformerBlockKVC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0), num_experts=num_experts, num_active=num_active) for i in range(depth) 
+            LDTformerBlockKVC(dim, num_heads, topo_dim, is_global=((i+1)%global_layer_interval==0), num_experts=num_experts, num_active=num_active, rope_base=rope_base) for i in range(depth) 
         ])
         
         # Output heads (used by SpanUnembedder)
@@ -1079,7 +1089,8 @@ class coolerLDTformerKVC(nn.Module):
         k_caches: list,
         v_caches: list,
         slot_mapping: torch.Tensor,
-        block_masks: Tuple[object, object] # Receives (Local, Global)
+        block_masks: Tuple[object, object],  # Receives (Local, Global)
+        scale: float = 1.0
     ) -> Tuple[torch.Tensor, float]:
         """
         Pure transformer pass. No span logic.
@@ -1095,7 +1106,7 @@ class coolerLDTformerKVC(nn.Module):
         for i, layer in enumerate(self.layers):
             block_mask = mask_global if layer.is_global else mask_local
             x, aux = layer(x, topo_embeds, k_caches[i], v_caches[i], 
-                          slot_mapping, block_mask)
+                          slot_mapping, block_mask, scale=scale)
             total_aux += aux
         
         x = self.final_norm(x)
@@ -1120,7 +1131,7 @@ class coolerLDTformerKVC(nn.Module):
 
 
 class coolerLDTformerZC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base:int = 500):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1169,7 +1180,8 @@ class coolerLDTformerZC(nn.Module):
         z: torch.Tensor,           # [B, L_total, D] - FLAT
         topo_embeds: torch.Tensor, # [B, L_total, Topo_Dim] - FLAT
         slot_mapping: torch.Tensor,
-        block_masks: Tuple[object, object] # Receives (Local, Global)
+        block_masks: Tuple[object, object],
+        scale: float = 1.0 # Receives (Local, Global)
     ) -> Tuple[torch.Tensor, float]:
         """
         Pure transformer pass. No span logic.
@@ -1185,7 +1197,7 @@ class coolerLDTformerZC(nn.Module):
         for i, layer in enumerate(self.layers):
             block_mask = mask_global if layer.is_global else mask_local
             x, aux = layer(x, topo_embeds,
-                          slot_mapping, block_mask)
+                          slot_mapping, block_mask, scale=scale)
             total_aux += aux
         x = self.final_norm(x)
         return x, total_aux
