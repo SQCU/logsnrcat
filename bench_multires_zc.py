@@ -876,58 +876,92 @@ def distill_nll(components, mode, buckets, steps=1000, logger=None):
             
     return pd.DataFrame(history)
 
-# lets get dumb in here
+# lets get a little less dumb in here
 def train_autoembed(components, mode, buckets, steps=1000, logger=None):
-    print(f"\n--- Training: {mode.upper()} embeddahs ---")
+    """
+    Pre-trains the Embedder and Unembedder as a Denoising-State Autoencoder.
+    
+    Goal: Identity Function z_t -> z_t.
+    Why:  Ensures the representation space can distinguish signal (x) from 
+          noise (eps) before the Transformer body tries to separate them.
+    """
+    print(f"\n--- Training: Auto-Encoder (Input Reconstruction) ---")
     model = components[0]
-    opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
-    scheduler_main = OneCycleLR(opt, max_lr=1e-4, total_steps=steps, 
+    # Higher LR is usually safe for shallow encoder/decoder networks
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+    scheduler_main = OneCycleLR(opt, max_lr=1e-3, total_steps=steps, 
                         pct_start=0.1, div_factor=10, final_div_factor=100)
     
     iterator = CompositeIterator(model.text_embed.weight.device, config={'checkerboard': 0.5, 'torus': 0.5})
     manager = BucketManager(buckets)
     history = []
     
-    pbar = tqdm(range(steps), desc=f"{mode}")
+    pbar = tqdm(range(steps), desc=f"train-ae")
     for i in pbar:
         opt.zero_grad()
         res, bs = manager.next_bucket()
         
+        # 1. Generate Input Data
         x0 = iterator.generate_batch(bs, res, num_tiles=4.0)
+        
+        # 2. Noise it (Cover full spectrum)
+        # We want the Embedder to work for Clean (-10 logsnr) AND Pure Noise (+10 logsnr)
+        # and everything in between.
         t = torch.rand(bs, device=x0.device).clamp(0.001, 0.999)
         logsnr = get_schedule(t)
         alpha, sigma = get_alpha_sigma(logsnr)
         
         eps = torch.randn_like(x0)
         z_t = x0 * alpha.view(-1,1,1,1) + eps * sigma.view(-1,1,1,1)
-        v_true = alpha.view(-1,1,1,1) * eps - sigma.view(-1,1,1,1) * x0
 
+        # 3. Embed (z_t + logsnr)
+        # The embedder sees the noisy latent and the noise level.
         base_spans = get_image_spans(res)
-
-        z_flat, span_objects, topo_embeds = run_embed_step(components, 
-        z_t, logsnr, base_spans)
-        #we have to do this funky two stage spatial reduction if we want to log inner features of a batch's loss.
-        #imagine if we'd been socialized into using wandb instead of writing python like this... damn...
-        loss_ae = compute_autoembed_loss(components, x0, eps).mean(dim=[1,2,3])
-        # regularization to try to make lsnr fields at least more representable...
-        loss_unembed = compute_unembed_loss(components, z_flat, span_objects, logsnr)
-        total_loss = loss_ae.mean()+0.001*loss_unembed
+        
+        # Use helper (embeds to flat tokens)
+        z_flat, span_objects, _ = run_embed_step(components, z_t, logsnr, base_spans)
+        
+        # 4. Unembed (tokens -> reconstruction)
+        # Note: We bypass the transformer entirely. z_flat goes straight to decode.
+        recon_z, recon_logsnr = run_unembed_step(z_flat, span_objects)
+        
+        # 5. Compute Identity Loss
+        # A. Image Reconstruction: The output should look exactly like the NOISY input z_t
+        #    This forces the bottleneck to preserve "grain".
+        loss_img = F.mse_loss(recon_z, z_t)
+        
+        # B. Metadata Reconstruction: The model should know what logsnr it's looking at
+        #    (The Unembedder has a head for this).
+        if logsnr.dim() == 1:
+            target_logsnr = logsnr.view(bs, 1, 1, 1).expand_as(recon_logsnr)
+        else:
+            target_logsnr = logsnr
+            
+        loss_meta = F.mse_loss(recon_logsnr, target_logsnr)
+        
+        # Total Loss
+        total_loss = loss_img + 0.1 * loss_meta
                 
         total_loss.backward()
         opt.step()
         scheduler_main.step()
 
-        step_stats = {'step': i, 'res': res, 'loss_total': total_loss.item()}
-        if hasattr(iterator, 'last_labels') and hasattr(iterator, 'label_map'):
-            labels = iterator.last_labels
-            for lbl_idx, lbl_name in iterator.label_map.items():
-                mask = (labels == lbl_idx)
-                if mask.any():
-                    step_stats[f'loss_{lbl_name}'] = loss_ae[mask].mean().item()
+        # Logging
+        step_stats = {
+            'step': i, 
+            'res': res, 
+            'loss_total': total_loss.item(),
+            'loss_img': loss_img.item(),
+            'loss_meta': loss_meta.item()
+        }
         
         history.append(step_stats)
         if i % 100 == 0:
-            pbar.set_postfix({'loss': f'{total_loss.item():.4f}', 'lae':f'{loss_ae.mean().item()}', 'res': res})
+            pbar.set_postfix({
+                'mse': f'{loss_img.item():.4f}', 
+                'meta': f'{loss_meta.item():.4f}', 
+                'res': res
+            })
             
     return pd.DataFrame(history)
 
