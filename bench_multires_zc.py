@@ -996,10 +996,10 @@ if __name__ == "__main__":
     # 4. Sample BEFORE distillation
     for res in RESOLUTIONS:
         eval_config = {
-            'res': 32,
+            'res': res,
             'num_samples': 8,
-            'min_logsnr': -14.0, # Very noisy
-            'max_logsnr': -1.0,  # Partially clean
+            'min_logsnr': -4.0, # Very noisy
+            'max_logsnr': 1.0,  # Partially clean
         }
     
         model.param_load(params_naive)
@@ -1052,7 +1052,7 @@ if __name__ == "__main__":
     samples_after = []
     for res in RESOLUTIONS:
         eval_config = {
-            'res': 32,
+            'res': res,
             'num_samples': 8,
             'min_logsnr': -4.0, # Very noisy
             'max_logsnr': 1.0,  # Partially clean

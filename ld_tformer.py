@@ -310,7 +310,7 @@ class FourierScaleDecoder(nn.Module):
         # f: [..., Fourier_Dim]
         # We assume the network predicts Log(Lambda) or similar, 
         # but here we just return the raw scalar output.
-        return torch.exp(self.net(f))
+        return self.net(f)
 
 # latent unembedding units
 
@@ -428,7 +428,7 @@ class ContextualPatchUnembedder(nn.Module):
         #i don't care if 256 is too big, having magic numbers is bad
         # dubious dubious dubious!!! be careful!!!
         self.logsnr_decoder = FourierScaleDecoder(fourier_dim, hidden_dim=embed_dim, output_dim=1)
-        self.lambda_head = nn.Linear(embed_dim, 1)
+        #self.lambda_head = nn.Linear(embed_dim, 1)
         self.param_init()
 
     def param_init(self):
@@ -436,7 +436,7 @@ class ContextualPatchUnembedder(nn.Module):
             block.param_init()
         init_layer_norm(self.output_proj[0])
         init_linear(self.output_proj[1])
-        init_linear(self.lambda_head)
+        #init_linear(self.lambda_head)
         self.logsnr_decoder.param_init()
 
     def forward(
@@ -477,8 +477,10 @@ class ContextualPatchUnembedder(nn.Module):
         # 3. Reconstruct LogSNR
         # [L, F] -> [L, 1]
         #oopsie woopsie this prohibited negative logsnr outputs, never program while sleepy
-        #logsnr_pred = self.logsnr_decoder(fourier_part)
-        logsnr_pred = self.lambda_head(z)
+        #but only because of an exp() call!
+        logsnr_pred = self.logsnr_decoder(fourier_part)
+        #single linear layer, in contrast, produces loss:1 fitted models in both the nll and factorized vpred case!
+        #logsnr_pred = self.lambda_head(z)
         
         # Reshape to grid [1, GH, GW]
         logsnr_grid = logsnr_pred.view(GH, GW).unsqueeze(0)
