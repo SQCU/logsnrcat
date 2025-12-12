@@ -755,12 +755,84 @@ def compute_consistency_loss(components, x0, spans, mode='factorized', min_logsn
     z_end_coarse = euler_reverse_step(z_start, v_start_coarse, l_start, l_end)
     
     # 2. fine (Start -> Mid -> End)
-    z_mid_fine = euler_reverse_step(z_start, v_start_coarse, l_start, l_mid)
-    v_mid_fine, aux2, _ = predict_velocity_field(components, z_mid_fine, l_mid, spans, mode)
-    z_end_fine = euler_reverse_step(z_mid_fine, v_mid_fine, l_mid, l_end)
+    with torch.no_grad():
+        z_mid_fine = euler_reverse_step(z_start, v_start_coarse, l_start, l_mid)
+        v_mid_fine, aux2, _ = predict_velocity_field(components, z_mid_fine, l_mid, spans, mode)
+        z_end_fine = euler_reverse_step(z_mid_fine, v_mid_fine, l_mid, l_end)
     
     loss = F.mse_loss(z_end_coarse, z_end_fine.detach())
     return loss, aux1 + aux2, lambda: None
+
+def compute_trajectory_variance_loss(components, x0_batch, rollout_steps=2, K=2):
+    """
+    x0_batch: [B, C, H, W] - Distinct clean images
+    K: Number of noise variations per image
+    """
+    model, _, _, _, _ = components
+    B, C, H, W = x0_batch.shape
+    device = x0_batch.device
+    
+    # 1. Expand Batch: [B, K, C, H, W] -> [B*K, C, H, W]
+    # We repeat each image K times to form groups
+    x0_expanded = x0_batch.unsqueeze(1).repeat(1, K, 1, 1, 1).view(B*K, C, H, W)
+    
+    # 2. Add Noise (Autoregressive Start Point)
+    # Use a single time t for the whole batch for fair comparison
+    t_val = torch.rand(1, device=device).item()
+    # We want t to be in the "learning zone" (not 0, not 1)
+    t_val = 0.3 + 0.5 * t_val 
+    
+    t = torch.full((B*K,), t_val, device=device)
+    logsnr = get_schedule(t)
+    a, s = logsnr_to_alpha_sigma(logsnr)
+    
+    # Distinct epsilons for every item
+    eps = torch.randn_like(x0_expanded)
+    z_curr = x0_expanded * a.view(-1,1,1,1) + eps * s.view(-1,1,1,1)
+    
+    # 3. Autoregressive Rollout (The Memory Cost)
+    # We take 'rollout_steps' Euler steps. 
+    # Gradients flow through the whole chain.
+    dt = 1.0 / 32.0 # Small fixed step size
+    
+    for _ in range(rollout_steps):
+        # Predict v
+        logsnr_curr = get_schedule(t) # assuming t doesn't change much or using step logic
+        
+        # Note: We must pass 'naive' or 'factorized' based on training phase
+        # Let's assume naive for generic structure, or pass as arg
+        v_pred, _, _ = predict_velocity_field(components, z_curr, logsnr_curr, 
+                                              get_image_spans(H), mode='factorized')
+        
+        # Euler Step (z_next = z - v * dt approx)
+        # Simplified Euler for trajectory regularization (direction matters more than exact ODE)
+        # We simulate moving "towards data" (denoising direction)
+        # z_next = z_curr - v_pred * dt 
+        # (This is a rough proxy for the ODE, sufficient for manifold shaping)
+        z_curr = z_curr - v_pred * dt
+    
+    # 4. Compute Variances
+    # Reshape back to [B, K, -1]
+    z_groups = z_curr.view(B, K, -1)
+    
+    # A. Intra-Group Variance (Consistency)
+    # Variance along dim=1 (the K views of the same image)
+    # We want these to be TIGHT (low variance)
+    # "Different noise, same image -> Same output"
+    intra_var = z_groups.var(dim=1).mean()
+    
+    # B. Inter-Group Variance (Diversity)
+    # Variance of the *means* of the groups
+    # We want these to be WIDE (high variance)
+    # "Different images -> Different outputs"
+    group_means = z_groups.mean(dim=1) # [B, -1]
+    inter_var = group_means.var(dim=0).mean()
+    
+    # 5. Ratio Loss (Pull-Push)
+    # Add epsilon to denominator for stability
+    loss_manifold = intra_var / (inter_var + 1e-6)
+    
+    return loss_manifold
 
 def distill_multires(components, mode, buckets, steps=1000, logger=None):
     print(f"\n--- Distilling: {mode.upper()} ---")
@@ -796,7 +868,7 @@ def distill_multires(components, mode, buckets, steps=1000, logger=None):
         v_pred, aux_loss, _ = predict_velocity_field(components, z_t, l_den, spans, mode)
         loss_d = F.mse_loss(v_pred, v_t)
         
-        loss_t = (1.0+loss_c) * 1.0 * loss_d + aux_loss + aux_loss_con
+        loss_t = loss_d + 0.5*loss_c + aux_loss + aux_loss_con
         loss_t.backward()
         opt.step()
         scheduler_main.step()
@@ -1088,7 +1160,8 @@ if __name__ == "__main__":
     """
     
     BUCKETS = [(16, 64), (32, 32)]
-    STEPS = 1000
+    AE_STEPS = 2000
+    STEPS = 3000
     DISTILL_STEPS = 1000
     RESOLUTIONS = [16, 32]
     
@@ -1141,7 +1214,7 @@ if __name__ == "__main__":
     # 2. Run A (Naive)
     print("🚀 Run A: Naive")
     model.param_init()
-    df_n_ae = train_autoembed(components, 'naive', BUCKETS, STEPS, logger)
+    df_n_ae = train_autoembed(components, 'naive', BUCKETS, AE_STEPS, logger)
     df_n = train_multires(components, 'naive', BUCKETS, STEPS, logger)
     params_naive = model.dump() 
     
@@ -1149,7 +1222,7 @@ if __name__ == "__main__":
     print("🚀 Run B: Factorized")
     model.flush()
     model.param_init()
-    df_f_ae = train_autoembed(components, 'factorized', BUCKETS, STEPS, logger)
+    df_f_ae = train_autoembed(components, 'factorized', BUCKETS, AE_STEPS, logger)
     df_f = train_multires(components, 'factorized', BUCKETS, STEPS, logger)
     params_fact = model.dump()
     
