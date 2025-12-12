@@ -66,6 +66,8 @@ This project uses `uv` for fast and reliable dependency management.
     
     but also newer and harder datasets for unconditional unsupervised in-context-learning.
 
+    converges like 10x faster for some reason? please don't ask me to explain i tried to find the pessimization in the old script and couldn't find it.
+
 5. **why low resolution checkerboards?**
 
     technically speaking this project is testing 2 hard things:

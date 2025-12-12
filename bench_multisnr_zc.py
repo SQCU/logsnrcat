@@ -678,19 +678,31 @@ if __name__ == "__main__":
             'noise_mode': 'uniform',
             'noise_params': {'min_snr': -4.0, 'max_snr': 2.0}
         },
+        'split_checker': {
+            'type': 'checkerboard',
+            'ratio': 0.6,
+            'noise_mode': 'split',
+            'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 30.0}
+        },
         'split_torus': {
             'type': 'torus',
             'ratio': 0.6,
             'noise_mode': 'split',
-            'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 30.0}
+            'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 270.0}
+        },
+        'uniform_torus': {
+            'type': 'torus',
+            'ratio': 0.6,
+            'noise_mode': 'uniform',
+            'noise_params': {'min_snr': -5.0, 'max_snr': 5.0}
         }
     }
 
     base_config = {
-        'ae_steps': 1000,
-        'steps': 1000,
-        'distill_steps': 1000,
-        'buckets': [(16, 64), (32, 32)],
+        'ae_steps': 2000,
+        'steps': 3000,
+        'distill_steps': 0,
+        'buckets': [(16, 128), (32, 64), (64, 16)],
         'lambda_coeff': 0.2, # Regularization strength for lambda reconstruction
         'dataset_mix': dataset_mix
     }
@@ -723,11 +735,13 @@ if __name__ == "__main__":
 
     # Sample A
     print("🎨 Sampling Naive (Post-Train)...")
-    res_n_strat = sample_viz_dset(components, val_iterator, {'mode':'naive', 'res':32})
-    plot_dset_reconstruction(res_n_strat, logger, "naive_train_stratified")
-    
-    res_n_split = sample_viz_split_topology(components, val_iterator, {'mode':'naive', 'res':32})
-    plot_dset_reconstruction(res_n_split, logger, "naive_train_split", show_map=True)
+    sample_res = [32, 64]
+    for res in sample_res:
+        res_n_strat = sample_viz_dset(components, val_iterator, {'mode':'naive', 'res':res})
+        plot_dset_reconstruction(res_n_strat, logger, f"naive_train_stratified_{res}")
+        
+        res_n_split = sample_viz_split_topology(components, val_iterator, {'mode':'naive', 'res':res})
+        plot_dset_reconstruction(res_n_split, logger, f"naive_train_split_{res}", show_map=True)
 
     # --- Run B: Factorized Mode ---
     print("🚀 Starting Run B: Factorized")
@@ -741,17 +755,21 @@ if __name__ == "__main__":
     
     # Sample B
     print("🎨 Sampling Factorized (Post-Train)...")
-    res_f_strat = sample_viz_dset(components, val_iterator, {'mode':'factorized', 'res':32})
-    plot_dset_reconstruction(res_f_strat, logger, "factorized_train_stratified")
-    
-    res_f_split = sample_viz_split_topology(components, val_iterator, {'mode':'factorized', 'res':32})
-    plot_dset_reconstruction(res_f_split, logger, "factorized_train_split", show_map=True)
+    sample_res = [32, 64]
+    for res in sample_res:
+        res_f_strat = sample_viz_dset(components, val_iterator, {'mode':'factorized', 'res':res})
+        plot_dset_reconstruction(res_f_strat, logger, f"factorized_train_stratified_{res}")
+        
+        res_f_split = sample_viz_split_topology(components, val_iterator, {'mode':'factorized', 'res':res})
+        plot_dset_reconstruction(res_f_split, logger, f"factorized_train_split_{res}", show_map=True)
 
     # --- Plotting ---
     print("\n📈 Plotting Results...")
     plot_losses(df_train_n, df_train_f, logger, metric='loss_v', title='Velocity Prediction Loss (MSE)')
     plot_losses(df_train_n, df_train_f, logger, metric='loss_lambda', title='Lambda Reconstruction Loss (L1)')
     
+    #distillation is stinky, makes models collapse on image-semantics-unrelated outputs with extreme consistency
+    """
     # --- Distillation (Optional) ---
     print("\n🔮 Distillation Phase...")
     model.param_load(params_n)
@@ -769,5 +787,5 @@ if __name__ == "__main__":
     plot_dset_reconstruction(res_fd, logger, "factorized_distill_stratified")
     
     plot_losses(df_dist_n, df_dist_f, logger, metric='loss_cons', title='Consistency Loss')
-
+    """
     print(f"\n✅ Experiment Complete. Results in {logger.run_dir}")
