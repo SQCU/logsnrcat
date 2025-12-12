@@ -470,12 +470,201 @@ def plot_losses(df_naive, df_fact, logger, metric='loss_total', title='Training 
     logger.save_figure(fig, f"plot_{metric}")
 
 # ==============================================================================
+# 6. Sampling & Visualization Tools
+# ==============================================================================
+
+@torch.no_grad()
+def sample_viz_dset(components, iterator, config):
+    """
+    Stratified Sampling using the Spatial Solver.
+    Generates items with random global noise levels, then solves them all to clean.
+    """
+    model, _, _, _, _ = components
+    model.eval()
+    
+    res = config.get('res', 32)
+    n_samples = config.get('num_samples', 8)
+    mode = config.get('mode', 'naive')
+    device = model.text_embed.weight.device
+    
+    # 1. Get Data (Ignore iterator noise, we generate our own stratification)
+    x0, _ = iterator.generate_batch(n_samples, res, num_tiles=4.0)
+    
+    # 2. Generate Stratified Start Conditions
+    min_snr = config.get('min_logsnr', -4.0)
+    max_snr = config.get('max_logsnr', 1.0)
+    
+    # [B] -> [B, 1, H, W]
+    start_vals = torch.rand(n_samples, device=device) * (max_snr - min_snr) + min_snr
+    start_vals, sort_idx = torch.sort(start_vals)
+    x0 = x0[sort_idx]
+    
+    logsnr_start_map = start_vals.view(n_samples, 1, 1, 1).expand(-1, -1, res, res)
+    
+    # 3. Noise Data
+    alpha, sigma = logsnr_to_alpha_sigma(logsnr_start_map)
+    eps = torch.randn_like(x0)
+    z_start = x0 * alpha + eps * sigma
+    
+    # 4. Solve
+    # Everyone marches from their specific start_snr to +10.0
+    z_final = spatial_euler_solver(
+        components, 
+        z_start, 
+        logsnr_start_map, 
+        target_logsnr=10.0, 
+        steps=50, 
+        mode=mode, 
+        config=config
+    )
+    
+    model.train()
+    
+    mse = F.mse_loss(z_final, x0, reduction='none').mean(dim=[1,2,3])
+    
+    return {
+        'x0': x0,
+        'noisy_input': z_start, # For viz
+        'reconstruction': z_final,
+        'mse': mse,
+        'start_snr': start_vals
+    }
+
+@torch.no_grad()
+def sample_viz_split_topology(components, iterator, config):
+    """
+    Split-Screen / Spatial Noise Test.
+    Uses the iterator's complex spatial logsnr_map as the starting condition.
+    """
+    model, _, _, _, _ = components
+    model.eval()
+    
+    res = config.get('res', 32)
+    n_samples = config.get('num_samples', 8)
+    mode = config.get('mode', 'naive')
+    
+    # 1. Get Data AND Spatial Map from Iterator
+    x0, logsnr_start_map = iterator.generate_batch(n_samples, res, num_tiles=4.0)
+    
+    # 2. Noise Data (Spatially!)
+    alpha, sigma = logsnr_to_alpha_sigma(logsnr_start_map)
+    eps = torch.randn_like(x0)
+    z_start = x0 * alpha + eps * sigma
+    
+    # 3. Solve
+    # The 'Noisy' pixels traverse from -5 to +10.
+    # The 'Clean' pixels traverse from +2 to +10.
+    # The solver handles the interpolation per-pixel.
+    z_final = spatial_euler_solver(
+        components, 
+        z_start, 
+        logsnr_start_map, 
+        target_logsnr=10.0, 
+        steps=50, 
+        mode=mode, 
+        config=config
+    )
+    
+    model.train()
+    
+    return {
+        'x0': x0,
+        'noisy_input': z_start,
+        'reconstruction': z_final,
+        'logsnr_map': logsnr_start_map
+    }
+
+@torch.no_grad()
+def spatial_euler_solver(components, z, logsnr_start_map, target_logsnr, steps, mode, config):
+    """
+    Generalized Euler solver that handles spatially varying schedules.
+    Interpolates PER-PIXEL from logsnr_start_map[b,1,y,x] to target_logsnr.
+    
+    This handles:
+    1. Global Schedules (start_map is uniform)
+    2. Stratified Schedules (start_map is uniform per batch item, distinct across batch)
+    3. Split-Screen/Inpainting (start_map varies spatially)
+    """
+    B, C, H, W = z.shape
+    device = z.device
+    base_spans = get_image_spans(H) 
+
+    # Ensure target is broadcastable [B, 1, H, W]
+    if isinstance(target_logsnr, (float, int)):
+        target_map = torch.full_like(logsnr_start_map, target_logsnr)
+    else:
+        target_map = target_logsnr
+
+    # Time parameter tau: 0.0 -> 1.0
+    # We simply interpolate the LOGSNR linearly from Start -> End.
+    # (You could curve this, but linear in logSNR is standard)
+    taus = torch.linspace(0.0, 1.0, steps + 1, device=device)
+
+    # Logging for visualization if needed
+    # trajectory = [z.cpu().clone()]
+
+    for i in range(steps):
+        tau_curr = taus[i]
+        tau_next = taus[i+1]
+
+        # Interpolate Schedule
+        # Current LogSNR map: [B, 1, H, W]
+        lsnr_curr = (1 - tau_curr) * logsnr_start_map + tau_curr * target_map
+        
+        # Next LogSNR map
+        lsnr_next = (1 - tau_next) * logsnr_start_map + tau_next * target_map
+
+        # Predict Velocity Field at current spatial noise level
+        v_pred, _, _ = predict_velocity(components, z, lsnr_curr, base_spans, mode)
+
+        # Spatial Euler Step
+        # euler_reverse_step handles broadcasting internally
+        z = euler_reverse_step(z, v_pred, lsnr_curr, lsnr_next)
+        
+    return z.clamp(0, 1)
+
+def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False):
+    x0 = result_dict['x0'].cpu()
+    noisy = result_dict['noisy_input'].cpu()
+    recon = result_dict['reconstruction'].cpu()
+    
+    cols = 4 if show_map else 3
+    n = x0.shape[0]
+    fig, axes = plt.subplots(n, cols, figsize=(3*cols, 2 * n))
+    if n == 1: axes = axes.reshape(1, -1)
+    
+    for i in range(n):
+        # GT
+        axes[i, 0].imshow(x0[i].permute(1,2,0).numpy())
+        axes[i, 0].axis('off')
+        if i==0: axes[i,0].set_title("Ground Truth")
+        
+        # Input
+        axes[i, 1].imshow(noisy[i].permute(1,2,0).clamp(0,1).numpy())
+        axes[i, 1].axis('off')
+        if i==0: axes[i,1].set_title("Noisy Input")
+        
+        # Output
+        axes[i, 2].imshow(recon[i].permute(1,2,0).numpy())
+        axes[i, 2].axis('off')
+        if i==0: axes[i,2].set_title("Reconstruction")
+        
+        if show_map:
+            lmap = result_dict['logsnr_map'][i].squeeze().cpu().numpy()
+            axes[i, 3].imshow(lmap, cmap='viridis')
+            axes[i, 3].axis('off')
+            if i==0: axes[i,3].set_title("Split Map")
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+# ==============================================================================
 # 5. Main Execution
 # ==============================================================================
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision('high')
-    logger = ExperimentLogger(output_dir="./experiments_refactor")
+    logger = ExperimentLogger(output_dir="./experiments_mix")
     device = torch.device('cuda')
 
     # --- Configuration ---
@@ -493,7 +682,7 @@ if __name__ == "__main__":
             'type': 'torus',
             'ratio': 0.6,
             'noise_mode': 'split',
-            'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 45.0}
+            'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 30.0}
         }
     }
 
@@ -520,6 +709,9 @@ if __name__ == "__main__":
     
     components = (model, span_emb, span_unemb, None, page_table)
 
+    # Iterator for Validation Sampling
+    val_iterator = CompositeIterator(device, config=dataset_mix)
+
     # --- Run A: Naive Mode ---
     print("🚀 Starting Run A: Naive")
     model.param_init()
@@ -528,7 +720,15 @@ if __name__ == "__main__":
     df_ae_n = train_autoembed(components, config_n)
     df_train_n = train_denoise(components, config_n)
     params_n = model.dump()
+
+    # Sample A
+    print("🎨 Sampling Naive (Post-Train)...")
+    res_n_strat = sample_viz_dset(components, val_iterator, {'mode':'naive', 'res':32})
+    plot_dset_reconstruction(res_n_strat, logger, "naive_train_stratified")
     
+    res_n_split = sample_viz_split_topology(components, val_iterator, {'mode':'naive', 'res':32})
+    plot_dset_reconstruction(res_n_split, logger, "naive_train_split", show_map=True)
+
     # --- Run B: Factorized Mode ---
     print("🚀 Starting Run B: Factorized")
     model.flush()
@@ -538,6 +738,14 @@ if __name__ == "__main__":
     df_ae_f = train_autoembed(components, config_f)
     df_train_f = train_denoise(components, config_f)
     params_f = model.dump()
+    
+    # Sample B
+    print("🎨 Sampling Factorized (Post-Train)...")
+    res_f_strat = sample_viz_dset(components, val_iterator, {'mode':'factorized', 'res':32})
+    plot_dset_reconstruction(res_f_strat, logger, "factorized_train_stratified")
+    
+    res_f_split = sample_viz_split_topology(components, val_iterator, {'mode':'factorized', 'res':32})
+    plot_dset_reconstruction(res_f_split, logger, "factorized_train_split", show_map=True)
 
     # --- Plotting ---
     print("\n📈 Plotting Results...")
@@ -549,8 +757,16 @@ if __name__ == "__main__":
     model.param_load(params_n)
     df_dist_n = distill_consistency(components, config_n)
     
+    print("🎨 Sampling Naive (Post-Distill)...")
+    res_nd = sample_viz_dset(components, val_iterator, {'mode':'naive', 'res':32})
+    plot_dset_reconstruction(res_nd, logger, "naive_distill_stratified")
+    
     model.param_load(params_f)
     df_dist_f = distill_consistency(components, config_f)
+    
+    print("🎨 Sampling Factorized (Post-Distill)...")
+    res_fd = sample_viz_dset(components, val_iterator, {'mode':'factorized', 'res':32})
+    plot_dset_reconstruction(res_fd, logger, "factorized_distill_stratified")
     
     plot_losses(df_dist_n, df_dist_f, logger, metric='loss_cons', title='Consistency Loss')
 
