@@ -37,6 +37,7 @@ dependencies = [
     "matplotlib",
     #"pytorch3d",
     'xxhash',
+    "av", #ffmpeg bindings?
     #pytorch3d is fictional
     #crimes against nature
     "pyzmq",

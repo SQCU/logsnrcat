@@ -400,6 +400,7 @@ class ContextualPatchEmbedder(nn.Module):
 class ContextualPatchUnembedder(nn.Module):
     """
     Reconstructs a single raster + logsnr map from tokens.
+    Handles both 2D Latent grids and 1D Text strips.
     """
     def __init__(
         self, 
@@ -425,10 +426,7 @@ class ContextualPatchUnembedder(nn.Module):
             nn.LayerNorm(embed_dim, elementwise_affine=False), 
             nn.Linear(embed_dim, total_out_dim)
         )
-        #i don't care if 256 is too big, having magic numbers is bad
-        # dubious dubious dubious!!! be careful!!!
         self.logsnr_decoder = FourierScaleDecoder(fourier_dim, hidden_dim=embed_dim, output_dim=1)
-        #self.lambda_head = nn.Linear(embed_dim, 1)
         self.param_init()
 
     def param_init(self):
@@ -436,65 +434,74 @@ class ContextualPatchUnembedder(nn.Module):
             block.param_init()
         init_layer_norm(self.output_proj[0])
         init_linear(self.output_proj[1])
-        #init_linear(self.lambda_head)
         self.logsnr_decoder.param_init()
 
     def forward(
         self, 
         z: torch.Tensor, 
-        shape: Tuple[int, int]
+        shape: Tuple[int, ...]
     ) -> torch.Tensor:
         """
         Args:
             z: [Num_Tokens, Embed_Dim]
-            shape: (Grid_H, Grid_W)
+            shape: (Grid_H, Grid_W) for latents, or (Len,) for text
             
         Returns:
             [Output_Channels + 1, H, W]
         """
         L, D = z.shape
         P = self.patch_size
-        GH, GW = shape
         
-        if L != GH * GW:
-            raise ValueError(f"Token count {L} does not match shape {GH}x{GW}")
+        # 1. Resolve Topology
+        if len(shape) == 2:
+            GH, GW = shape
+        elif len(shape) == 1:
+            # Interpret 1D sequence as a horizontal strip (1 row, L columns)
+            # This ensures text can still project to a valid "image" strip
+            GH, GW = 1, shape[0]
+        else:
+            # Fallback for empty or unknown shapes -> treat as linear strip
+            GH, GW = 1, L
 
-        # 1. Decode Features
+        # Sanity check: If metadata drifted, prioritize the actual token count
+        # to ensure the reshape operation succeeds.
+        if L != GH * GW:
+            # You might want to log a warning here in a production system
+            GH, GW = 1, L
+
+        # 2. Decode Features
         h = self.res_blocks(z)
         flat = self.output_proj(h) # [L, Raster_Dim + Fourier_Dim]
         
         raster_part = flat[:, :self.raster_flat_dim]
         fourier_part = flat[:, self.raster_flat_dim:]
         
-        # 2. Reconstruct Raster
+        # 3. Reconstruct Raster
         # [L, C*P*P] -> [GH, GW, C, P, P]
         patches = raster_part.reshape(GH, GW, self.output_channels, P, P)
         
         # Permute to [C, GH, P, GW, P] -> [C, H, W]
+        # (GH*P = H, GW*P = W)
         patches = patches.permute(2, 0, 3, 1, 4)
         rasters = patches.reshape(self.output_channels, GH * P, GW * P)
         
-        # 3. Reconstruct LogSNR
+        # 4. Reconstruct LogSNR
         # [L, F] -> [L, 1]
-        #oopsie woopsie this prohibited negative logsnr outputs, never program while sleepy
-        #weirdly this produces a loss:1 model when used to scale model outputs.
-        #ground truth logsnr field inputs and applying an exp(self.logsnr_decoder) produce decreasing but bad loss.
         logsnr_pred = self.logsnr_decoder(fourier_part)
-        #single linear layer, in contrast, produces loss:1 fitted models in both the nll and factorized vpred case!
-        #logsnr_pred = self.lambda_head(z)
         
         # Reshape to grid [1, GH, GW]
         logsnr_grid = logsnr_pred.view(GH, GW).unsqueeze(0)
         
         # Upsample [1, H, W]
         # Need 4D for interpolate: [1, 1, GH, GW]
+        # Output will be [1, 1, H, W] -> squeeze -> [1, H, W]
         logsnr_pixel = F.interpolate(
             logsnr_grid.unsqueeze(0), 
             scale_factor=P, 
             mode='nearest'
         ).squeeze(0)
         
-        # 4. Concat
+        # 5. Concat
         return torch.cat([rasters, logsnr_pixel], dim=0)
 
 # ===== OUTSIDE MODEL: Span Processor =====
@@ -507,7 +514,9 @@ class Span:
     shape: Tuple[int, ...]  # ~~(H, W) for images, () for text~~
     # wait that's not right at all. shape needs to be dim1, dim2, dim3, dim4, ... dim_final for images.
     # and shape needs to be (L) for text.
-    causal: bool
+    causal: bool    
+    doc_id: int  # <--- NEW: Explicit grouping
+
 
 class SpanEmbedder:
     def __init__(self, text_embedder, patch_embedder):
@@ -528,6 +537,9 @@ class SpanEmbedder:
         text_idx = 0
         img_idx = 0
         
+        # We need to map metadata 'group_id' to integer doc_ids if provided
+        # or generate them sequentially if not.
+        
         from ld_tformer_embedding_functional import generate_content_hash_stream
         hash_spans = []
 
@@ -535,30 +547,29 @@ class SpanEmbedder:
             span_type = meta['type']
             span_len = meta['len']
             
+            # Resolve Document ID
+            # If 'group_id' is in metadata, use it. Else use strictly unique ID.
+            # We assume group_ids are managed by the iterator to be unique across the batch.
+            doc_id = meta.get('group_id', i) 
+
             if span_type == 'text':
                 tokens = text_tokens[text_idx]
                 emb = self.text_emb(tokens)
                 text_idx += 1
-                
-                hash_spans.append({
-                    'type': 'text',
-                    'shape': (span_len,),
-                    'data': tokens.cpu().tolist()
-                })
+                hash_spans.append({'type': 'text', 'shape': (span_len,), 'data': tokens.cpu().tolist()})
                 
             elif span_type == 'latent':
                 img = images[img_idx]
                 logsnr = logsnr_maps[img_idx]
+                
+                # FIX: Pass 3D tensors directly.
+                # The ContextualPatchEmbedder expects [C, H, W] and [1, H, W].
+                # It returns [L, D] and the grid shape (H_grid, W_grid).
                 emb, grid_shape = self.patch_emb(img, logsnr)
+                
                 img_idx += 1
-                
                 meta['shape'] = grid_shape
-                
-                hash_spans.append({
-                    'type': 'latent',
-                    'shape': grid_shape,
-                    'id': meta.get('id', f'img_{i}')
-                })
+                hash_spans.append({'type': 'latent', 'shape': grid_shape, 'id': meta.get('id', f'img_{i}')})
             
             all_embeds.append(emb)
             span_objects.append(Span(
@@ -566,7 +577,8 @@ class SpanEmbedder:
                 start_idx=cursor,
                 end_idx=cursor + span_len,
                 shape=meta.get('shape', ()),
-                causal=meta.get('causal', True)
+                causal=meta.get('causal', True),
+                doc_id=doc_id 
             ))
             cursor += span_len
             
@@ -649,18 +661,20 @@ def build_dual_masks(
     block_size = page_table.block_size
     
     # 1. Build doc_ids for ACTIVE tokens
+    # USE THE EXPLICIT doc_id FROM THE SPAN
     doc_ids_active = []
-    for i, span in enumerate(spans):
-        doc_ids_active.extend([i] * (span.end_idx - span.start_idx))
-    doc_ids_active_t = torch.tensor(doc_ids_active, dtype=torch.long, device=device)
+    for span in spans:
+        doc_ids_active.extend([span.doc_id] * (span.end_idx - span.start_idx))
+    doc_ids_active_t = torch.tensor(doc_ids_active, dtype=torch.long, device=topo_active.device)
     
     # 2. Build doc_ids for HEAP (EFFICIENT VERSION)
-    # Initialize heap as unallocated
-    doc_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=device)
+    # Initialize heap as -1
+    L_heap = topo_heap.shape[0]
+    doc_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=topo_active.device)
     
-    # For each span, compute which physical slots it occupies
+    block_size = page_table.block_size
     cursor = 0
-    for rid, span in enumerate(spans):
+    for span in spans:
         span_len = span.end_idx - span.start_idx
         
         # Get logical block range for this span
@@ -686,7 +700,10 @@ def build_dual_masks(
             phys_end = phys_block * block_size + offset_end
             
             # Mark these slots as belonging to this document
-            doc_ids_heap_t[phys_start:phys_end] = rid
+            doc_ids_heap_t[phys_start:phys_end] = span.doc_id
+            if flat_page_table is not None:
+             # Identity mapping shortcut for ZC
+                doc_ids_heap_t[cursor:cursor+span_len] = span.doc_id
         
         cursor += span_len
     

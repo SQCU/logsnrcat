@@ -100,49 +100,49 @@ def get_image_spans(resolution):
 # 2. Model Wrappers & Sampling
 # ==============================================================================
 
-def run_model_forward(components, z, logsnr_map, spans):
+def run_model_forward(components, z_list, logsnr_list, spans):
     """
-    Low-level wrapper: Embedding -> Transformer -> Unembedding.
-    Returns raw outputs (v_raw, pred_logsnr) and aux_loss.
+    Unified forward pass for heterogeneous lists of tensors.
+    
+    Args:
+        z_list: List[Tensor] of shape [C, H, W]
+        logsnr_list: List[Tensor] of shape [1, H, W]
+        spans: List[Dict] (metadata objects)
+        
+    Returns:
+        decoded: List[Dict] keys=['image_vpreds', 'image_logsnrs', ...]
+        aux_loss: Tensor (scalar)
     """
     model, span_embedder, span_unembedder, _, page_table = components
-    B = z.shape[0]
-    device = z.device
+    device = model.text_embed.weight.device 
     
-    # 1. Metadata Construction
-    batch_spans_meta = []
-    images = [z[i] for i in range(B)]
-    # Handle spatial logsnr broadcasting for the embedder list
-    logsnr_list = [logsnr_map[i] for i in range(B)]
-    
-    for i in range(B):
-        item_spans = [s.copy() for s in spans]
-        for s in item_spans: s['id'] = f"req_{i}"
-        batch_spans_meta.extend(item_spans)
-        
-    # 2. Embed
+    # 1. Embed (Pass lists directly to SpanEmbedder)
+    # SpanEmbedder handles the iteration and mixed-resolution logic
     z_flat, span_objects, _ = span_embedder.embed(
-        batch_spans_meta, 
-        text_tokens=[None]*B, 
-        images=images, 
+        spans, 
+        text_tokens=[None]*len(spans), 
+        images=z_list, 
         logsnr_maps=logsnr_list
     )
     
-    # 3. Topology
-    topo_embeds, _ = render_topology_embeddings(batch_spans_meta, 3, device)
+    # 2. Topology
+    topo_embeds, _ = render_topology_embeddings(spans, 3, device)
     
-    # 4. Masking (ZC Mode - Identity Heap)
+    # 3. Masking (ZC Mode)
+    # Construct Identity Page Table for the flat buffer
     L_total = z_flat.shape[0]
     block_size = page_table.block_size
     num_blocks = (L_total + block_size - 1) // block_size
     flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
     
+    # Note: build_dual_masks must support span.doc_id for causal blocking
     block_masks = build_dual_masks(
         span_objects, topo_embeds, topo_embeds,
         page_table, flat_page_table, None
     )
     
-    # 5. Transformer
+    # 4. Transformer
+    # Auto-scale RoPE base for very long sequences (e.g. video batches)
     base_ref_len = 64.0
     rope_scale = max(1.0, L_total / base_ref_len)
     
@@ -154,34 +154,42 @@ def run_model_forward(components, z, logsnr_map, spans):
         scale=rope_scale
     )
     
-    # 6. Unembed
+    # 5. Unembed
+    # Returns list of dicts because output resolutions vary
     decoded = span_unembedder.decode(z_out.squeeze(0), span_objects)
     
-    # Stack results
-    v_raw = torch.stack([d['image_vpreds'] for d in decoded])
-    pred_logsnr = torch.stack([d['image_logsnrs'] for d in decoded])
-    
-    return v_raw, pred_logsnr, aux_loss
+    return decoded, aux_loss
 
-def predict_velocity(components, z, logsnr_map, spans, mode='naive'):
+def predict_velocity_list(components, z_list, logsnr_list, spans, mode='naive'):
     """
-    High-level prediction logic.
-    Applies factorization if mode='factorized'.
-    Returns final velocity, predicted logsnr (for loss), and aux loss.
-    """
-    v_raw, pred_logsnr, aux_loss = run_model_forward(components, z, logsnr_map, spans)
+    High-level prediction wrapper for lists.
+    Applies factorization scaling if needed.
     
-    if mode == 'factorized':
-        # Factorized: v_final = v_raw * sigma(predicted_noise_level)
-        # This allows the model to output 'direction' and 'magnitude' separately
-        sigma_p = torch.sqrt(torch.sigmoid(-pred_logsnr))
-        v_final = v_raw * sigma_p
-    else:
-        # Naive: v_raw is the velocity.
-        # Note: We still return pred_logsnr because we want to train it!
-        v_final = v_raw
+    Returns:
+        v_final_list: List[Tensor] [3, H, W]
+        pred_logsnr_list: List[Tensor] [1, H, W]
+        aux_loss: scalar
+    """
+    decoded, aux_loss = run_model_forward(components, z_list, logsnr_list, spans)
+    
+    v_final_list = []
+    pred_logsnr_list = []
+    
+    for d in decoded:
+        v_raw = d['image_vpreds']   # [3, H, W]
+        pred_l = d['image_logsnrs'] # [1, H, W]
         
-    return v_final, pred_logsnr, aux_loss
+        if mode == 'factorized':
+            # Apply sigma scaling
+            sigma_p = torch.sqrt(torch.sigmoid(-pred_l))
+            v_final = v_raw * sigma_p
+        else:
+            v_final = v_raw
+            
+        v_final_list.append(v_final)
+        pred_logsnr_list.append(pred_l)
+        
+    return v_final_list, pred_logsnr_list, aux_loss
 
 @torch.no_grad()
 def autoregressive_sample_loop(components, x0_shape, config):
@@ -291,50 +299,66 @@ def train_autoembed(components, config, logger=None):
     return pd.DataFrame(history)
 
 def train_denoise(components, config, logger=None):
-    """
-    Phase 1: Flow Matching / Diffusion Training.
-    Handles 'Naive' and 'Factorized' modes via config.
-    """
     mode = config['mode']
     steps = config['steps']
-    buckets = config['buckets']
     lambda_coeff = config.get('lambda_coeff', 0.2)
     
-    print(f"\n--- Training: Denoise ({mode.upper()}) ---")
+    print(f"\n--- Training: Denoise ({mode.upper()}) [Unified List Mode] ---")
+    
+    # Setup
     model = components[0]
     opt = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.1)
     scheduler = OneCycleLR(opt, max_lr=5e-4, total_steps=steps, pct_start=0.1)
     
+    # Iterator now expected to implement generate_batch_list
     iterator = CompositeIterator(model.text_embed.weight.device, config=config['dataset_mix'])
-    manager = BucketManager(buckets)
-    history = []
     
+    # We define a helper to get batch size from config or manager
+    # Assuming config['buckets'] exists or we pick a fixed BS for list mode
+    bs = 8 
+    
+    history = []
     pbar = tqdm(range(steps), desc=f"train-{mode}")
+    
     for i in pbar:
         opt.zero_grad()
-        res, bs = manager.next_bucket()
         
-        # 1. Data (Spatial Noise Map included!)
-        x0, logsnr_map = iterator.generate_batch(bs, res, num_tiles=4.0)
+        # 1. Get Unified Data Lists
+        # images_list: List[Tensor], logsnrs_list: List[Tensor], spans_meta: List[Dict]
+        # (This supports mix of 32px, 64px, single images, sequences, etc.)
+        images_list, logsnrs_list, spans_meta = iterator.generate_batch_list(bs)
         
-        # 2. Noise
-        z_t, v_true, _ = euler_forward_step(x0, logsnr_map)
+        # 2. Noise Injection (Map over list)
+        z_t_list = []
+        v_true_list = []
         
-        # 3. Predict
-        base_spans = get_image_spans(res)
-        v_pred, pred_logsnr, aux_loss = predict_velocity(components, z_t, logsnr_map, base_spans, mode)
+        for img, lsnr in zip(images_list, logsnrs_list):
+            # euler_forward_step handles broadcasting if lsnr is [1, H, W]
+            z, v, _ = euler_forward_step(img, lsnr)
+            z_t_list.append(z)
+            v_true_list.append(v)
+            
+        # 3. Model Prediction
+        v_pred_list, pred_logsnr_list, aux_loss = predict_velocity_list(
+            components, z_t_list, logsnrs_list, spans_meta, mode
+        )
         
-        # 4. Losses
-        # A. Velocity Matching (MSE or NLL)
-        # For simplicity, using MSE. If probabilistic needed, switch to NLL here.
-        loss_v = F.mse_loss(v_pred, v_true)
+        # 4. Loss Computation
+        total_loss_v = 0.0
+        total_loss_lam = 0.0
+        count = len(v_pred_list)
         
-        # B. Lambda Reconstruction (Anti-Cheat / Grounding)
-        # Even Naive mode trains this, though it doesn't use it for v scaling.
-        # This ensures the model "knows" the noise level.
-        loss_lambda = F.l1_loss(pred_logsnr, logsnr_map)
+        for idx in range(count):
+            # MSE on Velocity
+            total_loss_v += F.mse_loss(v_pred_list[idx], v_true_list[idx])
+            
+            # L1 on Lambda (Grounding)
+            total_loss_lam += F.l1_loss(pred_logsnr_list[idx], logsnrs_list[idx])
+            
+        loss_v = total_loss_v / count
+        loss_lam = total_loss_lam / count
         
-        total_loss = loss_v + lambda_coeff * loss_lambda + aux_loss
+        total_loss = loss_v + lambda_coeff * loss_lam + aux_loss
         
         total_loss.backward()
         opt.step()
@@ -342,15 +366,15 @@ def train_denoise(components, config, logger=None):
         
         # 5. Logging
         stats = {
-            'step': i, 'res': res,
+            'step': i, 
             'loss_total': total_loss.item(),
             'loss_v': loss_v.item(),
-            'loss_lambda': loss_lambda.item()
+            'loss_lambda': loss_lam.item()
         }
         history.append(stats)
         
         if i % 100 == 0:
-            pbar.set_postfix({'v': f'{loss_v.item():.4f}', 'lam': f'{loss_lambda.item():.4f}'})
+            pbar.set_postfix({'v': f'{loss_v.item():.4f}', 'lam': f'{loss_lam.item():.4f}'})
             
     return pd.DataFrame(history)
 
@@ -575,53 +599,203 @@ def sample_viz_split_topology(components, iterator, config):
     }
 
 @torch.no_grad()
-def spatial_euler_solver(components, z, logsnr_start_map, target_logsnr, steps, mode, config):
+def sample_viz_causal_prefix(components, iterator, config):
     """
-    Generalized Euler solver that handles spatially varying schedules.
-    Interpolates PER-PIXEL from logsnr_start_map[b,1,y,x] to target_logsnr.
+    Tests Causal Prefix Generation:
+    1. Grabs a sequence (e.g. 4 frames).
+    2. Pins frames 0..N-1 as Clean Context (Prefix).
+    3. Noises frame N (Suffix).
+    4. Solves frame N while attending to the fixed Prefix.
+    """
+    model, _, _, _, _ = components
+    model.eval()
     
-    This handles:
-    1. Global Schedules (start_map is uniform)
-    2. Stratified Schedules (start_map is uniform per batch item, distinct across batch)
-    3. Split-Screen/Inpainting (start_map varies spatially)
-    """
-    B, C, H, W = z.shape
-    device = z.device
-    base_spans = get_image_spans(H) 
+    # Config
+    mode = config.get('mode', 'naive')
+    res = config.get('res', 32)
+    seq_len = 4
+    n_sequences = 2 # Total batches
+    suffix_idx = 3 # The index to generate (0-based) -> Last frame
+    
+    # 1. Get Data (Unified List)
+    # We request a specific sequence structure from the video iterator if available
+    # Or just grab items and chunk them if using the generic iterator
+    # Assuming iterator returns a flat list where every `seq_len` items are a group.
+    
+    # Hack: Force iterator to give us sequences if it's a Video iterator
+    # For CompositeIterator, we rely on the config passed during init to produce sequences.
+    # Here we assume the iterator produces coherent blocks.
+    
+    flat_images, flat_logsnrs, _ = iterator.generate_batch_list(n_sequences * seq_len)
+    
+    # We only care about the images, we will synthesize our own noise maps for the test
+    # Chunk into sequences
+    sequences = [flat_images[i:i+seq_len] for i in range(0, len(flat_images), seq_len)]
+    
+    results = []
+    
+    for seq_idx, seq_imgs in enumerate(sequences):
+        if len(seq_imgs) < seq_len: continue 
+        
+        # Setup Lists for Solver
+        z_init_list = []
+        logsnr_start_list = []
+        fixed_data_list = [] # None = Evolve, Tensor = Pin
+        
+        device = seq_imgs[0].device
+        
+        for t, img in enumerate(seq_imgs):
+            if t < suffix_idx:
+                # --- PREFIX (Context) ---
+                # State: Clean Image
+                z_init_list.append(img) 
+                
+                # Noise Map: "Clean" (High SNR) implies we trust this input
+                # We start it at Target SNR so the solver doesn't try to move it much anyway,
+                # but 'fixed_data' ensures it stays bit-exact.
+                l_map = torch.full((1, img.shape[1], img.shape[2]), 10.0, device=device)
+                logsnr_start_list.append(l_map)
+                
+                # Constraint: PIN THIS
+                fixed_data_list.append(img)
+                
+            else:
+                # --- SUFFIX (Target) ---
+                # State: Random Noise
+                # We need to construct the noise level we WANT to start solving from.
+                start_snr = -4.0 # Standard noisy starting point
+                
+                l_map = torch.full((1, img.shape[1], img.shape[2]), start_snr, device=device)
+                logsnr_start_list.append(l_map)
+                
+                # Create noisy latent z_T
+                alpha, sigma = logsnr_to_alpha_sigma(l_map)
+                eps = torch.randn_like(img)
+                z_t = img * alpha + eps * sigma # Or just pure noise if alpha~0
+                
+                z_init_list.append(z_t)
+                
+                # Constraint: None (Let it evolve)
+                fixed_data_list.append(None)
+        
+        # Run Solver on this sequence group
+        # The solver processes the list as one "batch" of distinct items
+        # but the attention masking (via spans/group_id) binds them.
+        z_final_list = spatial_euler_solver(
+            components, 
+            z_init_list, 
+            logsnr_start_list, 
+            target_logsnr=10.0, 
+            steps=50, 
+            mode=mode, 
+            config=config,
+            fixed_data=fixed_data_list # <--- The magic key
+        )
+        
+        # Store result (just the target frame vs GT)
+        target_gt = seq_imgs[suffix_idx]
+        target_recon = z_final_list[suffix_idx]
+        
+        results.append({
+            'gt': target_gt,
+            'recon': target_recon,
+            'context': seq_imgs[suffix_idx-1] # Previous frame for Ref
+        })
+        
+        if len(results) >= n_sequences: break
 
-    # Ensure target is broadcastable [B, 1, H, W]
-    if isinstance(target_logsnr, (float, int)):
-        target_map = torch.full_like(logsnr_start_map, target_logsnr)
-    else:
-        target_map = target_logsnr
+    # Plot
+    fig, axes = plt.subplots(len(results), 3, figsize=(10, 4*len(results)))
+    if len(results) == 1: axes = axes.reshape(1, -1)
+    
+    for i, res in enumerate(results):
+        # 1. Context (Last Prefix Frame)
+        axes[i, 0].imshow(res['context'].permute(1,2,0).cpu().numpy())
+        axes[i, 0].set_title("Context (Frame t-1)")
+        axes[i, 0].axis('off')
+        
+        # 2. GT Target
+        axes[i, 1].imshow(res['gt'].permute(1,2,0).cpu().numpy())
+        axes[i, 1].set_title("Ground Truth (Frame t)")
+        axes[i, 1].axis('off')
+        
+        # 3. Generated Target
+        axes[i, 2].imshow(res['recon'].permute(1,2,0).cpu().numpy())
+        axes[i, 2].set_title("Generated (Frame t)")
+        axes[i, 2].axis('off')
+        
+    model.train()
+    return fig
+
+@torch.no_grad()
+def spatial_euler_solver(components, z_list, logsnr_start_list, target_logsnr, steps, mode, config, fixed_data=None):
+    """
+    Unified solver for Tensors OR Lists of Tensors.
+    Supports 'Fixed' latents for Inpainting/Prefix generation.
+    
+    Args:
+        z_list: List[Tensor] (Initial state, mixed noise)
+        logsnr_start_list: List[Tensor] (Starting noise map per item)
+        fixed_data: Optional List[Tensor]. If an entry is NOT None, that latent 
+                    is reset to this value at every step (e.g. clean prefix).
+    """
+    device = z_list[0].device
+    # Create base spans for the resolutions present in the list
+    # (Recomputed per step effectively via predict_velocity wrapper, but we need resolution metadata)
+    # Actually, predict_velocity_list constructs spans internally or expects them.
+    # We need to construct spans for the current z state.
+    
+    # Pre-compute spans since resolution doesn't change during sampling
+    from bench_multires_zc import get_image_spans # Ensure available
+    spans_meta = []
+    for i, z in enumerate(z_list):
+        H = z.shape[-1]
+        spans_meta.append({
+            'type': 'latent', 'len': (H//2)**2, 'shape': (H//2, H//2), 
+            'causal': True, 'group_id': i, 'id': f"sample_{i}"
+        })
 
     # Time parameter tau: 0.0 -> 1.0
-    # We simply interpolate the LOGSNR linearly from Start -> End.
-    # (You could curve this, but linear in logSNR is standard)
     taus = torch.linspace(0.0, 1.0, steps + 1, device=device)
 
-    # Logging for visualization if needed
-    # trajectory = [z.cpu().clone()]
+    # Helper to broadcast target
+    def get_target_map(start_map):
+        if isinstance(target_logsnr, (float, int)):
+            return torch.full_like(start_map, target_logsnr)
+        return target_logsnr # Assume tensor match
+
+    target_maps = [get_target_map(m) for m in logsnr_start_list]
 
     for i in range(steps):
         tau_curr = taus[i]
         tau_next = taus[i+1]
 
-        # Interpolate Schedule
-        # Current LogSNR map: [B, 1, H, W]
-        lsnr_curr = (1 - tau_curr) * logsnr_start_map + tau_curr * target_map
-        
-        # Next LogSNR map
-        lsnr_next = (1 - tau_next) * logsnr_start_map + tau_next * target_map
+        # 1. Interpolate Schedule (Per Item)
+        lsnr_curr_list = []
+        lsnr_next_list = []
+        for start, end in zip(logsnr_start_list, target_maps):
+            lsnr_curr_list.append((1 - tau_curr) * start + tau_curr * end)
+            lsnr_next_list.append((1 - tau_next) * start + tau_next * end)
 
-        # Predict Velocity Field at current spatial noise level
-        v_pred, _, _ = predict_velocity(components, z, lsnr_curr, base_spans, mode)
+        # 2. Predict Velocity (Unified List Pass)
+        v_pred_list, _, _ = predict_velocity_list(components, z_list, lsnr_curr_list, spans_meta, mode)
 
-        # Spatial Euler Step
-        # euler_reverse_step handles broadcasting internally
-        z = euler_reverse_step(z, v_pred, lsnr_curr, lsnr_next)
+        # 3. Spatial Euler Step & Constraint Enforcement
+        z_next_list = []
+        for idx, (z, v, l_curr, l_next) in enumerate(zip(z_list, v_pred_list, lsnr_curr_list, lsnr_next_list)):
+            
+            # Check Constraint: If this frame is fixed (Prefix), don't step it.
+            if fixed_data is not None and fixed_data[idx] is not None:
+                # Keep it pinned to the ground truth/clean state
+                z_next_list.append(fixed_data[idx])
+            else:
+                # Update Suffix
+                z_new = euler_reverse_step(z, v, l_curr, l_next)
+                z_next_list.append(z_new)
         
-    return z.clamp(0, 1)
+        z_list = z_next_list
+        
+    return [z.clamp(0, 1) for z in z_list]
 
 def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False):
     x0 = result_dict['x0'].cpu()
@@ -674,35 +848,76 @@ if __name__ == "__main__":
     dataset_mix = {
         'uniform_checker': {
             'type': 'checkerboard',
-            'ratio': 0.4,
+            'ratio': 0.2,
             'noise_mode': 'uniform',
             'noise_params': {'min_snr': -4.0, 'max_snr': 2.0}
         },
         'split_checker': {
             'type': 'checkerboard',
-            'ratio': 0.6,
+            'ratio': 0.3,
             'noise_mode': 'split',
             'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 30.0}
         },
         'split_torus': {
             'type': 'torus',
-            'ratio': 0.6,
+            'ratio': 0.3,
             'noise_mode': 'split',
             'noise_params': {'min_snr': -5.0, 'max_snr': 2.0, 'angle_range_deg': 270.0}
         },
         'uniform_torus': {
             'type': 'torus',
-            'ratio': 0.6,
+            'ratio': 0.2,
             'noise_mode': 'uniform',
             'noise_params': {'min_snr': -5.0, 'max_snr': 5.0}
+        },
+        'video_causal_zoom': {
+        'type': 'video',  # Triggers VideoFolderIterator
+        'ratio': 0.8,     
+        
+        # Dataset-specific parameters passed to the Iterator
+        'params': {
+            'path': "C:/dox/recordings/rl_capture/capture_run_1760343426/videos",  # Absolute or Relative path
+            
+            # The heart of the causal architecture:
+            # Defines a single sequence of 4 frames [t-3, t-2, t-1, t]
+            'sequence_structure': [
+                # --- Context Frames (Past) ---
+                # Low Res (32px), High SNR (Clean-ish), Mild Split Topology
+                # These provide semantic grounding without burning compute on pixels.
+                {
+                    'res': 32, 
+                    'noise_mode': 'split', 
+                    'noise_params': {'min_snr': 2.0, 'max_snr': 6.0, 'angle_range_deg': 15.0}
+                },
+                {
+                    'res': 32, 
+                    'noise_mode': 'split', 
+                    'noise_params': {'min_snr': 2.0, 'max_snr': 6.0, 'angle_range_deg': 15.0}
+                },
+                {
+                    'res': 32, 
+                    'noise_mode': 'split', 
+                    'noise_params': {'min_snr': 2.0, 'max_snr': 6.0, 'angle_range_deg': 15.0}
+                },
+                
+                # --- Target Frame (Present) ---
+                # High Res (64px), Full Noise Range, Aggressive Split Topology
+                # This is the actual denoising task.
+                {
+                    'res': 64, 
+                    'noise_mode': 'split', 
+                    'noise_params': {'min_snr': -5.0, 'max_snr': 5.0, 'angle_range_deg': 45.0}
+                }
+            ]
         }
+    },
     }
 
     base_config = {
-        'ae_steps': 2000,
-        'steps': 3000,
+        'ae_steps': 500,
+        'steps': 1000,
         'distill_steps': 0,
-        'buckets': [(16, 128), (32, 64), (64, 16)],
+        'buckets': [(16, 64), (32, 32), (64, 8)],
         'lambda_coeff': 0.2, # Regularization strength for lambda reconstruction
         'dataset_mix': dataset_mix
     }
@@ -710,7 +925,7 @@ if __name__ == "__main__":
     # --- Model Init ---
     print("🔧 Initializing ZC Model Stack...")
     embed_dim = 256
-    model = coolerLDTformer(dim=embed_dim, depth=8, num_heads=8, topo_dim=3).to(device)
+    model = coolerLDTformer(dim=embed_dim, depth=4, num_heads=8, topo_dim=3).to(device)
     model = torch.compile(model, dynamic=True)
     
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
@@ -743,6 +958,12 @@ if __name__ == "__main__":
         res_n_split = sample_viz_split_topology(components, val_iterator, {'mode':'naive', 'res':res})
         plot_dset_reconstruction(res_n_split, logger, f"naive_train_split_{res}", show_map=True)
 
+        # Requires a video iterator config
+        if 'video_causal_zoom' in dataset_mix: # Or whatever key you used
+            print("🎨 Sampling Prefix Sequence (Video)...")
+            fig_prefix = sample_viz_causal_prefix(components, val_iterator, {'mode':'naive'})
+            logger.save_figure(fig_prefix, f"naive_video_prefix_generation_{res}")
+
     # --- Run B: Factorized Mode ---
     print("🚀 Starting Run B: Factorized")
     model.flush()
@@ -762,6 +983,12 @@ if __name__ == "__main__":
         
         res_f_split = sample_viz_split_topology(components, val_iterator, {'mode':'factorized', 'res':res})
         plot_dset_reconstruction(res_f_split, logger, f"factorized_train_split_{res}", show_map=True)
+
+        # Requires a video iterator config
+        if 'video_causal_zoom' in dataset_mix: # Or whatever key you used
+            print("🎨 Sampling Prefix Sequence (Video)...")
+            fig_prefix = sample_viz_causal_prefix(components, val_iterator, {'mode':'factorized'})
+            logger.save_figure(fig_prefix, "factorized_video_prefix_generation_{res}")
 
     # --- Plotting ---
     print("\n📈 Plotting Results...")

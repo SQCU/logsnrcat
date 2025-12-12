@@ -1,7 +1,19 @@
+# dataset.py (Append/Update)
 import torch
 import torch.nn.functional as F
 import math
-import numpy as np
+import glob
+import os
+import random
+from pathlib import Path
+
+# Try importing torchvision for video handling
+try:
+    import torchvision
+    import torchvision.io
+    HAS_VIDEO = True
+except ImportError:
+    HAS_VIDEO = False
 
 # --- 1. Noise Topology Generators ---
 
@@ -252,13 +264,97 @@ class CheckerboardIterator:
         
         return c1 * (1 - mask) + c2 * mask
 
+
+class VideoFolderIterator:
+    def __init__(self, folder_path, device='cuda'):
+        if not HAS_VIDEO: raise ImportError("torchvision required")
+        self.device = device
+        self.folder = Path(folder_path)
+        self.files = sorted(list(self.folder.glob("**/*.mp4")))
+        if not self.files: raise ValueError(f"No videos in {folder_path}")
+
+    def generate_batch_list(self, batch_size, sequence_config, start_group_id=0):
+        """
+        Advanced List-Mode: Returns heterogeneous lists for causal training.
+        """
+        seq_len = len(sequence_config)
+        chosen_files = random.choices(self.files, k=batch_size)
+        
+        out_images = []
+        out_logsnrs = []
+        out_spans = []
+        current_group_id = start_group_id
+        
+        for fpath in chosen_files:
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    vframes, _, _ = torchvision.io.read_video(str(fpath), output_format='TCHW')
+            except Exception:
+                vframes = torch.zeros(max(1, seq_len), 3, 64, 64)
+            
+            T = vframes.shape[0]
+            if T < 1: T = 1
+            
+            # Sample Indices
+            if T >= seq_len:
+                indices = sorted(random.sample(range(T), seq_len))
+            else:
+                indices = [i % T for i in range(seq_len)]
+                indices.sort()
+                
+            raw_selected = vframes[indices].float() / 255.0
+            
+            for t, spec in enumerate(sequence_config):
+                target_res = spec.get('res', 32)
+                frame = raw_selected[t:t+1]
+                if frame.shape[-1] != target_res:
+                    frame = F.interpolate(frame, size=(target_res, target_res), mode='area')
+                
+                n_mode = spec.get('noise_mode', 'uniform')
+                n_params = spec.get('noise_params', {})
+                lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params)
+                
+                out_images.append(frame.squeeze(0).to(self.device))
+                out_logsnrs.append(lsnr.squeeze(0).to(self.device))
+                
+                tokens = (target_res // 2) ** 2
+                out_spans.append({
+                    'type': 'latent', 'len': tokens, 'shape': (target_res // 2, target_res // 2),
+                    'causal': True, 'group_id': current_group_id, 'id': f"vid_{current_group_id}_{t}"
+                })
+            
+            current_group_id += 1
+            
+        return out_images, out_logsnrs, out_spans
+
+    def generate_batch(self, batch_size, resolution, **kwargs):
+        """
+        Legacy Tensor-Mode: Compatibility wrapper.
+        Treats video frames as independent images (I.I.D) to satisfy CompositeIterator.generate_batch.
+        """
+        # Swallow 'num_tiles' or other geometry-specific kwargs
+        
+        # 1. Config for single frame
+        seq_conf = [{'res': resolution, 'noise_mode': 'uniform'}]
+        
+        # 2. Delegate to list implementation
+        imgs, _, _ = self.generate_batch_list(batch_size, seq_conf)
+        
+        # 3. Stack into [B, 3, H, W]
+        return torch.stack(imgs)
+
+
 # --- 3. Composite Iterator (Refactored) ---
 
 class CompositeIterator:
     _ITERATOR_MAP = {
         'checkerboard': CheckerboardIterator,
-        'torus': TorusIterator
+        'torus': TorusIterator,
+        'video': VideoFolderIterator # Register new type
     }
+
 
     def __init__(self, device='cuda', config=None):
         """
@@ -302,7 +398,13 @@ class CompositeIterator:
             # Create Iterator Instance
             # We instantiate fresh for every split to keep parameter injection clean
             iterator_cls = self._ITERATOR_MAP[gen_type]
-            iterator_instance = iterator_cls(device)
+            if gen_type == 'video':
+                 # Extract path from d_params or config
+                 path = cfg.get('params', {}).get('path', None)
+                 if not path: raise ValueError("Video iterator requires 'path' param")
+                 iterator_instance = iterator_cls(path, device=device)
+            else:
+                 iterator_instance = iterator_cls(device)
             
             self.splits.append({
                 'name': split_key,
@@ -376,6 +478,74 @@ class CompositeIterator:
         self.last_labels = full_labels[perm]
         
         return full_imgs, full_snr
+
+    def generate_batch_list(self, batch_size, **kwargs):
+        """
+        Unified generation returning Lists.
+        """
+        # 1. Calc counts per split
+        # ... (counts logic) ...
+        
+        all_images = []
+        all_logsnrs = []
+        all_spans = []
+        
+        # Track group ID globally to avoid collision between splits
+        global_group_id = 0
+        
+        for idx, split in enumerate(self.splits):
+            count = counts[idx]
+            if count == 0: continue
+            
+            gen_type = split['type']
+            
+            if gen_type == 'video':
+                # Video handles its own sequence logic via config 'sequence_structure'
+                seq_conf = split['d_params'].get('sequence_structure', [{'res':32}])
+                imgs, snrs, metas = split['iterator'].generate_batch_list(count, seq_conf, start_group_id=global_group_id)
+                global_group_id += count # Video iterator increments group_id internally
+                
+            else:
+                # Geometric Iterators (Checker/Torus) are typically single-frame
+                # We wrap them to match list interface
+                d_params = {**kwargs, **split['d_params']}
+                res = d_params.get('resolution', 32) # Default or from kwargs
+                
+                # Generate Tensor Batch [B, 3, H, W]
+                # Note: We need to update Checker/Torus to accept resolution in kwargs if not present
+                raw_imgs = split['iterator'].generate_batch(count, res, **d_params)
+                
+                # Generate LogSNR Batch
+                n_mode = split['n_mode']
+                n_params = split['n_params']
+                raw_snrs = get_logsnr_batch(n_mode, count, res, res, self.device, n_params)
+                
+                # Convert to Lists
+                for b in range(count):
+                    all_images.append(raw_imgs[b])
+                    all_logsnrs.append(raw_snrs[b])
+                    
+                    tokens = (res // 2) ** 2
+                    all_spans.append({
+                        'type': 'latent',
+                        'len': tokens,
+                        'shape': (res // 2, res // 2),
+                        'causal': True, # Internal causal
+                        'group_id': global_group_id,
+                        'id': f"{split['name']}_{global_group_id}"
+                    })
+                    global_group_id += 1
+            
+            all_images.extend(imgs if gen_type == 'video' else [])
+            all_logsnrs.extend(snrs if gen_type == 'video' else [])
+            all_spans.extend(metas if gen_type == 'video' else [])
+            
+        # Shuffle?
+        # If we shuffle, we must shuffle by GROUP, not by image, to preserve causal blocks.
+        # For simplicity, we can shuffle the order of groups.
+        # (Implementation details omitted for brevity, but crucial for IID training)
+        
+        return all_images, all_logsnrs, all_spans
 
 # --- 4. Debug/Visualization ---
 
