@@ -54,6 +54,18 @@ This project uses `uv` for fast and reliable dependency management.
 
     in case you wanted vllm at home that you can backwards() through
 
+    `bench_multires_zc.py`
+
+    zero copy block-masked attention to unify batch and sequence dimensions. 
+
+    this makes mixed resolution training and interleaved sampling/eval SUPER FAST.
+
+    `bench_multisnr_zc.py`
+
+    regularizations to stop logsnr output field collapse. 
+    
+    but also newer and harder datasets for unconditional unsupervised in-context-learning.
+
 5. **why low resolution checkerboards?**
 
     technically speaking this project is testing 2 hard things:
