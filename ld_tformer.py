@@ -404,6 +404,8 @@ class ContextBlock:
     logsnr: Optional[torch.Tensor] = None # [1, H, W]
     group_id: int = 0
     id: str = ""
+        # NEW FIELD
+    source: str = "unknown" 
 
     def __post_init__(self):
         if not self.shape_meta:

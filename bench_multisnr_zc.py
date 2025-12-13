@@ -275,7 +275,7 @@ def train_autoembed(components, config, logger=None):
         total_loss.backward()
         opt.step(); scheduler.step()
         
-        history.append({'step': i, 'loss_ae': loss_img.item() if count else 0})
+        history.append({'step': i,'loss': loss_img.item(), 'loss_ae': loss_img.item() if count else 0})
         if i % 100 == 0: pbar.set_postfix({'ae': f'{loss_img:.4f}'})
             
     return pd.DataFrame(history)
@@ -297,7 +297,7 @@ def train_denoise(components, config, logger=None):
         # 1. Clean Data
         clean_blocks = iterator.generate_batch_list(bs)
         
-        # 2. Noise
+        # 2. Noise Injection
         noisy_blocks = []
         targets_v = []
         targets_l = []
@@ -305,35 +305,80 @@ def train_denoise(components, config, logger=None):
         for b in clean_blocks:
             if b.type == 'latent':
                 z, v, _ = euler_forward_step(b.content, b.logsnr)
+                # Pass source/id/metadata through to noisy block
                 noisy_blocks.append(ContextBlock(
                     content=z, logsnr=b.logsnr, type='latent', causal=b.causal,
-                    shape_meta=b.shape_meta, group_id=b.group_id, id=b.id
+                    shape_meta=b.shape_meta, group_id=b.group_id, id=b.id,
+                    source=getattr(b, 'source', 'unknown') # Capture source tag
                 ))
                 targets_v.append(v)
                 targets_l.append(b.logsnr)
             else:
-                noisy_blocks.append(b) # Text
+                noisy_blocks.append(b)
                 
         # 3. Predict
         v_preds, l_preds, aux = predict_velocity_from_blocks(components, noisy_blocks, mode)
         
-        # 4. Loss
-        loss_v = 0.0; loss_lam = 0.0; count = 0
-        for j, (vp, lp) in enumerate(zip(v_preds, l_preds)):
+        # 4. Loss & Harvest
+        loss_v_accum = 0.0
+        loss_lam_accum = 0.0
+        valid_samples = 0
+        step_stats = []
+        
+        # Iterate over results to compute gradient AND harvest stats
+        for j, (block, vp, lp) in enumerate(zip(noisy_blocks, v_preds, l_preds)):
             if vp is not None:
-                loss_v += F.mse_loss(vp, targets_v[count])
-                loss_lam += F.l1_loss(lp, targets_l[count])
-                count += 1 # targets indices match only latent blocks
+                # -- A. Velocity Loss (Exploded View) --
+                # [C, H, W] -> [C, H, W]
+                # Calculate elementwise squared error
+                sq_err_v = F.mse_loss(vp,targets_v[valid_samples], reduction="none")
+                
+                # 1. For Gradient (Mean Reduction)
+                loss_val = sq_err_v.mean()
+                loss_v_accum += loss_val
+                
+                # 2. For Stats (Variance + Detached Mean)
+                # We harvest the "shape" of the error distribution for this item
+                stat_mse = loss_val.detach().item()
+                stat_var = sq_err_v.var().detach().item()
+                
+                # -- B. Lambda Loss --
+                loss_lam_val = F.l1_loss(lp, targets_l[valid_samples])
+                loss_lam_accum += loss_lam_val
+                
+                # -- C. Metadata Extraction --
+                # Calculate resolution area
+                h_res = block.shape_meta[0] * block.shape_meta[1]
+                # Mean LogSNR (Time proxy)
+                h_lsnr = targets_l[valid_samples].mean().item()
+                
+                step_stats.append({
+                    'step': i,
+                    'source': getattr(block, 'source', 'unknown'),
+                    'resolution': h_res,
+                    'logsnr': h_lsnr,
+                    'loss': stat_mse,
+                    'loss_var': stat_var,
+                    'loss_lambda': loss_lam_val.detach().item()
+                })
+                
+                valid_samples += 1
         
-        if count > 0:
-            loss_v /= count; loss_lam /= count
+        if valid_samples > 0:
+            loss_v_accum /= valid_samples
+            loss_lam_accum /= valid_samples
         
-        total_loss = loss_v + lambda_coeff * loss_lam + aux
+        total_loss = loss_v_accum + lambda_coeff * loss_lam_accum + aux
         total_loss.backward()
         opt.step(); scheduler.step()
         
-        history.append({'step': i, 'loss_v': loss_v, 'loss_lam': loss_lam})
-        if i % 100 == 0: pbar.set_postfix({'v': f'{loss_v:.4f}'})
+        # Extend history with per-item stats (Rows = Batch Size * Steps)
+        history.extend(step_stats)
+        
+        if i % 100 == 0: 
+            # Log average of this batch for progress bar
+            avg_v = sum(s['loss'] for s in step_stats) / max(1, len(step_stats))
+            pbar.set_postfix({'v': f'{avg_v:.4f}'})
             
     return pd.DataFrame(history)
 # ==============================================================================
@@ -380,6 +425,68 @@ def plot_losses(df_naive, df_fact, logger, metric='loss_total', title='Training 
     ax.set_yscale('log')
     ax.legend()
     logger.save_figure(fig, f"plot_{metric}")
+
+
+def plot_multimetric_analysis(df, logger, stringy="multimetric_analysis"):
+    """
+    Plots d_loss/d_feature (Time, Scale, Semantics, Uncertainty).
+    """
+    if df.empty: return
+    
+    # Pre-process: Bin LogSNR
+    # Create 20 bins for the noise schedule
+    df['snr_bin'] = pd.cut(df['logsnr'], bins=20)
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 1. d_loss / d_logsnr (The Diffusion Curve)
+    # Group by bin and take mean
+    snr_grouped = df.groupby('snr_bin', observed=True)['loss'].mean()
+    snr_x = [i.mid for i in snr_grouped.index]
+    axes[0,0].plot(snr_x, snr_grouped.values, marker='o', linewidth=2)
+    axes[0,0].set_title("d_loss / d_logsnr (Temporal Difficulty)")
+    axes[0,0].set_xlabel("LogSNR (Right=Clean, Left=Noisy)")
+    axes[0,0].set_ylabel("MSE Loss")
+    axes[0,0].grid(True, alpha=0.3)
+    axes[0,0].invert_xaxis() # Convention: Diffusion goes right to left (Clean->Noise) or vice versa. 
+                             # Usually High SNR (Clean) is easier.
+    
+    # 2. d_loss / d_resolution (Scale Invariance Check)
+    if 'resolution' in df.columns:
+        res_stats = df.groupby('resolution')['loss'].agg(['mean', 'std'])
+        axes[0,1].errorbar(res_stats.index, res_stats['mean'], yerr=res_stats['std'], 
+                           fmt='-o', capsize=5)
+        axes[0,1].set_title("d_loss / d_resolution (Spatial Scale)")
+        axes[0,1].set_xlabel("Tokens (H*W)")
+        axes[0,1].set_xscale('log')
+        axes[0,1].grid(True, alpha=0.3)
+
+    # 3. d_loss / d_source (Semantic Convergence)
+    # Rolling mean of loss per source over steps
+    for source, grp in df.groupby('source'):
+        # Resample/Smooth to avoid jagged lines if batch size is small
+        # We group by step first to get batch average, then roll
+        step_avg = grp.groupby('step')['loss'].mean()
+        smooth = step_avg.rolling(window=50, min_periods=1).mean()
+        axes[1,0].plot(smooth.index, smooth.values, label=source)
+        
+    axes[1,0].legend()
+    axes[1,0].set_title("d_loss / d_source (Semantic Convergence)")
+    axes[1,0].set_xlabel("Step")
+    axes[1,0].set_yscale('log')
+    axes[1,0].grid(True, alpha=0.3)
+
+    # 4. d_var / d_logsnr (Heteroscedasticity)
+    # Where is the model most uncertain about the *structure* of the error?
+    var_grouped = df.groupby('snr_bin', observed=True)['loss_var'].mean()
+    axes[1,1].plot([i.mid for i in var_grouped.index], var_grouped.values, color='orange', marker='s')
+    axes[1,1].set_title("Variance of Error / d_logsnr (Uncertainty)")
+    axes[1,1].set_xlabel("LogSNR")
+    axes[1,1].invert_xaxis()
+    axes[1,1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    logger.save_figure(fig, stringy)
 
 # ==============================================================================
 # 6. Sampling & Visualization Tools
@@ -444,8 +551,6 @@ def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_lo
         z_list = z_next_list
         
     return [z.clamp(0, 1) for z in z_list]
-
-
 
 @torch.no_grad()
 def sample_viz_dset(components, iterator, config):
@@ -697,7 +802,7 @@ if __name__ == "__main__":
 
     base_config = {
         'ae_steps': 500,
-        'steps': 1000,
+        'steps': 500,
         'distill_steps': 0,
         'buckets': [(16, 64), (32, 32), (64, 8)],
         'lambda_coeff': 0.2, # Regularization strength for lambda reconstruction
@@ -707,7 +812,7 @@ if __name__ == "__main__":
     # --- Model Init ---
     print("🔧 Initializing ZC Model Stack...")
     embed_dim = 256
-    model = coolerLDTformer(dim=embed_dim, depth=4, num_heads=8, topo_dim=3).to(device)
+    model = coolerLDTformer(dim=embed_dim, depth=16, num_heads=8, topo_dim=3).to(device)
     model = torch.compile(model, dynamic=True)
     
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
@@ -761,21 +866,25 @@ if __name__ == "__main__":
     sample_res = [32, 64]
     for res in sample_res:
         res_f_strat = sample_viz_dset(components, val_iterator, {'mode':'factorized', 'res':res})
-        plot_dset_reconstruction(res_f_strat, logger, f"factorized_train_stratified_{res}")
+        plot_dset_reconstruction(res_f_strat, logger, f"facto_train_stratified_{res}")
         
         res_f_split = sample_viz_split_topology(components, val_iterator, {'mode':'factorized', 'res':res})
-        plot_dset_reconstruction(res_f_split, logger, f"factorized_train_split_{res}", show_map=True)
+        plot_dset_reconstruction(res_f_split, logger, f"facto_train_split_{res}", show_map=True)
 
         # Requires a video iterator config
         if 'video_causal_zoom' in dataset_mix: # Or whatever key you used
             print("🎨 Sampling Prefix Sequence (Video)...")
-            fig_prefix = sample_viz_causal_prefix(components, val_iterator, {'mode':'factorized'})
-            logger.save_figure(fig_prefix, "factorized_video_prefix_generation_{res}")
+            fig_prefix = sample_viz_causal_prefix_fig(components, val_iterator, {'mode':'factorized'})
+            logger.save_figure(fig_prefix, f"facto_video_prefix_generation_{res}")
 
     # --- Plotting ---
     print("\n📈 Plotting Results...")
-    plot_losses(df_train_n, df_train_f, logger, metric='loss_v', title='Velocity Prediction Loss (MSE)')
+    plot_losses(df_train_n, df_train_f, logger, metric='loss', title='Velocity Prediction Loss (MSE)')
     plot_losses(df_train_n, df_train_f, logger, metric='loss_lambda', title='Lambda Reconstruction Loss (L1)')
+
+    print("\n📈 Plotting Multimetric Analysis...")
+    plot_multimetric_analysis(df_train_n, logger, stringy="multimetric_analysis_naive")
+    plot_multimetric_analysis(df_train_f, logger, stringy="multimetric_analysis_facto")
     
     #distillation is stinky, makes models collapse on image-semantics-unrelated outputs with extreme consistency
     """

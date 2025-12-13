@@ -369,44 +369,76 @@ class VideoFolderIterator:
         return indices
 
     def generate_batch_list(self, batch_size, sequence_config, start_group_id=0):
+        from concurrent.futures import ThreadPoolExecutor
+        
         seq_len = len(sequence_config)
         chosen_files = random.choices(self.files, k=batch_size)
-        out_blocks = []
-        current_group_id = start_group_id
         sampler_config = sequence_config[0].get('time_sampler', {})
 
-        for fpath in chosen_files:
+        # Define the worker function for a single video sequence
+        def fetch_sequence(args):
+            fpath, group_id = args
+            blocks = []
             try:
+                # 1. Open
                 decoder = safe_create_decoder(fpath, self.device)
                 total_frames = decoder.metadata.num_frames
-                if total_frames is None: continue
-            except Exception: continue
-
-            indices = self._sample_indices(total_frames, seq_len, sampler_config)
-            try:
+                if total_frames is None: return []
+                
+                # 2. Plan
+                indices = self._sample_indices(total_frames, seq_len, sampler_config)
+                
+                # 3. Decode (Heavy Lifting - happens in parallel now)
+                # Note: safe_create_decoder ensures data lands on self.device (GPU)
+                # Moving to GPU inside a thread is generally safe in PyTorch
                 raw_batch = decoder.get_frames_at(indices).data.float() / 255.0
-            except Exception: continue
+                
+                # 4. Resize & Pack
+                for t, (frame_raw, spec) in enumerate(zip(raw_batch, sequence_config)):
+                    target_res = spec.get('res', 32)
+                    if frame_raw.shape[-1] != target_res:
+                        frame = F.interpolate(
+                            frame_raw.unsqueeze(0), 
+                            size=(target_res, target_res), 
+                            mode='area'
+                        ).squeeze(0)
+                    else: 
+                        frame = frame_raw
+                    
+                    n_mode = spec.get('noise_mode', 'uniform')
+                    n_params = spec.get('noise_params', {})
+                    # Optimization: Generate logsnr on device, no CPU trip needed
+                    lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
+                    
+                    blocks.append(ContextBlock(
+                        content=frame,
+                        type='latent',
+                        causal=True,
+                        logsnr=lsnr,
+                        group_id=group_id,
+                        id=f"vid_{group_id}_{t}"
+                    ))
+                return blocks
+            except Exception as e:
+                # print(f"Fetch fail {fpath.name}: {e}") # Optional noise
+                return []
 
-            for t, (frame_raw, spec) in enumerate(zip(raw_batch, sequence_config)):
-                target_res = spec.get('res', 32)
-                if frame_raw.shape[-1] != target_res:
-                    frame = F.interpolate(frame_raw.unsqueeze(0), size=(target_res, target_res), mode='area').squeeze(0)
-                else: frame = frame_raw
+        # Prepare arguments for parallel execution
+        # We pre-assign group_ids to keep them distinct
+        tasks = [(f, start_group_id + i) for i, f in enumerate(chosen_files)]
+        
+        all_blocks = []
+        
+        # ThreadPoolExecutor efficiently distributes the CPU-bound decoding tasks
+        # max_workers=batch_size ensures we try to decode the whole batch at once
+        with ThreadPoolExecutor(max_workers=min(batch_size, 16)) as executor:
+            results = executor.map(fetch_sequence, tasks)
+            
+        for res in results:
+            if res:
+                all_blocks.extend(res)
                 
-                n_mode = spec.get('noise_mode', 'uniform')
-                n_params = spec.get('noise_params', {})
-                lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
-                
-                out_blocks.append(ContextBlock(
-                    content=frame,
-                    type='latent',
-                    causal=True,
-                    logsnr=lsnr,
-                    group_id=current_group_id,
-                    id=f"vid_{current_group_id}_{t}"
-                ))
-            current_group_id += 1
-        return out_blocks
+        return all_blocks
 
 class CheckerboardIterator:
     def __init__(self, device='cuda'): self.device = device
@@ -504,11 +536,12 @@ class CompositeIterator:
         for idx, split in enumerate(self.splits):
             count = counts[idx]
             if count == 0: continue
-            
+            split_name = split['name'] # Capture the source name
             gen_type = split['type']
             if gen_type == 'video':
                 seq_conf = split['d_params'].get('sequence_structure', [{'res':32}])
                 blocks = split['iterator'].generate_batch_list(count, seq_conf, start_group_id=global_group_id)
+                for b in blocks: b.source = split_name
                 # Video iterator increments group_id internally, need to resync global
                 if blocks: global_group_id = max(b.group_id for b in blocks) + 1
             else:
@@ -521,6 +554,7 @@ class CompositeIterator:
                 raw_snrs = get_logsnr_batch(n_mode, len(blocks), res, res, self.device, n_params)
                 
                 for i, b in enumerate(blocks):
+                    b.source = split_name
                     b.logsnr = raw_snrs[i]
                     b.group_id = global_group_id
                     global_group_id += 1
