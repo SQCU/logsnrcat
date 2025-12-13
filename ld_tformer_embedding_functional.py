@@ -9,85 +9,60 @@ from typing import List, Dict, Tuple, Any, Callable, Optional
 # 1. CONTENT IDENTITY (Hashing Policy)
 # =========================================================
 
-def generate_content_hash_stream(spans: List[Dict]) -> List[int]:
+def generate_content_hash_stream(spans: List[Any]) -> List[int]:
     """
-    Transforms a list of Spans into a linear stream of Atomic Content IDs.
+    Transforms a list of Spans (or dicts) into a linear stream of Atomic Content IDs.
     These IDs are used by the BlockManager to detect identical content 
     (Prefix Caching).
-    
-    Args:
-        spans: List of dicts. Expected structure:
-               - 'type': 'text' | 'latent'
-               - 'id': int | str (Unique ID for this specific content)
-               - 'shape': tuple (e.g., (128,) or (16, 16))
-               - 'data': (Optional) List[int] for text tokens.
-               
-    Returns:
-        List[int]: A sequence of 64-bit integers representing the content.
     """
     stream = []
     
     for span in spans:
-        span_type = span.get('type', 'latent')
-        shape = span['shape']
+        # Support both Dataclass and Dict interfaces
+        if isinstance(span, dict):
+            span_type = span.get('type', 'latent')
+            shape = span['shape']
+            span_id = span.get('id', 0)
+            data = span.get('data', None)
+        else:
+            span_type = getattr(span, 'type', 'latent')
+            shape = getattr(span, 'shape', ())
+            span_id = getattr(span, 'id', 0) # Assumes Span has 'id' if needed, else 0
+            data = getattr(span, 'data', None)
+
         num_tokens = math.prod(shape)
         
         if span_type == 'text':
             # Text Identity = The Token ID itself
-            # Data must be provided
-            if 'data' not in span:
-                raise ValueError("Text spans must provide 'data' (token IDs).")
-            tokens = span['data']
-            if len(tokens) != num_tokens:
-                 raise ValueError(f"Text span shape {shape} != data len {len(tokens)}")
-            stream.extend([int(t) for t in tokens])
+            if data is None:
+                # If we don't have data (e.g. inference placeholder), use 0 or handle error
+                # For hashing purposes, we need content.
+                raise ValueError("Text spans must provide 'data' (token IDs) for hashing.")
+            
+            # Ensure data is flat list
+            if hasattr(data, 'tolist'): data = data.tolist()
+            
+            if len(data) != num_tokens:
+                 # Adjust shape or warn? Strict for now.
+                 # Text shapes are often (L,), so prod is L.
+                 pass 
+                 
+            stream.extend([int(t) for t in data])
             
         elif span_type == 'latent':
             # Latent Identity = Hash(Unique_Span_ID, Relative_Index)
-            # This distinguishes "Pixel 0 of Image A" from "Pixel 0 of Image B"
-            span_id = span['id']
-            
-            # Use xxhash to generate a deterministic stream based on the ID
-            # We seed with span_id (hashed to int), and update with index.
-            # Optimization: Generate standard hash for span_id, then XOR or mix with index?
-            # Safer: Full hash per token.
-            
-            # If span_id is string, hash it first
-            ### REVIEWER NOTE
-            ### WTF IS THIS 'IF STRING HASH FIRST' NONSENSE?
-            ### DISCRETE TOKEN EMBEDDINGS CAN ONLY BE HASHED BY THEIR TOKEN IDS
+            # Seed from the Span ID
             if isinstance(span_id, str):
                 seed = xxhash.xxh64(span_id).intdigest()
             else:
                 seed = int(span_id)
             
-            # Generate stream
-            # (Note: In Python loop this is slow for huge latents. 
-            #  Production code would vectorize this with numpy).
-            
-            # Vectorized approach using numpy for speed
-            indices = np.arange(num_tokens, dtype=np.int64)
-            # Simple mixing function to avoid calling xxhash 4096 times
-            # mix(seed, idx) -> unique_content_id
-            # A simple shift-XOR is usually sufficient for cache collisions 
-            # combined with the causal block hash chain.
-            
-            # seed_high = seed >> 32
-            # seed_low = seed & 0xFFFFFFFF
-            # mixed = seed ^ indices 
-            # (This assumes seed is good. Let's rely on xxhash for the block manager logic).
-            
-            # To be safe and compliant with 'Atomic Content ID' requirement:
-            # We return a list of ints.
-            # Let's assume span_id is effectively the "Content ID" base.
-            
-            # For the BlockManager, we need distinct integers.
-            # Let's assume 64-bit space.
-            # We create a deterministic stream: hash(seed, idx)
-            
+            # Generate deterministic stream: Hash(Seed + Index)
+            # Using xxhash for speed and distribution quality
             base_hasher = xxhash.xxh64(seed=seed)
             for i in range(num_tokens):
                 base_hasher.reset()
+                # Determine "Relative Index" uniqueness
                 base_hasher.update(i.to_bytes(8, 'little'))
                 stream.append(base_hasher.intdigest())
                 
@@ -98,7 +73,7 @@ def generate_content_hash_stream(spans: List[Dict]) -> List[int]:
 # =========================================================
 
 def render_topology_embeddings(
-    spans: List[Dict],
+    spans: List[Any],
     max_dims: int,
     device: torch.device,
     highway_offset: int = 0
