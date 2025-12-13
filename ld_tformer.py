@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, BlockMask
-from typing import Tuple, List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import Tuple, List, Dict, Any, Optional, Union
+from dataclasses import dataclass, field
 import math
 
 from nvllm_flex_attention import update_kv_cache
@@ -315,270 +315,147 @@ class FourierScaleDecoder(nn.Module):
 # latent unembedding units
 
 class ContextualPatchEmbedder(nn.Module):
-    def __init__(
-        self, 
-        input_channels: int = 3, 
-        fourier_dim: int = 16, 
-        embed_dim: int = 256, 
-        context_size: int = 4,
-        stride: int = 2,
-        mlp_depth: int = 1
-    ):
+    def __init__(self, input_channels=3, fourier_dim=16, embed_dim=256, context_size=4, stride=2, mlp_depth=1):
         super().__init__()
         self.context_size = context_size
         self.stride = stride
         self.padding = (context_size - stride) // 2
-        self.fourier_dim = fourier_dim
-        
-        # Fourier encoder for scalar logsnr -> feature vector
         self.fourier_enc = FourierFeatures(fourier_dim=fourier_dim)
-        
-        # Input: RGB patches (C*K*K) + logsnr features (F)
-        # Think of it as: (C+F)*K*K flattened
-        self.patch_flat_dim = (context_size ** 2) * input_channels
-        self.input_dim = self.patch_flat_dim + fourier_dim
-        
+        self.input_dim = (context_size ** 2) * input_channels + fourier_dim
         self.input_proj = nn.Linear(self.input_dim, embed_dim)
-        self.res_blocks = nn.Sequential(*[
-            MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))
-        ])
+        self.res_blocks = nn.Sequential(*[MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))])
         self.param_init()
-
     def param_init(self):
-        for block in self.res_blocks:
-            block.param_init()
+        for block in self.res_blocks: block.param_init()
         init_linear(self.input_proj)
-
-    def forward(
-        self, 
-        x: torch.Tensor,           # [C, H, W]
-        logsnr_map: torch.Tensor   # [1, H, W] ← SPATIAL field!
-    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
-        """
-        Treats logsnr_map as an additional 'channel' to concatenate to RGB.
-        """
-        C, H, W = x.shape
-        
-        # 1. Pad both tensors
-        x_pad = F.pad(x, (self.padding, self.padding, self.padding, self.padding), 
-                      mode='reflect')
-        logsnr_pad = F.pad(logsnr_map, (self.padding, self.padding, self.padding, self.padding), 
-                           mode='reflect')
-        
-        # 2. Extract overlapping patches from IMAGE
-        # [C, H_pad, W_pad] -> [C, GH, GW, K, K]
-        patches_img = x_pad.unfold(1, self.context_size, self.stride) \
-                           .unfold(2, self.context_size, self.stride)
+    def forward(self, x, logsnr_map):
+        # x: [C, H, W], logsnr_map: [1, H, W]
+        x_pad = F.pad(x, (self.padding,)*4, mode='reflect')
+        logsnr_pad = F.pad(logsnr_map, (self.padding,)*4, mode='reflect')
+        patches_img = x_pad.unfold(1, self.context_size, self.stride).unfold(2, self.context_size, self.stride)
         GH, GW = patches_img.shape[1], patches_img.shape[2]
-        
-        # Flatten spatial: [C, GH, GW, K, K] -> [GH*GW, C*K*K]
         patches_img = patches_img.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1)
-        
-        # 3. Extract overlapping patches from LOGSNR MAP
-        # [1, H_pad, W_pad] -> [1, GH, GW, K, K]
-        patches_logsnr = logsnr_pad.unfold(1, self.context_size, self.stride) \
-                                   .unfold(2, self.context_size, self.stride)
-        
-        # Average pool each patch's logsnr (or could use center pixel)
-        # [1, GH, GW, K, K] -> [GH*GW, 1]
+        patches_logsnr = logsnr_pad.unfold(1, self.context_size, self.stride).unfold(2, self.context_size, self.stride)
         patches_logsnr = patches_logsnr.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1).mean(dim=-1, keepdim=True)
-        
-        # 4. Encode logsnr with Fourier features
-        # [GH*GW, 1] -> [GH*GW, fourier_dim]
         logsnr_features = self.fourier_enc(patches_logsnr)
-        
-        # 5. Concatenate: Image patch + Noise level features
-        # Think: "RGB patch + noise channel"
         raw_input = torch.cat([patches_img, logsnr_features], dim=-1)
-        
-        # 6. Project & process
         h = self.input_proj(raw_input)
         z = self.res_blocks(h)
-        
         return z, (GH, GW)
 
+
 class ContextualPatchUnembedder(nn.Module):
-    """
-    Reconstructs a single raster + logsnr map from tokens.
-    Handles both 2D Latent grids and 1D Text strips.
-    """
-    def __init__(
-        self, 
-        output_channels: int = 3, 
-        fourier_dim: int = 16,
-        embed_dim: int = 256, 
-        patch_size: int = 2, 
-        mlp_depth: int = 1
-    ):
+    def __init__(self, output_channels=3, fourier_dim=16, embed_dim=256, patch_size=2, mlp_depth=1):
         super().__init__()
         self.patch_size = patch_size
         self.output_channels = output_channels
-        self.fourier_dim = fourier_dim
-        
         self.raster_flat_dim = output_channels * (patch_size ** 2)
-        total_out_dim = self.raster_flat_dim + fourier_dim
-        
-        self.res_blocks = nn.Sequential(*[
-            MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))
-        ])
-        
-        self.output_proj = nn.Sequential(
-            nn.LayerNorm(embed_dim, elementwise_affine=False), 
-            nn.Linear(embed_dim, total_out_dim)
-        )
+        self.res_blocks = nn.Sequential(*[MLPResBlock(embed_dim) for _ in range(max(0, mlp_depth - 1))])
+        self.output_proj = nn.Sequential(nn.LayerNorm(embed_dim, elementwise_affine=False), nn.Linear(embed_dim, self.raster_flat_dim + fourier_dim))
         self.logsnr_decoder = FourierScaleDecoder(fourier_dim, hidden_dim=embed_dim, output_dim=1)
         self.param_init()
-
     def param_init(self):
-        for block in self.res_blocks:
-            block.param_init()
-        init_layer_norm(self.output_proj[0])
-        init_linear(self.output_proj[1])
+        for block in self.res_blocks: block.param_init()
+        init_layer_norm(self.output_proj[0]); init_linear(self.output_proj[1])
         self.logsnr_decoder.param_init()
-
-    def forward(
-        self, 
-        z: torch.Tensor, 
-        shape: Tuple[int, ...]
-    ) -> torch.Tensor:
-        """
-        Args:
-            z: [Num_Tokens, Embed_Dim]
-            shape: (Grid_H, Grid_W) for latents, or (Len,) for text
-            
-        Returns:
-            [Output_Channels + 1, H, W]
-        """
+    def forward(self, z, shape):
         L, D = z.shape
         P = self.patch_size
-        
-        # 1. Resolve Topology
-        if len(shape) == 2:
-            GH, GW = shape
-        elif len(shape) == 1:
-            # Interpret 1D sequence as a horizontal strip (1 row, L columns)
-            # This ensures text can still project to a valid "image" strip
-            GH, GW = 1, shape[0]
-        else:
-            # Fallback for empty or unknown shapes -> treat as linear strip
-            GH, GW = 1, L
+        if len(shape) == 2: GH, GW = shape
+        elif len(shape) == 1: GH, GW = 1, shape[0]
+        else: GH, GW = 1, L
+        if L != GH * GW: GH, GW = 1, L # Fallback
 
-        # Sanity check: If metadata drifted, prioritize the actual token count
-        # to ensure the reshape operation succeeds.
-        if L != GH * GW:
-            # You might want to log a warning here in a production system
-            GH, GW = 1, L
-
-        # 2. Decode Features
-        h = self.res_blocks(z)
-        flat = self.output_proj(h) # [L, Raster_Dim + Fourier_Dim]
-        
+        flat = self.output_proj(self.res_blocks(z))
         raster_part = flat[:, :self.raster_flat_dim]
         fourier_part = flat[:, self.raster_flat_dim:]
         
-        # 3. Reconstruct Raster
-        # [L, C*P*P] -> [GH, GW, C, P, P]
         patches = raster_part.reshape(GH, GW, self.output_channels, P, P)
-        
-        # Permute to [C, GH, P, GW, P] -> [C, H, W]
-        # (GH*P = H, GW*P = W)
         patches = patches.permute(2, 0, 3, 1, 4)
         rasters = patches.reshape(self.output_channels, GH * P, GW * P)
         
-        # 4. Reconstruct LogSNR
-        # [L, F] -> [L, 1]
         logsnr_pred = self.logsnr_decoder(fourier_part)
-        
-        # Reshape to grid [1, GH, GW]
         logsnr_grid = logsnr_pred.view(GH, GW).unsqueeze(0)
-        
-        # Upsample [1, H, W]
-        # Need 4D for interpolate: [1, 1, GH, GW]
-        # Output will be [1, 1, H, W] -> squeeze -> [1, H, W]
-        logsnr_pixel = F.interpolate(
-            logsnr_grid.unsqueeze(0), 
-            scale_factor=P, 
-            mode='nearest'
-        ).squeeze(0)
-        
-        # 5. Concat
+        logsnr_pixel = F.interpolate(logsnr_grid.unsqueeze(0), scale_factor=P, mode='nearest').squeeze(0)
         return torch.cat([rasters, logsnr_pixel], dim=0)
 
-# ===== OUTSIDE MODEL: Span Processor =====
 
+# ===== OUTSIDE MODEL: Span Processor =====
 @dataclass
 class Span:
     type: str  # 'text' | 'latent'
     start_idx: int
     end_idx: int
-    shape: Tuple[int, ...]  # ~~(H, W) for images, () for text~~
-    # wait that's not right at all. shape needs to be dim1, dim2, dim3, dim4, ... dim_final for images.
-    # and shape needs to be (L) for text.
+    shape: Tuple[int, ...] 
     causal: bool    
-    doc_id: int  # <--- NEW: Explicit grouping
+    doc_id: int 
 
+@dataclass
+class ContextBlock:
+    """
+    Canonical atomic unit of the dataset.
+    Holds raw data and its topological metadata.
+    """
+    content: Union[torch.Tensor, str] # [3, H, W] or String
+    type: str = 'latent'
+    causal: bool = True
+    # Metadata
+    shape_meta: Tuple[int, ...] = field(default_factory=tuple)
+    logsnr: Optional[torch.Tensor] = None # [1, H, W]
+    group_id: int = 0
+    id: str = ""
+
+    def __post_init__(self):
+        if not self.shape_meta:
+             if isinstance(self.content, torch.Tensor) and self.type == 'latent':
+                 h, w = self.content.shape[-2:]
+                 self.shape_meta = (h // 2, w // 2)
+             elif isinstance(self.content, str) and self.type == 'text':
+                 self.shape_meta = (len(self.content),)
+             elif isinstance(self.content, torch.Tensor) and self.type == 'text':
+                 self.shape_meta = (self.content.shape[0],)
 
 class SpanEmbedder:
     def __init__(self, text_embedder, patch_embedder):
         self.text_emb = text_embedder
         self.patch_emb = patch_embedder
         
-    def embed(
-        self, 
-        spans_metadata: List[Dict],
-        text_tokens: Optional[List[torch.Tensor]] = None,
-        images: Optional[List[torch.Tensor]] = None,
-        logsnr_maps: Optional[List[torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, List[Span], List[int]]:
-        
+    def embed(self, context_blocks: List[ContextBlock]) -> Tuple[torch.Tensor, List[Span], List[int]]:
         all_embeds = []
         span_objects = []
         cursor = 0
-        text_idx = 0
-        img_idx = 0
-        
-        # We need to map metadata 'group_id' to integer doc_ids if provided
-        # or generate them sequentially if not.
         
         from ld_tformer_embedding_functional import generate_content_hash_stream
         hash_spans = []
 
-        for i, meta in enumerate(spans_metadata):
-            span_type = meta['type']
-            span_len = meta['len']
-            
-            # Resolve Document ID
-            # If 'group_id' is in metadata, use it. Else use strictly unique ID.
-            # We assume group_ids are managed by the iterator to be unique across the batch.
-            doc_id = meta.get('group_id', i) 
-
-            if span_type == 'text':
-                tokens = text_tokens[text_idx]
+        for block in context_blocks:
+            if block.type == 'text':
+                # Assuming content is already tokenized tensor or handle tokenization externally?
+                # The benchmark scripts pass tokenized tensors. 
+                # Let's assume input is Tensor[Long].
+                tokens = block.content
+                if isinstance(tokens, str): raise ValueError("SpanEmbedder expects tokenized text tensors, not strings.")
+                
                 emb = self.text_emb(tokens)
-                text_idx += 1
+                span_len = tokens.shape[0]
                 hash_spans.append({'type': 'text', 'shape': (span_len,), 'data': tokens.cpu().tolist()})
                 
-            elif span_type == 'latent':
-                img = images[img_idx]
-                logsnr = logsnr_maps[img_idx]
-                
-                # FIX: Pass 3D tensors directly.
-                # The ContextualPatchEmbedder expects [C, H, W] and [1, H, W].
-                # It returns [L, D] and the grid shape (H_grid, W_grid).
+            elif block.type == 'latent':
+                img = block.content
+                logsnr = block.logsnr
+                # Direct 3D Tensor processing
                 emb, grid_shape = self.patch_emb(img, logsnr)
-                
-                img_idx += 1
-                meta['shape'] = grid_shape
-                hash_spans.append({'type': 'latent', 'shape': grid_shape, 'id': meta.get('id', f'img_{i}')})
+                span_len = emb.shape[0]
+                hash_spans.append({'type': 'latent', 'shape': grid_shape, 'id': block.id})
             
             all_embeds.append(emb)
             span_objects.append(Span(
-                type=span_type,
+                type=block.type,
                 start_idx=cursor,
                 end_idx=cursor + span_len,
-                shape=meta.get('shape', ()),
-                causal=meta.get('causal', True),
-                doc_id=doc_id 
+                shape=block.shape_meta,
+                causal=block.causal,
+                doc_id=block.group_id
             ))
             cursor += span_len
             
@@ -586,58 +463,25 @@ class SpanEmbedder:
         return torch.cat(all_embeds, dim=0), span_objects, content_hashes
 
 class SpanUnembedder:
-    """
-    Converts flat [L_total, D] -> heterogeneous outputs.
-    """
     def __init__(self, text_head, patch_unembedder):
         self.text_head = text_head
         self.patch_unembed = patch_unembedder
         
-    def decode(
-        self,
-        z: torch.Tensor,  # [L_total, D]
-        spans: List[Span]
-    ) -> Dict[str, Any]:
-        """
-        Returns list ofs dict with:
-            'text_logits': Tensor - [len(span), Vocab] per text span
-            'image_vpreds': Tensor - [C, H, W] per image span
-            'image_logsnrs': Tensor - [1, H, W] per image span
-        """
+    def decode(self, z: torch.Tensor, spans: List[Span]) -> List[Dict[str, Any]]:
         outputs = []
         for span in spans:
             spandict = {}
             z_span = z[span.start_idx:span.end_idx]
             
-            #if span.type == 'text':
-            # commented out because this branch is arbitrary; 
-            # we might want to look at the logits for image patches.
-            # it's up to the downstream model consumer to appreciate 
-            # that there isn't a loss metric joining a 
-            # [L, Vocab] <-> [C, H, W] tensor.
-            # specifically, because 
-            # L == H * W, and C != Vocab.
-            logits = self.text_head(z_span)  # [L, Vocab]
-            spandict['text_logits']=logits
-                
-            #elif span.type == 'latent':
-            # Need to know grid shape to unflatten
-            grid_shape = span.shape  # Should be (GH, GW) from metadata
-            # is this a superfluous special case?
-            # we should make sure we consider text spans to be shapeful.
-            # and their shape is [len(span)]!
+            # Text Head (Always computable)
+            spandict['text_logits'] = self.text_head(z_span)
             
-            # [L, D] + shape -> [C+1, H, W]
-            reconstruction = self.patch_unembed(z_span, grid_shape)
+            # Latent Head (Always computable, handles 1D/2D)
+            reconstruction = self.patch_unembed(z_span, span.shape)
+            spandict['image_vpreds'] = reconstruction[:-1]
+            spandict['image_logsnrs'] = reconstruction[-1:]
             
-            raster = reconstruction[:-1]  # [C, H, W]
-            logsnr = reconstruction[-1:]   # [1, H, W]
-            
-            spandict['image_vpreds']=raster
-            spandict['image_logsnrs']=logsnr
             outputs.append(spandict)
-        # we now have vpred and logsnr field predictions for every single embedding even if this doesn't make sense!
-        # hehe :)
         return outputs
 
 def build_dual_masks(

@@ -121,7 +121,7 @@ def render_topology_embeddings(
     spatial_dim_capacity = max_dims - 1
     
     for i, span in enumerate(spans):
-        shape = span['shape']
+        shape = span.shape
         num_tokens = math.prod(shape)
         
         # 1. Highway (Global Linear Time)

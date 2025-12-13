@@ -6,14 +6,15 @@ import glob
 import os
 import random
 from pathlib import Path
+from ld_tformer import ContextBlock # Import the canonical definition
 
 # Try importing torchvision for video handling
 # --- Dependency Check: Swap torchvision for torchcodec ---
 try:
     from torchcodec.decoders import VideoDecoder
-    HAS_VIDEO = True
+    HAS_TORCHCODEC = True
 except ImportError:
-    HAS_VIDEO = False
+    HAS_TORCHCODEC = False
     print("⚠️ torchcodec not found. Video iterator will fail if used.")
 
 # --- 1. Noise Topology Generators ---
@@ -320,202 +321,127 @@ class TorusIterator:
     def __init__(self, device='cuda'):
         self.marcher = TorusRaymarcher(device)
         
-    def generate_batch(self, batch_size, resolution, **kwargs):
+    def generate_batch_list(self, batch_size, resolution, num_tiles=4.0, **kwargs):
         origins, rays = self.marcher.get_camera_rays(batch_size, resolution)
         p, mask = self.marcher.intersect(origins, rays)
         p_reshaped = p.view(batch_size, resolution, resolution, 3)
-        images = self.marcher.shade_batch(p_reshaped, mask, rays, resolution)
-        return images.permute(0, 3, 1, 2)
-
-class CheckerboardIterator:
-    def __init__(self, device='cuda'):
-        self.device = device
+        images = self.marcher.shade_batch(p_reshaped, mask, rays, resolution).permute(0, 3, 1, 2)
         
-    def generate_batch(self, batch_size, resolution, num_tiles=4.0, **kwargs):
-        tile_scale = resolution / num_tiles 
-        half_tiles = num_tiles / 2.0
-        linspace = torch.linspace(-half_tiles, half_tiles, resolution, device=self.device)
-        y, x = torch.meshgrid(linspace, linspace, indexing='ij')
-        
-        x_flat = x.flatten().unsqueeze(0).expand(batch_size, -1)
-        y_flat = y.flatten().unsqueeze(0).expand(batch_size, -1)
-        
-        theta = torch.rand(batch_size, 1, device=self.device) * 2 * math.pi
-        cos_t = torch.cos(theta); sin_t = torch.sin(theta)
-        x_rot = x_flat * cos_t + y_flat * sin_t
-        y_rot = -x_flat * sin_t + y_flat * cos_t
-        
-        x_idx = torch.floor(x_rot + 0.01)
-        y_idx = torch.floor(y_rot + 0.01)
-        
-        pat = ((x_idx + y_idx) % 2).view(batch_size, resolution, resolution)
-        
-        c1 = torch.rand(batch_size, 3, 1, 1, device=self.device)
-        c2 = torch.rand(batch_size, 3, 1, 1, device=self.device)
-        mask = pat.unsqueeze(1)
-        
-        return c1 * (1 - mask) + c2 * mask
-
-
-
+        # Generate standard metadata
+        blocks = []
+        for i in range(batch_size):
+            blocks.append(ContextBlock(
+                content=images[i],
+                type='latent',
+                causal=True,
+                group_id=i, # Independent
+                id=f"torus_{i}"
+            ))
+        return blocks
 
 class VideoFolderIterator:
     def __init__(self, folder_path, device='cuda'):
-        if not HAS_VIDEO: 
-            raise ImportError("torchcodec required. pip install torchcodec")
+        if not HAS_TORCHCODEC: raise ImportError("torchcodec required")
         self.device = device
         self.folder = Path(folder_path)
         self.files = sorted(list(self.folder.glob("**/*.mp4")))
-        if not self.files: 
-            raise ValueError(f"No videos in {folder_path}")
+        if not self.files: raise ValueError(f"No videos in {folder_path}")
 
     def _sample_indices(self, total_frames, seq_len, sampler_config):
-        """
-        Core logic for Variable Interval Sampling.
-        Returns ordered list of indices.
-        """
-        # Default: Sample freely from the entire video
         min_pct = sampler_config.get('min_pct', 0.0)
         max_pct = sampler_config.get('max_pct', 1.0)
+        stride = sampler_config.get('stride', None)
+        if total_frames < seq_len: return [i % total_frames for i in range(seq_len)]
         
-        # Absolute limits (optional overrides for "Video Model" mode)
-        # e.g. strict_stride=1 implies contiguous frames
-        stride = sampler_config.get('stride', None) 
-        
-        if total_frames < seq_len:
-            # Fallback: Loop the video if it's too short for the sequence
-            return [i % total_frames for i in range(seq_len)]
-
-        # 1. Determine Window Size (The "Narrative Arc" length)
-        # How many source frames does our sequence cover?
         min_span = max(seq_len, int(total_frames * min_pct))
         max_span = max(min_span, int(total_frames * max_pct))
-        
-        # Clamp to reality
-        max_span = min(max_span, total_frames)
-        min_span = min(min_span, max_span)
-        
-        # Pick the span size for this specific sample
+        max_span = min(max_span, total_frames); min_span = min(min_span, max_span)
         actual_span = random.randint(min_span, max_span)
-        
-        # 2. Place the Window
-        # Where does the arc start?
-        max_start_idx = total_frames - actual_span
-        start_idx = random.randint(0, max_start_idx)
-        
-        # 3. Select Frames within Window
+        max_start = total_frames - actual_span
+        start_idx = random.randint(0, max_start)
         window_range = range(start_idx, start_idx + actual_span)
         
         if stride is not None:
-            # Fixed Stride Mode (Traditional Video Modeling)
-            # Take every Nth frame starting from start_idx
             indices = [start_idx + i * stride for i in range(seq_len)]
-            # Wrap if we go out of bounds (shouldn't happen with correct logic but safety first)
             indices = [i % total_frames for i in indices]
         else:
-            # Random Interval Mode (Storyboarding)
-            # Sample K unique frames from the window and Sort them (Time must flow forward)
             indices = sorted(random.sample(window_range, seq_len))
-            
         return indices
 
     def generate_batch_list(self, batch_size, sequence_config, start_group_id=0):
-        """
-        Args:
-            sequence_config: List of dicts per frame.
-            
-            supported kwargs in config (passed via 'params' in composite iterator):
-            'time_sampler': {
-                'min_pct': 0.01, # Context must cover at least 1% of video
-                'max_pct': 0.10, # Context must cover at most 10% of video
-                'stride': None   # If set, forces fixed intervals (1, 2, etc)
-            }
-        """
         seq_len = len(sequence_config)
         chosen_files = random.choices(self.files, k=batch_size)
-        
-        out_images = []
-        out_logsnrs = []
-        out_spans = []
+        out_blocks = []
         current_group_id = start_group_id
-        
-        # Extract global sampler config if present in the *first* frame spec 
-        # (Assuming sampler config is uniform for the sequence generation)
-        # In the CompositeIterator, this comes from 'params' -> 'sequence_structure'
-        # We'll allow passing it via the first item or a separate arg if we refactor, 
-        # but for now, let's look for a specialized key in the first frame config.
-        # OR: We rely on the Iterator wrapper to pass it. 
-        # For simplicity, let's assume default random sampling if not specified.
-        
-        # HACK: Inspect first frame config for sampler settings
         sampler_config = sequence_config[0].get('time_sampler', {})
 
         for fpath in chosen_files:
             try:
-                # 1. Open Header
-                decoder = safe_create_decoder(str(fpath), device=self.device)
+                decoder = safe_create_decoder(fpath, self.device)
                 total_frames = decoder.metadata.num_frames
-                if total_frames is None: raise ValueError("No frame count")
-            except Exception as e:
-                # print(f"Skipping {fpath.name}: {e}")
-                continue
+                if total_frames is None: continue
+            except Exception: continue
 
-            # 2. Calculate Indices
             indices = self._sample_indices(total_frames, seq_len, sampler_config)
-            
-            # 3. Decode O(1)
             try:
-                # Returns [Seq, C, H, W]
                 raw_batch = decoder.get_frames_at(indices).data.float() / 255.0
-            except Exception as e:
-                print(f"Decode fail {fpath.name}: {e}")
-                continue
+            except Exception: continue
 
-            # 4. Construct List
             for t, (frame_raw, spec) in enumerate(zip(raw_batch, sequence_config)):
                 target_res = spec.get('res', 32)
-                
                 if frame_raw.shape[-1] != target_res:
-                    frame_final = F.interpolate(
-                        frame_raw.unsqueeze(0), 
-                        size=(target_res, target_res), 
-                        mode='area'
-                    ).squeeze(0)
-                else:
-                    frame_final = frame_raw
-
+                    frame = F.interpolate(frame_raw.unsqueeze(0), size=(target_res, target_res), mode='area').squeeze(0)
+                else: frame = frame_raw
+                
                 n_mode = spec.get('noise_mode', 'uniform')
                 n_params = spec.get('noise_params', {})
-                lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params)
+                lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
                 
-                out_images.append(frame_final)
-                out_logsnrs.append(lsnr.squeeze(0))
-                
-                tokens = (target_res // 2) ** 2
-                out_spans.append({
-                    'type': 'latent',
-                    'len': tokens,
-                    'shape': (target_res // 2, target_res // 2),
-                    'causal': True,
-                    'group_id': current_group_id,
-                    'id': f"vid_{current_group_id}_{t}"
-                })
-            
+                out_blocks.append(ContextBlock(
+                    content=frame,
+                    type='latent',
+                    causal=True,
+                    logsnr=lsnr,
+                    group_id=current_group_id,
+                    id=f"vid_{current_group_id}_{t}"
+                ))
             current_group_id += 1
-            
-        return out_images, out_logsnrs, out_spans
+        return out_blocks
 
-    def generate_batch(self, batch_size, resolution, **kwargs):
-        """Legacy Wrapper."""
-        seq_conf = [{'res': resolution, 'noise_mode': 'uniform'}]
-        imgs, _, _ = self.generate_batch_list(batch_size, seq_conf)
-        
-        if len(imgs) < batch_size:
-            diff = batch_size - len(imgs)
-            if len(imgs) > 0: imgs.extend([imgs[-1]] * diff)
-            else: return torch.zeros(batch_size, 3, resolution, resolution, device=self.device)
+class CheckerboardIterator:
+    def __init__(self, device='cuda'): self.device = device
+    def generate_batch_list(self, batch_size, resolution, num_tiles=4.0, **kwargs):
+        # Generate batch of images
+        # Logic copied from original CheckerboardIterator.generate_batch
+        tile_scale = resolution / num_tiles 
+        half_tiles = num_tiles / 2.0
+        linspace = torch.linspace(-half_tiles, half_tiles, resolution, device=self.device)
+        y, x = torch.meshgrid(linspace, linspace, indexing='ij')
+        x_flat = x.flatten().unsqueeze(0).expand(batch_size, -1)
+        y_flat = y.flatten().unsqueeze(0).expand(batch_size, -1)
+        theta = torch.rand(batch_size, 1, device=self.device) * 2 * math.pi
+        cos_t = torch.cos(theta); sin_t = torch.sin(theta)
+        x_rot = x_flat * cos_t + y_flat * sin_t
+        y_rot = -x_flat * sin_t + y_flat * cos_t
+        x_idx = torch.floor(x_rot + 0.01); y_idx = torch.floor(y_rot + 0.01)
+        pat = ((x_idx + y_idx) % 2).view(batch_size, resolution, resolution)
+        c1 = torch.rand(batch_size, 3, 1, 1, device=self.device)
+        c2 = torch.rand(batch_size, 3, 1, 1, device=self.device)
+        mask = pat.unsqueeze(1)
+        imgs = c1 * (1 - mask) + c2 * mask # [B, 3, H, W]
 
-        return torch.stack(imgs)
+        # Generate standard metadata
+        blocks = []
+        for i in range(batch_size):
+            blocks.append(ContextBlock(
+                content=imgs[i],
+                type='latent',
+                causal=True,
+                group_id=i, # Independent
+                id=f"checker_{i}"
+            ))
+        return blocks
+
 
 
 # --- 3. Composite Iterator (Refactored) ---
@@ -527,142 +453,52 @@ class CompositeIterator:
         'video': VideoFolderIterator # Register new type
     }
 
-
     def __init__(self, device='cuda', config=None):
-        """
-        Advanced config structure:
-        {
-            'my_split_name_1': {
-                'type': 'checkerboard',  # Underlying generator
-                'ratio': 0.5,
-                'params': {'num_tiles': 4.0},
-                'noise_mode': 'uniform',
-                'noise_params': {'max_snr': 5.0}
-            },
-            'my_split_name_2': {
-                'type': 'torus',
-                'ratio': 0.5,
-                ...
-            }
-        }
-        Legacy (shorthand) support:
-        { 'checkerboard': 0.5, 'torus': 0.5 }
-        """
         self.device = device
         if config is None: config = {'checkerboard': 1.0}
         
-        self.splits = [] # List of dicts: {name, iterator, ratio, d_params, n_mode, n_params}
+        self.splits = []
         
-        # 1. Parse Config
         for split_key, cfg in config.items():
-            
-            # Handle shorthand: 'checkerboard': 0.5
-            if isinstance(cfg, (float, int)):
+            if isinstance(cfg, (float, int)): 
                 cfg = {'ratio': float(cfg), 'type': split_key}
             
-            # Identify generator type
-            # If 'type' is missing, assume the split key is the type (legacy behavior)
             gen_type = cfg.get('type', split_key)
             
+            # Fallback only if type is genuinely unknown (prevents crash, but warns)
             if gen_type not in self._ITERATOR_MAP:
-                raise ValueError(f"Unknown generator type '{gen_type}' in split '{split_key}'. Available: {list(self._ITERATOR_MAP.keys())}")
-            
-            # Create Iterator Instance
-            # We instantiate fresh for every split to keep parameter injection clean
-            iterator_cls = self._ITERATOR_MAP[gen_type]
-            if gen_type == 'video':
-                 # Extract path from d_params or config
-                 path = cfg.get('params', {}).get('path', None)
-                 if not path: raise ValueError("Video iterator requires 'path' param")
-                 iterator_instance = iterator_cls(path, device=device)
+                print(f"⚠️ Unknown iterator type '{gen_type}', defaulting to Checkerboard.")
+                iterator_cls = CheckerboardIterator
             else:
+                iterator_cls = self._ITERATOR_MAP[gen_type]
+            
+            if gen_type == 'video':
+                 path = cfg.get('params', {}).get('path', None)
+                 iterator_instance = iterator_cls(path, device=device)
+            else: 
                  iterator_instance = iterator_cls(device)
             
             self.splits.append({
-                'name': split_key,
-                'iterator': iterator_instance,
-                'ratio': cfg.get('ratio', 1.0),
+                'name': split_key, 
+                'type': gen_type, # <--- FIX: Store the type!
+                'iterator': iterator_instance, 
+                'ratio': cfg.get('ratio', 1.0), 
                 'd_params': cfg.get('params', {}),
-                'n_mode': cfg.get('noise_mode', 'uniform'),
+                'n_mode': cfg.get('noise_mode', 'uniform'), 
                 'n_params': cfg.get('noise_params', {})
             })
             
-        # 2. Normalize Ratios
-        total_ratio = sum(s['ratio'] for s in self.splits)
-        if total_ratio <= 0: raise ValueError("Total ratio must be positive.")
-        
-        # Normalize in place
-        for s in self.splits:
-            s['ratio'] /= total_ratio
-            
-        self.last_labels = None
-        # Map label index -> split name
+        total = sum(s['ratio'] for s in self.splits)
+        for s in self.splits: 
+            s['ratio'] /= total
         self.label_map = {i: s['name'] for i, s in enumerate(self.splits)}
 
-    def generate_batch(self, batch_size, resolution, **kwargs):
-        """
-        Returns:
-            images: [B, 3, H, W] (Clean x0)
-            logsnr: [B, 1, H, W] (Topology-aware noise map)
-        """
-        counts = [int(batch_size * s['ratio']) for s in self.splits]
-        
-        # Dump remainder into first non-zero split
-        remainder = batch_size - sum(counts)
-        for i in range(len(counts)):
-            if counts[i] > 0 or (i == len(counts)-1): # Ensure we dump somewhere
-                counts[i] += remainder
-                break
-        
-        batch_imgs = []
-        batch_snr = []
-        labels_parts = []
-        
-        for idx, split in enumerate(self.splits):
-            count = counts[idx]
-            if count == 0: continue
-            
-            # 1. Generate Images
-            # Merge global defaults (kwargs) with split-specific params
-            # Split params override global kwargs
-            d_params = {**kwargs, **split['d_params']}
-            
-            imgs = split['iterator'].generate_batch(count, resolution, **d_params)
-            batch_imgs.append(imgs)
-            
-            # 2. Generate Noise Map
-            n_mode = split['n_mode']
-            n_params = split['n_params']
-            snr_map = get_logsnr_batch(n_mode, count, resolution, resolution, self.device, n_params)
-            batch_snr.append(snr_map)
-            
-            # 3. Labels
-            labels_parts.append(torch.full((count,), idx, device=self.device, dtype=torch.long))
-            
-        # 3. Concatenate & Shuffle
-        full_imgs = torch.cat(batch_imgs, dim=0)
-        full_snr = torch.cat(batch_snr, dim=0)
-        full_labels = torch.cat(labels_parts, dim=0)
-        
-        perm = torch.randperm(batch_size, device=self.device)
-        full_imgs = full_imgs[perm]
-        full_snr = full_snr[perm]
-        self.last_labels = full_labels[perm]
-        
-        return full_imgs, full_snr
-
     def generate_batch_list(self, batch_size, **kwargs):
-        """
-        Unified generation returning Lists.
-        """
-        # 1. Calc counts per split
-        # ... (counts logic) ...
+        counts = [int(batch_size * s['ratio']) for s in self.splits]
+        remainder = batch_size - sum(counts)
+        if counts: counts[0] += remainder
         
-        all_images = []
-        all_logsnrs = []
-        all_spans = []
-        
-        # Track group ID globally to avoid collision between splits
+        all_blocks = []
         global_group_id = 0
         
         for idx, split in enumerate(self.splits):
@@ -670,54 +506,27 @@ class CompositeIterator:
             if count == 0: continue
             
             gen_type = split['type']
-            
             if gen_type == 'video':
-                # Video handles its own sequence logic via config 'sequence_structure'
                 seq_conf = split['d_params'].get('sequence_structure', [{'res':32}])
-                imgs, snrs, metas = split['iterator'].generate_batch_list(count, seq_conf, start_group_id=global_group_id)
-                global_group_id += count # Video iterator increments group_id internally
-                
+                blocks = split['iterator'].generate_batch_list(count, seq_conf, start_group_id=global_group_id)
+                # Video iterator increments group_id internally, need to resync global
+                if blocks: global_group_id = max(b.group_id for b in blocks) + 1
             else:
-                # Geometric Iterators (Checker/Torus) are typically single-frame
-                # We wrap them to match list interface
                 d_params = {**kwargs, **split['d_params']}
-                res = d_params.get('resolution', 32) # Default or from kwargs
+                res = d_params.get('resolution', 32)
+                blocks = split['iterator'].generate_batch_list(count, res, **d_params)
                 
-                # Generate Tensor Batch [B, 3, H, W]
-                # Note: We need to update Checker/Torus to accept resolution in kwargs if not present
-                raw_imgs = split['iterator'].generate_batch(count, res, **d_params)
+                # Apply LogSNR metadata (Video handles this internally, geometric does not)
+                n_mode = split['n_mode']; n_params = split['n_params']
+                raw_snrs = get_logsnr_batch(n_mode, len(blocks), res, res, self.device, n_params)
                 
-                # Generate LogSNR Batch
-                n_mode = split['n_mode']
-                n_params = split['n_params']
-                raw_snrs = get_logsnr_batch(n_mode, count, res, res, self.device, n_params)
-                
-                # Convert to Lists
-                for b in range(count):
-                    all_images.append(raw_imgs[b])
-                    all_logsnrs.append(raw_snrs[b])
-                    
-                    tokens = (res // 2) ** 2
-                    all_spans.append({
-                        'type': 'latent',
-                        'len': tokens,
-                        'shape': (res // 2, res // 2),
-                        'causal': True, # Internal causal
-                        'group_id': global_group_id,
-                        'id': f"{split['name']}_{global_group_id}"
-                    })
+                for i, b in enumerate(blocks):
+                    b.logsnr = raw_snrs[i]
+                    b.group_id = global_group_id
                     global_group_id += 1
             
-            all_images.extend(imgs if gen_type == 'video' else [])
-            all_logsnrs.extend(snrs if gen_type == 'video' else [])
-            all_spans.extend(metas if gen_type == 'video' else [])
-            
-        # Shuffle?
-        # If we shuffle, we must shuffle by GROUP, not by image, to preserve causal blocks.
-        # For simplicity, we can shuffle the order of groups.
-        # (Implementation details omitted for brevity, but crucial for IID training)
-        
-        return all_images, all_logsnrs, all_spans
+            all_blocks.extend(blocks)
+        return all_blocks
 
 # --- 4. Debug/Visualization ---
 
