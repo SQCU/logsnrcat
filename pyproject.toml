@@ -38,6 +38,7 @@ dependencies = [
     #"pytorch3d",
     'xxhash',
     "av", #ffmpeg bindings?
+    "torchcodec", #better ffmpeg bindings
     #pytorch3d is fictional
     #crimes against nature
     "pyzmq",
