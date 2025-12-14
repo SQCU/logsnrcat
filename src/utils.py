@@ -658,28 +658,50 @@ def plot_multimetric_analysis(df, logger, stringy="multimetric_analysis"):
     logger.save_figure(fig, stringy)
 
 
+
 def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False):
-    x0 = result_dict["x0"].cpu()
-    noisy = result_dict["noisy_input"].cpu()
-    recon = result_dict["reconstruction"].cpu()
-    cols = 4 if show_map else 3
-    n = x0.shape[0]
+    # Expect lists of tensors, potentially of mixed resolution
+    x0s = result_dict["x0"]
+    noisy = result_dict["noisy_input"]
+    recon = result_dict["reconstruction"]
+    lmaps = result_dict.get("logsnr_map", None)
+    
+    n = len(x0s)
+    if n == 0: return
+
+    cols = 4 if (show_map and lmaps is not None) else 3
+    
+    # Create figure
     fig, axes = plt.subplots(n, cols, figsize=(3*cols, 2*n))
     if n == 1: axes = axes.reshape(1, -1)
+    
     for i in range(n):
-        axes[i, 0].imshow(x0[i].permute(1,2,0).numpy())
+        # Helper to safely visualize a single tensor (C,H,W) -> numpy (H,W,C)
+        def to_img(t):
+            return t.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
+
+        # Col 0: Ground Truth
+        axes[i, 0].imshow(to_img(x0s[i]))
         axes[i, 0].axis("off")
         if i==0: axes[i,0].set_title("Ground Truth")
-        axes[i, 1].imshow(noisy[i].permute(1,2,0).clamp(0,1).numpy())
+
+        # Col 1: Noisy Input
+        axes[i, 1].imshow(to_img(noisy[i]))
         axes[i, 1].axis("off")
         if i==0: axes[i,1].set_title("Noisy Input")
-        axes[i, 2].imshow(recon[i].permute(1,2,0).numpy())
+
+        # Col 2: Reconstruction
+        axes[i, 2].imshow(to_img(recon[i]))
         axes[i, 2].axis("off")
         if i==0: axes[i,2].set_title("Reconstruction")
-        if show_map:
-            lmap = result_dict["logsnr_map"][i].squeeze().cpu().numpy()
-            axes[i, 3].imshow(lmap, cmap="viridis")
+        
+        # Col 3: LogSNR Map
+        if show_map and lmaps is not None:
+            # Map might be (1,H,W) or (H,W)
+            m = lmaps[i].detach().cpu().squeeze().numpy()
+            axes[i, 3].imshow(m, cmap="viridis")
             axes[i, 3].axis("off")
             if i==0: axes[i,3].set_title("Split Map")
+            
     plt.tight_layout()
     logger.save_figure(fig, name)

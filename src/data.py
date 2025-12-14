@@ -397,9 +397,10 @@ class RawSequenceBatch:
         self.req_idx = req_idx
 
 class VideoFolderIterator:
-    def __init__(self, folder_path, device='cuda', horizon=256, result_queue_depth=1024, num_workers=None, max_ram_pct=95.0):
+    def __init__(self, folder_path, device='cuda', horizon=256, result_queue_depth=1024, num_workers=None, max_ram_pct=95.0, target_dtype=torch.float32):
         if not HAS_TORCHCODEC: raise ImportError("torchcodec required")
         self.device = device
+        self.target_dtype = target_dtype
         self.folder = Path(folder_path)
         self.files = sorted(list(self.folder.glob("**/*.mp4")))
         if not self.files: raise ValueError(f"No videos in {folder_path}")
@@ -605,7 +606,7 @@ class VideoFolderIterator:
                 
             # 1. GPU Transfer & Cast
             # Input is already resized uint8 [L, C, res, res]
-            frames_gpu = batch_raw.small_frames.to(self.device, non_blocking=True).float() / 255.0
+            frames_gpu = batch_raw.small_frames.to(device=self.device, dtype=self.target_dtype, non_blocking=True) / 255.0
             
             seq_blocks = []
             for t, (frame, spec) in enumerate(zip(frames_gpu, batch_raw.configs)):
@@ -637,7 +638,7 @@ class CompositeIterator:
         'video': VideoFolderIterator # Register new type
     }
 
-    def __init__(self, device='cuda', config=None):
+    def __init__(self, device='cuda', config=None, target_dtype=torch.float32):
         self.device = device
         if config is None: config = {'checkerboard': 1.0}
         
@@ -658,7 +659,7 @@ class CompositeIterator:
             
             if gen_type == 'video':
                  path = cfg.get('params', {}).get('path', None)
-                 iterator_instance = iterator_cls(path, device=device)
+                 iterator_instance = iterator_cls(path, device=device, target_dtype=target_dtype)
             else: 
                  iterator_instance = iterator_cls(device)
             

@@ -18,7 +18,11 @@ from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder
 from src.utils import PageTable, ExperimentLogger, plot_multimetric_analysis, plot_dset_reconstruction
 from src.data import CompositeIterator
 from src.train import train_autoembed, train_denoise
-from src.sample import sample_viz_dset, sample_viz_split_topology
+from src.sample import (
+    sample_viz_dset, 
+    sample_viz_split_topology, 
+    sample_viz_causal_sweep  # <--- Add this
+)
 
 
 def build_model(cfg: ExperimentConfig, device: torch.device):
@@ -50,7 +54,13 @@ def build_model(cfg: ExperimentConfig, device: torch.device):
 
 def build_components(cfg: ExperimentConfig, device: torch.device):
     """Build full component tuple expected by training functions."""
-    model = build_model(cfg, device)
+    if cfg.training.precision == "bf16":
+        dtype = torch.bfloat16
+    if cfg.training.precision == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    model = build_model(cfg, device).to(dtype=dtype)
     
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -68,6 +78,12 @@ def build_components(cfg: ExperimentConfig, device: torch.device):
 
 def build_train_config(cfg: ExperimentConfig) -> dict:
     """Convert ExperimentConfig to dict format expected by training functions."""
+    if cfg.training.precision == "bf16":
+        dtype = torch.bfloat16
+    if cfg.training.precision == "fp16":
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
     return {
         "ae_steps": cfg.training.ae_steps,
         "steps": cfg.training.steps,
@@ -85,6 +101,7 @@ def build_train_config(cfg: ExperimentConfig) -> dict:
         "ae_max_lr": cfg.training.ae_optimizer.max_lr,
         "ae_pct_start": cfg.training.ae_optimizer.pct_start,
         "log_interval": cfg.logging.log_interval,
+        "dtype":dtype
     }
 
 
@@ -152,7 +169,38 @@ def main():
             
             res_split = sample_viz_split_topology(components, val_iterator, sample_cfg)
             plot_dset_reconstruction(res_split, logger, f"{cfg.training.mode}_split_{res}", show_map=True)
+            # --- NEW: Causal Sweep Visualization ---
+            # We check if 'enable_sweep' is set in config to avoid running it if not desired
+
+            # --- NEW/UPDATED: Causal Sweep Visualization ---
+            if getattr(cfg.sampling, "enable_sweep", False):
+                print("Generating Causal Information Sweep from Video Data...")
+                M = getattr(cfg.sampling, "sweep_length", 4)
+                # Construct a sequence structure for the video iterator
+                # This dictates the resolution and noise properties of each frame in the sequence
+                video_seq_structure = [{
+                    'res': res, 
+                    'noise_mode': 'uniform', # Or 'split' if desired for video context
+                    'noise_params': {'min_snr': -4.0, 'max_snr': 1.0} 
+                } for _ in range(M)] # Ensure sequence length M
+                sweep_cfg = {
+                    "mode": cfg.training.mode,
+                    "target_logsnr": cfg.sampling.target_logsnr,
+                    "sampling_steps": cfg.sampling.steps,
+                    "num_sweep_sequences": getattr(cfg.sampling, "sweep_count", 4),
+                    "sequence_length": M,
+                    "prefix_snr_range": getattr(cfg.sampling, "sweep_range", (2.0, -4.0)),
+                    "video_sequence_structure": video_seq_structure, # Pass this
+                    "video_source_name": getattr(cfg.sampling, "sweep_video_source", None), # Optional: specify a particular video split
+                }
+                
+                fig_sweep = sample_viz_causal_sweep(components, val_iterator, sweep_cfg)
+                logger.save_figure(fig_sweep, f"{cfg.training.mode}_causal_sweep")
+
+    print("\nPlotting...")
+    plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg.training.mode}")
     
+    print(f"\nDone! Results in {logger.run_dir}")
     print("\nPlotting...")
     plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg.training.mode}")
     

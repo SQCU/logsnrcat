@@ -14,6 +14,8 @@ from .train import (
 @torch.no_grad()
 def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_logsnr, steps, mode, config, fixed_data=None):
     """Evolves a list of ContextBlocks from their initial state/logsnr to target_logsnr."""
+    if not start_blocks: return []
+    
     device = start_blocks[0].content.device
     taus = torch.linspace(0.0, 1.0, steps + 1, device=device)
     
@@ -65,18 +67,20 @@ def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_lo
     return [z.clamp(0, 1) for z in z_list]
 
 
+
 @torch.no_grad()
 def sample_viz_dset(components, iterator, config):
     """Sample and visualize reconstruction from stratified noise."""
     model, _, _, _ = components
     model.eval()
     
-    res = config.get("res", 32)
     n = config.get("num_samples", 8)
-    
+    # Fetch blocks (likely mixed resolution)
     clean_blocks = iterator.generate_batch_list(n)
     clean_blocks = [b for b in clean_blocks if b.type == "latent"][:n]
     
+    if not clean_blocks: return {}
+
     min_snr = config.get("min_logsnr", -4.0)
     max_snr = config.get("max_logsnr", 1.0)
     device = clean_blocks[0].content.device
@@ -109,11 +113,12 @@ def sample_viz_dset(components, iterator, config):
     )
     model.train()
     
+    # RETURN LISTS instead of stacks
     return {
-        "x0": torch.stack(x0s),
-        "noisy_input": torch.stack(noisy_inputs),
-        "reconstruction": torch.stack(z_final),
-        "logsnr_map": torch.stack([b.logsnr for b in clean_blocks])
+        "x0": x0s,
+        "noisy_input": noisy_inputs,
+        "reconstruction": z_final,
+        "logsnr_map": [b.logsnr for b in clean_blocks]
     }
 
 
@@ -123,10 +128,11 @@ def sample_viz_split_topology(components, iterator, config):
     model, _, _, _ = components
     model.eval()
     
-    res = config.get("res", 32)
     n = config.get("num_samples", 8)
     clean_blocks = iterator.generate_batch_list(n)
     clean_blocks = [b for b in clean_blocks if b.type == "latent"][:n]
+    
+    if not clean_blocks: return {}
     
     start_blocks = []
     noisy_inputs = []
@@ -153,60 +159,85 @@ def sample_viz_split_topology(components, iterator, config):
     )
     model.train()
     
+    # RETURN LISTS instead of stacks
     return {
-        "x0": torch.stack(x0s),
-        "noisy_input": torch.stack(noisy_inputs),
-        "reconstruction": torch.stack(z_final),
-        "logsnr_map": torch.stack([b.logsnr for b in clean_blocks])
+        "x0": x0s,
+        "noisy_input": noisy_inputs,
+        "reconstruction": z_final,
+        "logsnr_map": [b.logsnr for b in clean_blocks]
     }
 
 
 @torch.no_grad()
 def sample_viz_causal_sweep(components, iterator, config):
     """
-    Demonstrates Information Flow by sweeping Prefix SNR.
-    
-    Layout per Sequence (2 rows):
-    [Noisy P1] [Noisy P2] [Noisy P3] [Gen Suffix]
-    [MSE P1]   [MSE P2]   [MSE P3]   [MSE Suffix]
-    
-    Args:
-        config keys:
-            num_sweep_sequences (N): Number of rows to plot.
-            sequence_length (M): Total frames per row (default 4).
-            prefix_snr_range: Tuple (start, end) e.g. (2.0, -4.0).
+    Demonstrates Information Flow by sweeping Prefix SNR, specifically using video sequences.
     """
     model, _, _, _ = components
     model.eval()
     device = model.text_embed.weight.device
     
-    # 1. Config & Data Prep
     N = config.get('num_sweep_sequences', 4)
     M = config.get('sequence_length', 4)
     snr_start, snr_end = config.get('prefix_snr_range', (2.0, -4.0))
+    video_sequence_structure = config.get('video_sequence_structure')
+    video_source_name_filter = config.get('video_source_name', None) # Optional filter for a specific video split
     
-    # Fetch enough data to find N valid sequences of length M
-    # We fetch a large batch and group by ID
-    fetch_buffer = N * M * 2 
-    raw_blocks = iterator.generate_batch_list(fetch_buffer)
+    if not video_sequence_structure:
+        print("⚠️ Warning: 'video_sequence_structure' not provided for causal sweep. Cannot fetch video data.")
+        return plt.figure() # Return an empty figure
+
+    # --- Find and use a Video Iterator instance ---
+    video_iterator_instance = None
+    for split in iterator.splits: # 'iterator' is a CompositeIterator
+        if split['type'] == 'video':
+            # If a specific source name is requested, match it
+            if video_source_name_filter and split['name'] != video_source_name_filter:
+                continue
+            video_iterator_instance = split['iterator']
+            break
     
-    # Group into sequences
-    from collections import defaultdict
-    groups = defaultdict(list)
-    for b in raw_blocks:
-        if b.type == 'latent':
-            groups[b.group_id].append(b)
-            
-    # Filter for valid length
-    sequences = [sorted(g, key=lambda x: x.id) for g in groups.values() if len(g) >= M]
-    sequences = sequences[:N]
+    if video_iterator_instance is None:
+        print(f"⚠️ Warning: No 'video' type iterator found in CompositeIterator (matching '{video_source_name_filter}' if specified) for causal sweep.")
+        return plt.figure()
+
+    # Request N sequences from the video iterator, each of length M
+    # The VideoFolderIterator's generate_batch_list returns a FLAT list of ContextBlocks
+    # for N * M frames.
+    flat_blocks_from_video_iterator = video_iterator_instance.generate_batch_list(N, video_sequence_structure)
+    
+    # --- Re-group the flat list of blocks into N sequences ---
+    sequences = []
+    current_sequence_blocks = []
+    
+    if flat_blocks_from_video_iterator:
+        current_group_id = flat_blocks_from_video_iterator[0].group_id
+        
+        for block in flat_blocks_from_video_iterator:
+            if block.group_id == current_group_id:
+                current_sequence_blocks.append(block)
+            else:
+                # New sequence starts. Add the previous one if it's the correct length.
+                if len(current_sequence_blocks) == M: 
+                    sequences.append(sorted(current_sequence_blocks, key=lambda x: x.id))
+                current_sequence_blocks = [block]
+                current_group_id = block.group_id
+        
+        # Add the very last sequence after the loop
+        if len(current_sequence_blocks) == M:
+            sequences.append(sorted(current_sequence_blocks, key=lambda x: x.id))
+    
+    # Ensure we don't exceed N sequences or have sequences of incorrect length
+    sequences = [s for s in sequences if len(s) == M]
+    sequences = sequences[:N] 
     
     if len(sequences) < N:
-        print(f"⚠️ Warning: Requested {N} sequences, found {len(sequences)}")
-        N = len(sequences)
+        print(f"⚠️ Warning: Requested {N} sequences, but only found {len(sequences)} of length {M} after fetching from video iterator. Adjusting N.")
+        if not sequences:
+            return plt.figure() # Return empty if no sequences
+        N = len(sequences) # Adjust N if fewer sequences are available
 
     # 2. Setup Plot
-    # Figure: N * 2 Rows, M Columns
     fig, axes = plt.subplots(N * 2, M, figsize=(3 * M, 4 * N))
     plt.subplots_adjust(hspace=0.3, wspace=0.1)
     
@@ -261,7 +292,6 @@ def sample_viz_causal_sweep(components, iterator, config):
                 fixed_data.append(None) # None = Solve me
 
         # Run Solver
-        # Uses the config's sampling steps (e.g. 20 or 50)
         z_final = spatial_euler_solver(
             components, start_blocks, 
             target_logsnr=config.get('target_logsnr', 10.0),
@@ -276,29 +306,21 @@ def sample_viz_causal_sweep(components, iterator, config):
         row_bot = i * 2 + 1
         
         for t in range(M):
-            # A. Visual State
-            # Prefix: Shows the noisy condition provided
-            # Suffix: Shows the hallucinated result
             viz_tens = z_final[t].permute(1,2,0).cpu().clamp(0,1).numpy()
             
-            ax_img = axes[row_top, t] if N > 1 else axes[t] # Handle N=1 edge case logic if needed
+            ax_img = axes[row_top, t] if N > 1 else axes[t]
             ax_img.imshow(viz_tens)
             ax_img.axis('off')
             
-            # Headers
             if t == 0:
                 ax_img.set_title(f"Prefix SNR: {prefix_snr:.1f}\n(Input)", fontsize=10, loc='left')
             elif t == suffix_idx:
                 ax_img.set_title("Generated Suffix\n(Output)", fontsize=10, fontweight='bold')
                 
-            # B. Error Field (MSE Heatmap)
-            # Diff against Ground Truth
             gt = gt_visuals[t]
-            # Since z_final[t] might be on GPU and gt on GPU, compute diff there
-            diff = (z_final[t] - gt).pow(2).mean(dim=0).cpu().numpy() # [H, W]
+            diff = (z_final[t] - gt).pow(2).mean(dim=0).cpu().numpy()
             
             ax_err = axes[row_bot, t]
-            # Use a hot colormap for error. Normalize 0 to 0.1 for sensitivity.
             im_err = ax_err.imshow(diff, cmap='inferno', vmin=0, vmax=0.1)
             ax_err.axis('off')
             

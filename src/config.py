@@ -124,6 +124,8 @@ class TrainingConfig(BaseModel):
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     ae_optimizer: AEOptimizerConfig = Field(default_factory=AEOptimizerConfig)
 
+    precision: str = "fp32"  # <--- ENABLE THIS # Options: "fp32", "bf16", "fp16"
+
 
 class SamplingConfig(BaseModel):
     num_samples: int = 8
@@ -131,6 +133,11 @@ class SamplingConfig(BaseModel):
     target_logsnr: float = 10.0
     resolutions: List[int] = Field(default_factory=lambda: [32, 64])
 
+    # New Causal Sweep fields
+    enable_sweep: bool = False
+    sweep_count: int = 4
+    sweep_length: int = 4
+    sweep_range: Tuple[float, float] = (2.0, -4.0)
 
 class PageTableConfig(BaseModel):
     num_blocks: int = 1024
