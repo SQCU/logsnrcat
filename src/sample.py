@@ -68,7 +68,7 @@ def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_lo
 @torch.no_grad()
 def sample_viz_dset(components, iterator, config):
     """Sample and visualize reconstruction from stratified noise."""
-    model, _, _, _, _ = components
+    model, _, _, _ = components
     model.eval()
     
     res = config.get("res", 32)
@@ -120,7 +120,7 @@ def sample_viz_dset(components, iterator, config):
 @torch.no_grad()
 def sample_viz_split_topology(components, iterator, config):
     """Sample and visualize using split topology (block logsnr maps)."""
-    model, _, _, _, _ = components
+    model, _, _, _ = components
     model.eval()
     
     res = config.get("res", 32)

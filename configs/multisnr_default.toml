@@ -1,0 +1,161 @@
+# Default config matching bench_multisnr_zc.py exactly
+
+[model]
+dim = 256
+depth = 16
+num_heads = 8
+topo_dim = 3
+mlp_depth = 1
+vocab_size = 65536
+global_layer_interval = 4
+num_experts = 8
+num_active = 3
+rope_base = 500
+mlp_ratio = 4.0
+jitter_noise = 0.1
+window_size = 10.0
+
+[model.patch_embedder]
+input_channels = 3
+fourier_dim = 16
+context_size = 4
+stride = 2
+mlp_depth = 1
+
+[training]
+ae_steps = 500
+steps = 500
+lambda_coeff = 0.2
+mode = "naive"
+batch_size = 8
+compile = true
+compile_dynamic = true
+schedule_bounds = [5.0, -4.0]
+
+[training.optimizer]
+lr = 5e-4
+weight_decay = 0.1
+max_lr = 5e-4
+pct_start = 0.1
+div_factor = 10.0
+final_div_factor = 100.0
+
+[training.ae_optimizer]
+lr = 5e-4
+weight_decay = 0.1
+max_lr = 5e-4
+pct_start = 0.1
+final_div_factor = 100.0
+
+[sampling]
+num_samples = 8
+steps = 25
+target_logsnr = 10.0
+resolutions = [32, 64]
+
+[sampling.sweep]
+enabled = true
+interval = 250
+num_sequences = 4
+sequence_length = 4
+prefix_snr_range = [5.0, -2.0] #-5 snr is really  toasted
+target_logsnr = 10.0
+sampling_steps = 20
+mode = "naive"
+
+[page_table]
+num_blocks = 1024
+block_size = 128
+max_batch_size = 128
+max_logical_blocks = 1024
+
+[logging]
+output_dir = "./experiments_mix"
+log_interval = 100
+sample_after_training = true
+
+# Dataset mix - matches bench_multisnr_zc.py
+[dataset_mix.uniform_checker]
+type = "checkerboard"
+ratio = 0.2
+noise_mode = "uniform"
+[dataset_mix.uniform_checker.noise_params]
+min_snr = -4.0
+max_snr = 5.0
+
+[dataset_mix.split_checker]
+type = "checkerboard"
+ratio = 0.3
+noise_mode = "split"
+[dataset_mix.split_checker.noise_params]
+min_snr = -5.0
+max_snr = 5.0
+angle_range_deg = 30.0
+
+[dataset_mix.split_torus]
+type = "torus"
+ratio = 0.3
+noise_mode = "split"
+[dataset_mix.split_torus.noise_params]
+min_snr = -5.0
+max_snr = 2.0
+angle_range_deg = 270.0
+
+[dataset_mix.uniform_torus]
+type = "torus"
+ratio = 0.2
+noise_mode = "uniform"
+[dataset_mix.uniform_torus.noise_params]
+min_snr = -5.0
+max_snr = 5.0
+
+[dataset_mix.video_causal_zoom]
+type = "video"
+ratio = 0.8
+# No global noise_mode here; it is defined per-frame in sequence_structure
+
+[dataset_mix.video_causal_zoom.params]
+path = "C:/dox/recordings/rl_capture/capture_run_1760343426/videos"
+
+# Time Sampler: Pick a 0.1% to 5% slice of the video for the sequence
+[dataset_mix.video_causal_zoom.params.time_sampler]
+min_pct = 0.001
+max_pct = 0.05
+
+# --- Sequence Definition (List of 4 Frames) ---
+
+# Frame 0: Context (32px, Clean-ish)
+[[dataset_mix.video_causal_zoom.params.sequence_structure]]
+res = 32
+noise_mode = "split"
+[dataset_mix.video_causal_zoom.params.sequence_structure.noise_params]
+min_snr = 2.0
+max_snr = 6.0
+angle_range_deg = 15.0
+
+# Frame 1: Context (32px, Clean-ish)
+[[dataset_mix.video_causal_zoom.params.sequence_structure]]
+res = 32
+noise_mode = "split"
+[dataset_mix.video_causal_zoom.params.sequence_structure.noise_params]
+min_snr = 2.0
+max_snr = 6.0
+angle_range_deg = 15.0
+
+# Frame 2: Context (32px, Clean-ish)
+[[dataset_mix.video_causal_zoom.params.sequence_structure]]
+res = 32
+noise_mode = "split"
+[dataset_mix.video_causal_zoom.params.sequence_structure.noise_params]
+min_snr = 2.0
+max_snr = 6.0
+angle_range_deg = 15.0
+
+# Frame 3: Target (64px, Full Noise Range, Aggressive Topology)
+[[dataset_mix.video_causal_zoom.params.sequence_structure]]
+res = 64
+noise_mode = "split"
+[dataset_mix.video_causal_zoom.params.sequence_structure.noise_params]
+min_snr = -5.0
+max_snr = 5.0
+angle_range_deg = 45.0

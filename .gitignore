@@ -3,3 +3,7 @@ uv.lock
 
 .inductor_cache
 __pycache__
+
+configs/alt
+
+experiments_alt

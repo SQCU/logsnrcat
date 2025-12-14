@@ -8,6 +8,13 @@ import random
 from pathlib import Path
 from .model import ContextBlock  # Import the canonical definition
 
+# lookahead iterator
+import time
+import random
+import threading
+import queue
+from collections import defaultdict
+
 # Try importing torchvision for video handling
 # --- Dependency Check: Swap torchvision for torchcodec ---
 try:
@@ -17,6 +24,12 @@ except ImportError:
     HAS_TORCHCODEC = False
     print("⚠️ torchcodec not found. Video iterator will fail if used.")
 
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    print("⚠️ psutil not found. RAM safety checks disabled.")
 # --- 1. Noise Topology Generators ---
 
 def generate_split_logsnr(B, H, W, device, min_snr=-4.0, max_snr=1.0, angle_range_deg=30.0, jitter_pct=0.05):
@@ -338,106 +351,6 @@ class TorusIterator:
             ))
         return blocks
 
-class VideoFolderIterator:
-    def __init__(self, folder_path, device='cuda'):
-        if not HAS_TORCHCODEC: raise ImportError("torchcodec required")
-        self.device = device
-        self.folder = Path(folder_path)
-        self.files = sorted(list(self.folder.glob("**/*.mp4")))
-        if not self.files: raise ValueError(f"No videos in {folder_path}")
-
-    def _sample_indices(self, total_frames, seq_len, sampler_config):
-        min_pct = sampler_config.get('min_pct', 0.0)
-        max_pct = sampler_config.get('max_pct', 1.0)
-        stride = sampler_config.get('stride', None)
-        if total_frames < seq_len: return [i % total_frames for i in range(seq_len)]
-        
-        min_span = max(seq_len, int(total_frames * min_pct))
-        max_span = max(min_span, int(total_frames * max_pct))
-        max_span = min(max_span, total_frames); min_span = min(min_span, max_span)
-        actual_span = random.randint(min_span, max_span)
-        max_start = total_frames - actual_span
-        start_idx = random.randint(0, max_start)
-        window_range = range(start_idx, start_idx + actual_span)
-        
-        if stride is not None:
-            indices = [start_idx + i * stride for i in range(seq_len)]
-            indices = [i % total_frames for i in indices]
-        else:
-            indices = sorted(random.sample(window_range, seq_len))
-        return indices
-
-    def generate_batch_list(self, batch_size, sequence_config, start_group_id=0):
-        from concurrent.futures import ThreadPoolExecutor
-        
-        seq_len = len(sequence_config)
-        chosen_files = random.choices(self.files, k=batch_size)
-        sampler_config = sequence_config[0].get('time_sampler', {})
-
-        # Define the worker function for a single video sequence
-        def fetch_sequence(args):
-            fpath, group_id = args
-            blocks = []
-            try:
-                # 1. Open
-                decoder = safe_create_decoder(fpath, self.device)
-                total_frames = decoder.metadata.num_frames
-                if total_frames is None: return []
-                
-                # 2. Plan
-                indices = self._sample_indices(total_frames, seq_len, sampler_config)
-                
-                # 3. Decode (Heavy Lifting - happens in parallel now)
-                # Note: safe_create_decoder ensures data lands on self.device (GPU)
-                # Moving to GPU inside a thread is generally safe in PyTorch
-                raw_batch = decoder.get_frames_at(indices).data.float() / 255.0
-                
-                # 4. Resize & Pack
-                for t, (frame_raw, spec) in enumerate(zip(raw_batch, sequence_config)):
-                    target_res = spec.get('res', 32)
-                    if frame_raw.shape[-1] != target_res:
-                        frame = F.interpolate(
-                            frame_raw.unsqueeze(0), 
-                            size=(target_res, target_res), 
-                            mode='area'
-                        ).squeeze(0)
-                    else: 
-                        frame = frame_raw
-                    
-                    n_mode = spec.get('noise_mode', 'uniform')
-                    n_params = spec.get('noise_params', {})
-                    # Optimization: Generate logsnr on device, no CPU trip needed
-                    lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
-                    
-                    blocks.append(ContextBlock(
-                        content=frame,
-                        type='latent',
-                        causal=True,
-                        logsnr=lsnr,
-                        group_id=group_id,
-                        id=f"vid_{group_id}_{t}"
-                    ))
-                return blocks
-            except Exception as e:
-                # print(f"Fetch fail {fpath.name}: {e}") # Optional noise
-                return []
-
-        # Prepare arguments for parallel execution
-        # We pre-assign group_ids to keep them distinct
-        tasks = [(f, start_group_id + i) for i, f in enumerate(chosen_files)]
-        
-        all_blocks = []
-        
-        # ThreadPoolExecutor efficiently distributes the CPU-bound decoding tasks
-        # max_workers=batch_size ensures we try to decode the whole batch at once
-        with ThreadPoolExecutor(max_workers=min(batch_size, 16)) as executor:
-            results = executor.map(fetch_sequence, tasks)
-            
-        for res in results:
-            if res:
-                all_blocks.extend(res)
-                
-        return all_blocks
 
 class CheckerboardIterator:
     def __init__(self, device='cuda'): self.device = device
@@ -474,6 +387,246 @@ class CheckerboardIterator:
         return blocks
 
 
+
+class RawSequenceBatch:
+    """Buffer object. Frames are now small (resized) uint8 tensors."""
+    def __init__(self, small_frames, configs, group_id, req_idx):
+        self.small_frames = small_frames # [L, C, Res, Res] uint8, CPU
+        self.configs = configs
+        self.group_id = group_id
+        self.req_idx = req_idx
+
+class VideoFolderIterator:
+    def __init__(self, folder_path, device='cuda', horizon=256, result_queue_depth=1024, num_workers=None, max_ram_pct=95.0):
+        if not HAS_TORCHCODEC: raise ImportError("torchcodec required")
+        self.device = device
+        self.folder = Path(folder_path)
+        self.files = sorted(list(self.folder.glob("**/*.mp4")))
+        if not self.files: raise ValueError(f"No videos in {folder_path}")
+        
+        self.num_workers = num_workers if num_workers else max(4, (os.cpu_count()//2) - 1)
+        self.max_ram_pct = max_ram_pct
+        
+        print(f"🚀 Video Iterator: {self.num_workers} threads, RAM Limit: {max_ram_pct}%")
+        
+        self.horizon = horizon
+        self.stop_event = threading.Event()
+        
+        # Queues
+        self.job_queue = queue.Queue(maxsize=horizon * 2)
+        # Note: We can increase result queue depth now because items are small!
+        self.result_queue = queue.Queue(maxsize=result_queue_depth)
+        
+        self.lock = threading.Lock()
+        self.global_group_id = 0
+        self.current_seq_config = None
+        
+        # Start Threads
+        self.planner_thread = threading.Thread(target=self._planner_loop, daemon=True)
+        self.planner_thread.start()
+        
+        self.workers = []
+        for i in range(self.num_workers):
+            t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True)
+            t.start()
+            self.workers.append(t)
+
+    def _check_memory_pressure(self):
+        """Returns True if we should pause due to RAM usage."""
+        if HAS_PSUTIL:
+            return psutil.virtual_memory().percent > self.max_ram_pct
+        return False
+
+    def _sample_indices(self, total_frames, seq_len, sampler_config):
+        min_pct = sampler_config.get('min_pct', 0.0)
+        max_pct = sampler_config.get('max_pct', 1.0)
+        stride = sampler_config.get('stride', None)
+        
+        if total_frames <= seq_len: return [i % total_frames for i in range(seq_len)]
+        start_min = int(total_frames * min_pct)
+        start_max = int(total_frames * max_pct) - seq_len
+        if start_max <= start_min: start_max = start_min + 1
+        
+        start_idx = random.randint(start_min, max(start_min, start_max))
+        
+        if stride:
+            indices = [(start_idx + i * stride) % total_frames for i in range(seq_len)]
+        else:
+            indices = [(start_idx + i) % total_frames for i in range(seq_len)]
+        return indices
+
+    def _planner_loop(self):
+        while not self.stop_event.is_set():
+            # 1. Memory Safety Check
+            if self._check_memory_pressure():
+                time.sleep(1.0) # Cool down for 1 second
+                continue
+
+            # 2. Backpressure
+            if self.result_queue.qsize() > (self.result_queue.maxsize - self.horizon):
+                time.sleep(0.05)
+                continue
+            
+            if self.current_seq_config is None:
+                time.sleep(0.1)
+                continue
+
+            if self.job_queue.full():
+                time.sleep(0.01)
+                continue
+
+            # 3. Create Jobs
+            seq_config = self.current_seq_config
+            sampler = seq_config[0].get('time_sampler', {})
+            seq_len = len(seq_config)
+            
+            batch_files = random.choices(self.files, k=self.horizon)
+            
+            with self.lock:
+                start_gid = self.global_group_id
+                self.global_group_id += self.horizon
+            
+            jobs_by_file = defaultdict(list)
+            for i, fpath in enumerate(batch_files):
+                req_idx = i 
+                gid = start_gid + i
+                jobs_by_file[fpath].append((req_idx, gid))
+            
+            for fpath, requests in jobs_by_file.items():
+                try:
+                    self.job_queue.put((fpath, requests, seq_config, seq_len, sampler), timeout=1.0)
+                except queue.Full:
+                    pass
+
+    def _worker_loop(self, worker_id):
+        while not self.stop_event.is_set():
+            # Double check memory pressure inside worker before grabbing heavy jobs
+            if self._check_memory_pressure():
+                time.sleep(1.0)
+                continue
+
+            try:
+                job = self.job_queue.get(timeout=1.0)
+                fpath, requests, seq_config, seq_len, sampler = job
+            except queue.Empty:
+                continue
+
+            try:
+                decoder = VideoDecoder(str(fpath), device='cpu')
+                total_frames = decoder.metadata.num_frames
+                if not total_frames: 
+                    self.job_queue.task_done()
+                    continue
+
+                req_to_idxs = {}
+                all_idxs = set()
+                
+                for req_idx, gid in requests:
+                    idxs = self._sample_indices(total_frames, seq_len, sampler)
+                    req_to_idxs[req_idx] = idxs
+                    all_idxs.update(idxs)
+                
+                if not all_idxs:
+                    self.job_queue.task_done()
+                    continue
+
+                # --- DECODE (Heavy RAM Usage Starts) ---
+                sorted_idxs = sorted(list(all_idxs))
+                # Decode to CPU uint8
+                heavy_frames = decoder.get_frames_at(sorted_idxs).data 
+                
+                # --- IMMEDIATE DOWNSCALE (The Fix) ---
+                # We map indices to *resized* frames immediately
+                idx_to_small_tensor = {}
+                
+                # Determine target resolution from config (assuming uniform usually, but handling mixed)
+                # We use the max resolution in the sequence to be safe, or just check first
+                target_res = seq_config[0].get('res', 32)
+                
+                # Check if we need to resize at all
+                needs_resize = (heavy_frames.shape[-1] != target_res)
+                
+                if needs_resize:
+                    # Convert to float for area interpolation, then back to uint8
+                    # [N, C, H, W] -> Float -> Resize -> Uint8
+                    # We do this in one block if N is reasonable, or loop if N is huge.
+                    # Given the horizon, N is usually small (<100) per file.
+                    
+                    # 1. Float Cast (Heavy but necessary for good downscaling)
+                    hf_float = heavy_frames.float()
+                    
+                    # 2. Resize
+                    sf_float = F.interpolate(
+                        hf_float, 
+                        size=(target_res, target_res), 
+                        mode='area' # 'area' is best for downscaling
+                    )
+                    
+                    # 3. Cast back to uint8 to save queue RAM
+                    small_frames_batch = sf_float.to(torch.uint8)
+                    
+                    # 4. Explicit delete to free RAM ASAP
+                    del heavy_frames
+                    del hf_float
+                    del sf_float
+                else:
+                    small_frames_batch = heavy_frames
+
+                # Map back to indices
+                for i, idx in enumerate(sorted_idxs):
+                    idx_to_small_tensor[idx] = small_frames_batch[i]
+                
+                # Assemble Requests
+                for req_idx, gid in requests:
+                    needed = req_to_idxs[req_idx]
+                    seq_stack = torch.stack([idx_to_small_tensor[x] for x in needed])
+                    
+                    result = RawSequenceBatch(seq_stack, seq_config, gid, req_idx)
+                    self.result_queue.put(result)
+                    
+            except Exception as e:
+                pass
+            finally:
+                self.job_queue.task_done()
+
+    def generate_batch_list(self, batch_size, sequence_config, start_group_id=0):
+        if self.current_seq_config is None:
+            self.current_seq_config = sequence_config
+            
+        out_blocks = []
+        fetched = 0
+        
+        while fetched < batch_size:
+            try:
+                batch_raw = self.result_queue.get(timeout=10.0)
+            except queue.Empty:
+                print("⚠️ Video Queue Empty! Workers lagging.")
+                break
+                
+            # 1. GPU Transfer & Cast
+            # Input is already resized uint8 [L, C, res, res]
+            frames_gpu = batch_raw.small_frames.to(self.device, non_blocking=True).float() / 255.0
+            
+            seq_blocks = []
+            for t, (frame, spec) in enumerate(zip(frames_gpu, batch_raw.configs)):
+                # Frames are already resized by worker, but check just in case config changed dynamically
+                target_res = spec.get('res', 32)
+                if frame.shape[-1] != target_res:
+                    frame = F.interpolate(frame.unsqueeze(0), size=(target_res, target_res), mode='area').squeeze(0)
+                
+                n_mode = spec.get('noise_mode', 'uniform')
+                n_params = spec.get('noise_params', {})
+                lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
+                
+                seq_blocks.append(ContextBlock(
+                    content=frame, type='latent', causal=True, logsnr=lsnr,
+                    group_id=batch_raw.group_id, id=f"vid_{batch_raw.group_id}_{t}"
+                ))
+            
+            out_blocks.extend(seq_blocks)
+            fetched += 1
+            
+        return out_blocks
 
 # --- 3. Composite Iterator (Refactored) ---
 

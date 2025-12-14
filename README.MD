@@ -31,42 +31,11 @@ This project uses `uv` for fast and reliable dependency management.
 
 4.  **run it!**:
 
-    ~~`python bench_v_pred.py`~~
+    thanks to valued contributor kalomaze for moduleifying the source
 
-    
-    `python bench_multires_cl.py`
+    `python -m src.causal_sweep_test`
 
-    better logging, less interactive repl:
-
-    `python diffusion_lab_bench_v3`
-
-    to concretely measure gradient 
-
-    `python compiler_daemon.py`
-
-    for crimes against torch
-
-    `python bench_backbone_hit_that_griddy.py`
-
-    test marginal benefit of different flops assignments
-
-    `bench_multires_cl_p.py` 
-
-    in case you wanted vllm at home that you can backwards() through
-
-    `bench_multires_zc.py`
-
-    zero copy block-masked attention to unify batch and sequence dimensions. 
-
-    this makes mixed resolution training and interleaved sampling/eval SUPER FAST.
-
-    `bench_multisnr_zc.py`
-
-    regularizations to stop logsnr output field collapse. 
-    
-    but also newer and harder datasets for unconditional unsupervised in-context-learning.
-
-    converges like 10x faster for some reason? please don't ask me to explain i tried to find the pessimization in the old script and couldn't find it.
+    validate package structure
 
 5. **why low resolution checkerboards?**
 
