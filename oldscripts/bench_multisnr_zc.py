@@ -105,7 +105,7 @@ def run_model_forward(components, blocks: List[ContextBlock]):
     Unified forward pass. 
     The 'blocks' contain the Tensors (z_t) and the Metadata (logsnr, shape, id).
     """
-    model, span_embedder, span_unembedder, _, page_table = components
+    model, span_embedder, span_unembedder, page_table = components
     device = model.text_embed.weight.device 
     
     # 1. Embed (Pass blocks directly)
@@ -175,7 +175,7 @@ def autoregressive_sample_loop(components, x0_shape, config):
     """
     Unified sampler for visual validation.
     """
-    model, _, _, _, _ = components
+    model, _, _, _ = components
     model.eval()
     
     res = config.get('res', 32)
@@ -554,7 +554,7 @@ def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_lo
 
 @torch.no_grad()
 def sample_viz_dset(components, iterator, config):
-    model, _, _, _, _ = components
+    model, _, _, _ = components
     model.eval()
     
     res = config.get('res', 32)
@@ -607,7 +607,7 @@ def sample_viz_dset(components, iterator, config):
 @torch.no_grad()
 def sample_viz_split_topology(components, iterator, config):
     # Similar to above, but uses the iterator's logsnr directly
-    model, _, _, _, _ = components
+    model, _, _, _ = components
     model.eval()
     
     res = config.get('res', 32)
@@ -644,7 +644,7 @@ def sample_viz_split_topology(components, iterator, config):
 
 @torch.no_grad()
 def sample_viz_causal_prefix_fig(components, iterator, config):
-    model, _, _, _, _ = components
+    model, _, _, _ = components
     model.eval()
     
     # 1. Get a Sequence Group
@@ -821,7 +821,7 @@ if __name__ == "__main__":
     # Dummy PageTable (needed for mask construction interface, though unused in logic)
     page_table = PageTable(num_blocks=1024, block_size=128, max_batch_size=128, max_logical_blocks=1024, device=device)
     
-    components = (model, span_emb, span_unemb, None, page_table)
+    components = (model, span_emb, span_unemb, page_table)
 
     # Iterator for Validation Sampling
     val_iterator = CompositeIterator(device, config=dataset_mix)

@@ -33,12 +33,15 @@ dependencies = [
     "transformers>=4.51.3",
     "wandb>=0.19.11",
     "gluon-experiment @ git+https://github.com/sqcu/gluon-experiment.git", # dion has rocked for a long long time
+    #refactor
+    "tomli",
     #logsnrcat
     "matplotlib",
     #"pytorch3d",
     'xxhash',
     "av", #ffmpeg bindings?
     "torchcodec", #better ffmpeg bindings
+
     #pytorch3d is fictional
     #crimes against nature
     "pyzmq",
