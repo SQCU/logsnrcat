@@ -11,219 +11,115 @@ from torch.optim.lr_scheduler import OneCycleLR
 
 from .model import (
     coolerLDTformerZC, SpanEmbedder, SpanUnembedder, 
-    build_dual_masks, ContextBlock, render_topology_embeddings
+    build_dual_masks, ContextBlock, render_topology_embeddings, PageTable
 )
 from .data import CompositeIterator
-from .utils import PageTable
+from .utils import run_model_forward, predict_velocity_from_blocks
+from .sample import euler_forward_step, euler_reverse_step
+from .config import sanitize_config
 
-# ==============================================================================
-# 1. Math & Physics Helpers (Deduplicated)
-# ==============================================================================
-
-def get_schedule(t, schedule_bounds: tuple = (5, -4)):
-    """Linear LogSNR schedule."""
-    return schedule_bounds[0] - t * (schedule_bounds[1] - schedule_bounds[0])
-
-def logsnr_to_alpha_sigma(logsnr):
+def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
     """
-    Returns alpha, sigma for a given logsnr.
-    Handles broadcasting if logsnr is [B, 1, H, W].
+    Scans config to find the maximum resolution required for video caching.
+    Considers both explicit bucket definitions and sequence relative scaling.
     """
-    # Ensure numerical stability
-    sigmoid_lsnr = torch.sigmoid(logsnr)
-    sigmoid_neg_lsnr = torch.sigmoid(-logsnr)
-    alpha = torch.sqrt(sigmoid_lsnr)
-    sigma = torch.sqrt(sigmoid_neg_lsnr)
-    return alpha, sigma
-
-def euler_forward_step(x0, logsnr, noise=None):
-    """
-    Diffuses x0 -> z_t. Returns z_t and the target velocity v_true.
-    """
-    if noise is None:
-        noise = torch.randn_like(x0)
+    max_res = 32 # Floor
     
-    alpha, sigma = logsnr_to_alpha_sigma(logsnr)
-    
-    # Broadcast check: logsnr might be [B, 1, H, W] or [B]
-    if alpha.ndim == 1:
-        alpha = alpha.view(-1, 1, 1, 1)
-        sigma = sigma.view(-1, 1, 1, 1)
-        
-    z_t = x0 * alpha + noise * sigma
-    v_true = alpha * noise - sigma * x0
-    return z_t, v_true, noise
-
-def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
-    """
-    Denoises z_t -> z_{t-1}.
-    """
-    alpha_from, sigma_from = logsnr_to_alpha_sigma(logsnr_from)
-    alpha_to, sigma_to = logsnr_to_alpha_sigma(logsnr_to)
-    
-    if alpha_from.ndim == 1:
-        alpha_from = alpha_from.view(-1, 1, 1, 1)
-        sigma_from = sigma_from.view(-1, 1, 1, 1)
-        alpha_to = alpha_to.view(-1, 1, 1, 1)
-        sigma_to = sigma_to.view(-1, 1, 1, 1)
-
-    # Reconstruct x0 (prediction)
-    x0_pred = alpha_from * z_t - sigma_from * v_pred
-    # Reconstruct eps (prediction)
-    eps_pred = sigma_from * z_t + alpha_from * v_pred
-    
-    # Step to next level
-    z_next = alpha_to * x0_pred + sigma_to * eps_pred
-    return z_next
-
-def get_image_spans(resolution):
-    latent_res = resolution // 2
-    length = latent_res * latent_res
-    return [{'type': 'latent', 'len': length, 'shape': (latent_res, latent_res), 'causal': False}]
-
-# ==============================================================================
-# 2. Model Wrappers & Sampling
-# ==============================================================================
-
-def run_model_forward(components, blocks: List[ContextBlock]):
-    """
-    Unified forward pass. 
-    The 'blocks' contain the Tensors (z_t) and the Metadata (logsnr, shape, id).
-    """
-    model, span_embedder, span_unembedder, page_table = components
-    device = model.text_embed.weight.device 
-    
-    # 1. Embed (Pass blocks directly)
-    z_flat, span_objects, _ = span_embedder.embed(blocks)
-    
-    # 2. Topology
-    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device)
-    
-    # 3. Masking
-    L_total = z_flat.shape[0]
-    block_size = page_table.block_size
-    num_blocks = (L_total + block_size - 1) // block_size
-    flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
-    
-    block_masks = build_dual_masks(
-        span_objects, topo_embeds, topo_embeds,
-        page_table, flat_page_table, None,
-        window_size=getattr(model, 'window_size', 10.0)
-    )
-    
-    # 4. Transformer
-    rope_scale = max(1.0, L_total / 64.0)
-    z_out, aux_loss = model(
-        z_flat.unsqueeze(0),
-        topo_embeds.unsqueeze(0),
-        slot_mapping=None,
-        block_masks=block_masks,
-        scale=rope_scale
-    )
-    
-    # 5. Unembed
-    decoded = span_unembedder.decode(z_out.squeeze(0), span_objects)
-    return decoded, aux_loss
-
-
-def predict_velocity_from_blocks(components, blocks: List[ContextBlock], mode='naive'):
-    """
-    Wrapper that calls model and processes outputs (factorization, etc).
-    """
-    decoded, aux_loss = run_model_forward(components, blocks)
-    
-    v_final_list = []
-    pred_logsnr_list = []
-    
-    for i, d in enumerate(decoded):
-        if 'image_vpreds' in d:
-            v_raw = d['image_vpreds']
-            pred_l = d['image_logsnrs']
-            
-            if mode == 'factorized':
-                sigma_p = torch.sqrt(torch.sigmoid(-pred_l))
-                v_final = v_raw * sigma_p
-            else:
-                v_final = v_raw
-            
-            v_final_list.append(v_final)
-            pred_logsnr_list.append(pred_l)
+    # 1. Check Buckets (if enabled)
+    bucketing = config['training'].get('bucketing', {'enabled': False})
+    if bucketing.get('enabled', False):
+        buckets = bucketing.get('image_buckets', [])
+        if buckets:
+            max_bucket_res = max(b['resolution'] for b in buckets)
         else:
-            # For text-only blocks, we might not have vpreds relevant to diffusion loss
-            # Just append None or dummy
-            v_final_list.append(None)
-            pred_logsnr_list.append(None)
+            max_bucket_res = 32
+    else:
+        max_bucket_res = 0 # Not driving resolution
         
-    return v_final_list, pred_logsnr_list, aux_loss
-
-@torch.no_grad()
-def autoregressive_sample_loop(components, x0_shape, config):
-    """
-    Unified sampler for visual validation.
-    """
-    model, _, _, _ = components
-    model.eval()
+    # 2. Check Sequence Structures
+    # We need to find the max 'res' (absolute) OR max 'relative_res'
+    dataset_mix = config.get('dataset_mix', {})
     
-    res = config.get('res', 32)
-    n_samples = config.get('num_samples', 8)
-    mode = config.get('mode', 'naive')
-    device = model.text_embed.weight.device
+    max_seq_res_abs = 0
+    max_seq_rel = 1.0
     
-    # Initialize Noise
-    z = torch.randn(n_samples, 3, res, res, device=device)
-    base_spans = get_image_spans(res)
+    for split_name, split_cfg in dataset_mix.items():
+        if split_cfg.get('type') == 'video':
+            params = split_cfg.get('params', {}) or {} # Handle None
+            seq_struct = params.get('sequence_structure', [])
+            for frame in seq_struct:
+                # Track absolute max defined in config
+                max_seq_res_abs = max(max_seq_res_abs, frame.get('res', 32))
+                # Track relative max
+                max_seq_rel = max(max_seq_rel, frame.get('relative_res', 1.0))
     
-    # Scheduler
-    steps = 50
-    ts = torch.linspace(1.0, 0.001, steps, device=device)
+    # 3. Compute Global Max
+    if bucketing.get('enabled', False):
+        # If bucketing, the demand is Bucket * Relative
+        # We assume the worst case: Biggest Bucket * Biggest Relative Factor
+        res_from_buckets = int(max_bucket_res * max_seq_rel)
+        # Ensure we cover at least that
+        max_res = max(max_res, res_from_buckets)
+    else:
+        # If no bucketing, we rely on the absolute definitions
+        max_res = max(max_res, max_seq_res_abs)
+        
+    # Alignment (Optional, but safe)
+    if max_res % 2 != 0: max_res += 1
     
-    for i in range(steps - 1):
-        t_curr = ts[i]
-        t_next = ts[i+1]
-        
-        # 1. Get LogSNR (Global scalar broadcast to map)
-        lsnr_val = get_schedule(t_curr)
-        logsnr_map = torch.full((n_samples, 1, res, res), lsnr_val, device=device)
-        
-        # 2. Predict
-        v_pred, _, _ = predict_velocity(components, z, logsnr_map, base_spans, mode)
-        
-        # 3. Step
-        lsnr_curr = get_schedule(t_curr)
-        lsnr_next = get_schedule(t_next)
-        z = euler_reverse_step(z, v_pred, lsnr_curr, lsnr_next)
-        
-    model.train()
-    return z.clamp(0, 1)
+    return max_res
 
 # ==============================================================================
 # 3. Training Loops (Config Driven)
 # ==============================================================================
 
+from .bucket_manager import build_bucket_manager_from_config
 
 def train_autoembed(components, config, logger=None):
-    mode = config['mode']; steps = config['ae_steps']
-    # We ignore buckets/manager for list mode simplicity or use a fixed one
-    bs = 8 
+    # 1. Enforce Dictionary Type
+    config = sanitize_config(config)
+    
+    # 2. Strict Access (No defaults allowed here - define them in Pydantic schema)
+    mode = config['training']['mode']
+    steps = config['training']['ae_steps']
+    bs = config['training']['batch_size']
+    
+    
+    # 4. Optimizer Params (Strict)
+    opt_cfg = config['training']['ae_optimizer'] # distinct AE optimizer config
+    lr = opt_cfg['lr']
+    wd = opt_cfg['weight_decay']
+    max_lr = opt_cfg['max_lr']
+    pct_start = opt_cfg['pct_start']
+
     
     print(f"\n--- Training: Auto-Encoder ({mode.upper()}) ---")
     model = components[0]
-    # Optimizer params from config
-    lr = config.get('lr', 5e-4)
-    wd = config.get('weight_decay', 0.1)
-    max_lr = config.get('max_lr', lr)
-    pct_start = config.get('pct_start', 0.1)
+    # 3. Build Manager
+    # We explicitly look up the stride from the model instance, or the config dict
+    model_stride = model.patch_embedder.stride
+    bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
+    
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
     fused=True)
     scheduler = OneCycleLR(opt, max_lr=max_lr, total_steps=steps, pct_start=pct_start)
-    iterator = CompositeIterator(model.text_embed.weight.device, config=config['dataset_mix'])
+    # FIX: Calculate cache size
+    caching_res = calculate_global_max_resolution(config)
+    
+    iterator = CompositeIterator(
+        model.text_embed.weight.device, 
+        config=config['dataset_mix'],
+        caching_resolution=caching_res # Pass it down
+    )
     history = []
-        # BF16 usually doesn't need a GradScaler, but FP16 does.
+    bucketing_enabled = config['training']['bucketing']['enabled']
+    # BF16 usually doesn't need a GradScaler, but FP16 does.
     # We can use it conditionally.
-    dtype = config.get('dtype', torch.float32)
+    dtype = config['dtype']
     use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16)) 
+    # FIX: Use new torch.amp API
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
     pbar = tqdm(range(steps), desc="train-ae")
     for i in pbar:
         opt.zero_grad()
@@ -231,7 +127,17 @@ def train_autoembed(components, config, logger=None):
                # --- AUTOCAST BLOCK ---
         with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
             # 1. Get Clean Blocks
-            clean_blocks = iterator.generate_batch_list(bs)
+            # 1. NEW: Sample Bucket
+            if bucketing_enabled:
+                bucket = bucket_mgr.sample_bucket()
+                curr_res = bucket.resolution
+                curr_bs = bucket.batch_size
+            else:
+                curr_res = 32 # Fallback
+                curr_bs = bs
+            
+            # 2. Generate Data with Dynamic Resolution
+            clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
             
             # 2. Noise Injection (Forward Step)
             noisy_blocks = []
@@ -282,41 +188,76 @@ def train_autoembed(components, config, logger=None):
             scheduler.step()
         
         history.append({'step': i,'loss': loss_img.item(), 'loss_ae': loss_img.item() if count else 0})
-        if i % config.get('log_interval', 100) == 0: pbar.set_postfix({'ae': f'{loss_img:.4f}'})
+        if i % config['logging']['log_interval'] == 0: pbar.set_postfix({'ae': f'{loss_img:.4f}'})
             
     return pd.DataFrame(history)
 
 def train_denoise(components, config, logger=None):
-    mode = config['mode']; steps = config['steps']; lambda_coeff = config.get('lambda_coeff', 0.2)
-    bs = config.get('batch_size', 8)
+    # 1. Enforce Dictionary Type
+    config = sanitize_config(config)
     
-    # Optimizer params from config
-    lr = config.get('lr', 5e-4)
-    wd = config.get('weight_decay', 0.1)
-    max_lr = config.get('max_lr', lr)
-    pct_start = config.get('pct_start', 0.1)
+    # 2. Strict Access (No defaults allowed here - define them in Pydantic schema)
+    mode = config['training']['mode']
+    steps = config['training']['ae_steps']
+    bs = config['training']['batch_size']
+
+    lambda_coeff = config['training']['lambda_coeff']
     
+    
+    # 4. Optimizer Params (Strict)
+    opt_cfg = config['training']['ae_optimizer'] # distinct AE optimizer config
+    lr = opt_cfg['lr']
+    wd = opt_cfg['weight_decay']
+    max_lr = opt_cfg['max_lr']
+    pct_start = opt_cfg['pct_start']
+
+
+    
+    print(f"\n--- Training: Denoiser ({mode.upper()}) ---")
     model = components[0]
+    # 3. Build Manager
+    # We explicitly look up the stride from the model instance, or the config dict
+    model_stride = model.patch_embedder.stride
+    bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
+    
+
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
     fused=True)
     scheduler = OneCycleLR(opt, max_lr=max_lr, total_steps=steps, pct_start=pct_start)
-    iterator = CompositeIterator(model.text_embed.weight.device, config=config['dataset_mix'])
+    # FIX: Calculate cache size
+    caching_res = calculate_global_max_resolution(config)
     
+    iterator = CompositeIterator(
+        model.text_embed.weight.device, 
+        config=config['dataset_mix'],
+        caching_resolution=caching_res # Pass it down
+    )
     history = []
-    pbar = tqdm(range(steps), desc=f"train-{mode}")
-    
+    # Pre-fetch bucketing flag to avoid lookup in loop
+    bucketing_enabled = config['training']['bucketing']['enabled']
     # BF16 usually doesn't need a GradScaler, but FP16 does.
     # We can use it conditionally.
-    dtype = config.get('dtype', torch.float32)
+    dtype = config['dtype']
     use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16)) 
-
+    # FIX: Use new torch.amp API
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
+    pbar = tqdm(range(steps), desc="train-ae")
     for i in pbar:
         opt.zero_grad()
                 # --- AUTOCAST BLOCK ---
         with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
             # 1. Clean Data
-            clean_blocks = iterator.generate_batch_list(bs)
+            # 1. NEW: Sample Bucket
+            if bucketing_enabled:
+                bucket = bucket_mgr.sample_bucket()
+                curr_res = bucket.resolution
+                curr_bs = bucket.batch_size
+            else:
+                curr_res = 32 # Fallback
+                curr_bs = bs   
+            
+            # 2. Generate Data with Dynamic Resolution
+            clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
             
             # 2. Noise Injection
             noisy_blocks = []
@@ -405,7 +346,7 @@ def train_denoise(components, config, logger=None):
         # Extend history with per-item stats (Rows = Batch Size * Steps)
         history.extend(step_stats)
         
-        if i % config.get('log_interval', 100) == 0: 
+        if i % config['logging']['log_interval']== 0: 
             # Log average of this batch for progress bar
             avg_v = sum(s['loss'] for s in step_stats) / max(1, len(step_stats))
             pbar.set_postfix({'v': f'{avg_v:.4f}'})

@@ -397,7 +397,7 @@ class RawSequenceBatch:
         self.req_idx = req_idx
 
 class VideoFolderIterator:
-    def __init__(self, folder_path, device='cuda', horizon=256, result_queue_depth=1024, num_workers=None, max_ram_pct=95.0, target_dtype=torch.float32):
+    def __init__(self, folder_path, device='cuda', horizon=256, result_queue_depth=1024, num_workers=None, max_ram_pct=95.0, target_dtype=torch.float32, caching_resolution=128):
         if not HAS_TORCHCODEC: raise ImportError("torchcodec required")
         self.device = device
         self.target_dtype = target_dtype
@@ -408,7 +408,12 @@ class VideoFolderIterator:
         self.num_workers = num_workers if num_workers else max(4, (os.cpu_count()//2) - 1)
         self.max_ram_pct = max_ram_pct
         
-        print(f"🚀 Video Iterator: {self.num_workers} threads, RAM Limit: {max_ram_pct}%")
+        # NEW: Fixed resolution for the worker queue.
+        # All frames in the queue will be this size.
+        # Downstream batches will interpolate FROM this size TO their target size.
+        self.caching_resolution = caching_resolution
+        
+        print(f"🚀 Video Iterator: {self.num_workers} threads, RAM Limit: {max_ram_pct}%, Cache Res: {caching_resolution}px")
         
         self.horizon = horizon
         self.stop_event = threading.Event()
@@ -457,13 +462,13 @@ class VideoFolderIterator:
         return indices
 
     def _planner_loop(self):
+        # Planner logic remains mostly same, but we don't need to stress about 
+        # the specific resolution in the config, just the sequence length/sampler params.
         while not self.stop_event.is_set():
-            # 1. Memory Safety Check
             if self._check_memory_pressure():
-                time.sleep(1.0) # Cool down for 1 second
+                time.sleep(1.0)
                 continue
 
-            # 2. Backpressure
             if self.result_queue.qsize() > (self.result_queue.maxsize - self.horizon):
                 time.sleep(0.05)
                 continue
@@ -476,7 +481,7 @@ class VideoFolderIterator:
                 time.sleep(0.01)
                 continue
 
-            # 3. Create Jobs
+            # We use the current config mainly for the Time Sampler settings
             seq_config = self.current_seq_config
             sampler = seq_config[0].get('time_sampler', {})
             seq_len = len(seq_config)
@@ -495,20 +500,20 @@ class VideoFolderIterator:
             
             for fpath, requests in jobs_by_file.items():
                 try:
-                    self.job_queue.put((fpath, requests, seq_config, seq_len, sampler), timeout=1.0)
+                    # Pass the sequence length, not the full config, to keep workers simple
+                    self.job_queue.put((fpath, requests, seq_len, sampler), timeout=1.0)
                 except queue.Full:
                     pass
 
     def _worker_loop(self, worker_id):
         while not self.stop_event.is_set():
-            # Double check memory pressure inside worker before grabbing heavy jobs
             if self._check_memory_pressure():
                 time.sleep(1.0)
                 continue
 
             try:
                 job = self.job_queue.get(timeout=1.0)
-                fpath, requests, seq_config, seq_len, sampler = job
+                fpath, requests, seq_len, sampler = job # unpacked
             except queue.Empty:
                 continue
 
@@ -531,49 +536,30 @@ class VideoFolderIterator:
                     self.job_queue.task_done()
                     continue
 
-                # --- DECODE (Heavy RAM Usage Starts) ---
                 sorted_idxs = sorted(list(all_idxs))
-                # Decode to CPU uint8
                 heavy_frames = decoder.get_frames_at(sorted_idxs).data 
                 
-                # --- IMMEDIATE DOWNSCALE (The Fix) ---
-                # We map indices to *resized* frames immediately
-                idx_to_small_tensor = {}
+                # --- DECOUPLED RESIZING ---
+                # Always resize to self.caching_resolution
+                # This ensures the queue is uniform and buckets don't invalidate work.
                 
-                # Determine target resolution from config (assuming uniform usually, but handling mixed)
-                # We use the max resolution in the sequence to be safe, or just check first
-                target_res = seq_config[0].get('res', 32)
+                # 1. Float Cast
+                hf_float = heavy_frames.float()
                 
-                # Check if we need to resize at all
-                needs_resize = (heavy_frames.shape[-1] != target_res)
+                # 2. Resize to Caching Resolution
+                sf_float = F.interpolate(
+                    hf_float, 
+                    size=(self.caching_resolution, self.caching_resolution), 
+                    mode='area' 
+                )
                 
-                if needs_resize:
-                    # Convert to float for area interpolation, then back to uint8
-                    # [N, C, H, W] -> Float -> Resize -> Uint8
-                    # We do this in one block if N is reasonable, or loop if N is huge.
-                    # Given the horizon, N is usually small (<100) per file.
-                    
-                    # 1. Float Cast (Heavy but necessary for good downscaling)
-                    hf_float = heavy_frames.float()
-                    
-                    # 2. Resize
-                    sf_float = F.interpolate(
-                        hf_float, 
-                        size=(target_res, target_res), 
-                        mode='area' # 'area' is best for downscaling
-                    )
-                    
-                    # 3. Cast back to uint8 to save queue RAM
-                    small_frames_batch = sf_float.to(torch.uint8)
-                    
-                    # 4. Explicit delete to free RAM ASAP
-                    del heavy_frames
-                    del hf_float
-                    del sf_float
-                else:
-                    small_frames_batch = heavy_frames
+                # 3. Cast back to uint8
+                small_frames_batch = sf_float.to(torch.uint8)
+                
+                del heavy_frames, hf_float, sf_float
 
                 # Map back to indices
+                idx_to_small_tensor = {}
                 for i, idx in enumerate(sorted_idxs):
                     idx_to_small_tensor[idx] = small_frames_batch[i]
                 
@@ -582,7 +568,8 @@ class VideoFolderIterator:
                     needed = req_to_idxs[req_idx]
                     seq_stack = torch.stack([idx_to_small_tensor[x] for x in needed])
                     
-                    result = RawSequenceBatch(seq_stack, seq_config, gid, req_idx)
+                    # Note: We pass None for configs here, main thread handles that
+                    result = RawSequenceBatch(seq_stack, None, gid, req_idx)
                     self.result_queue.put(result)
                     
             except Exception as e:
@@ -591,29 +578,40 @@ class VideoFolderIterator:
                 self.job_queue.task_done()
 
     def generate_batch_list(self, batch_size, sequence_config, start_group_id=0):
-        if self.current_seq_config is None:
-            self.current_seq_config = sequence_config
+        # Update current config so planner knows what to schedule (sequence length)
+        self.current_seq_config = sequence_config
             
         out_blocks = []
         fetched = 0
         
         while fetched < batch_size:
             try:
-                batch_raw = self.result_queue.get(timeout=10.0)
+                # Wait longer if queue is empty to avoid crashing loop
+                batch_raw = self.result_queue.get(timeout=15.0)
             except queue.Empty:
                 print("⚠️ Video Queue Empty! Workers lagging.")
                 break
                 
-            # 1. GPU Transfer & Cast
-            # Input is already resized uint8 [L, C, res, res]
+            # 1. GPU Transfer (Cached Res -> GPU)
+            # frames_gpu is [Seq_Len, 3, Cache_Res, Cache_Res]
             frames_gpu = batch_raw.small_frames.to(device=self.device, dtype=self.target_dtype, non_blocking=True) / 255.0
             
             seq_blocks = []
-            for t, (frame, spec) in enumerate(zip(frames_gpu, batch_raw.configs)):
-                # Frames are already resized by worker, but check just in case config changed dynamically
+            
+            # 2. Sequence Assembly & Final Resize
+            for t, (frame, spec) in enumerate(zip(frames_gpu, sequence_config)):
                 target_res = spec.get('res', 32)
+                
+                # Resize if the cached resolution != target resolution
                 if frame.shape[-1] != target_res:
-                    frame = F.interpolate(frame.unsqueeze(0), size=(target_res, target_res), mode='area').squeeze(0)
+                    # Note: We use bilinear here as it's faster on GPU and we are likely 
+                    # going from 128 -> 32 or 64. If going 128 -> 256, bilinear is also fine.
+                    frame = F.interpolate(
+                        frame.unsqueeze(0), 
+                        size=(target_res, target_res), 
+                        mode='bilinear', 
+                        align_corners=False
+                    ).squeeze(0)
                 
                 n_mode = spec.get('noise_mode', 'uniform')
                 n_params = spec.get('noise_params', {})
@@ -635,10 +633,10 @@ class CompositeIterator:
     _ITERATOR_MAP = {
         'checkerboard': CheckerboardIterator,
         'torus': TorusIterator,
-        'video': VideoFolderIterator # Register new type
+        'video': VideoFolderIterator 
     }
 
-    def __init__(self, device='cuda', config=None, target_dtype=torch.float32):
+    def __init__(self, device='cuda', config=None, target_dtype=torch.float32, caching_resolution=256):
         self.device = device
         if config is None: config = {'checkerboard': 1.0}
         
@@ -646,31 +644,40 @@ class CompositeIterator:
         
         for split_key, cfg in config.items():
             if isinstance(cfg, (float, int)): 
-                cfg = {'ratio': float(cfg), 'type': split_key}
+                cfg = {'ratio': float(cfg), 'type': split_key, 'params': {}} # Normalize shorthand
             
             gen_type = cfg.get('type', split_key)
             
-            # Fallback only if type is genuinely unknown (prevents crash, but warns)
             if gen_type not in self._ITERATOR_MAP:
                 print(f"⚠️ Unknown iterator type '{gen_type}', defaulting to Checkerboard.")
                 iterator_cls = CheckerboardIterator
             else:
                 iterator_cls = self._ITERATOR_MAP[gen_type]
             
+            # STRICT ACCESS: Trust the config schema.
+            # cfg['params'] is guaranteed to be a dict by src/config.py
+            raw_params = cfg['params']
+            
             if gen_type == 'video':
-                 path = cfg.get('params', {}).get('path', None)
-                 iterator_instance = iterator_cls(path, device=device, target_dtype=target_dtype)
+                 path = raw_params.get('path', None)
+                 # Pass the calculated max resolution to the video iterator
+                 iterator_instance = iterator_cls(
+                     path, 
+                     device=device, 
+                     target_dtype=target_dtype,
+                     caching_resolution=caching_resolution
+                 )
             else: 
                  iterator_instance = iterator_cls(device)
             
             self.splits.append({
                 'name': split_key, 
-                'type': gen_type, # <--- FIX: Store the type!
+                'type': gen_type,
                 'iterator': iterator_instance, 
                 'ratio': cfg.get('ratio', 1.0), 
-                'd_params': cfg.get('params', {}),
+                'd_params': raw_params, # Pass the dict directly
                 'n_mode': cfg.get('noise_mode', 'uniform'), 
-                'n_params': cfg.get('noise_params', {})
+                'n_params': cfg.get('noise_params', {}) # This might still need get if not fully sanitized, but params is the critical one
             })
             
         total = sum(s['ratio'] for s in self.splits)
@@ -689,21 +696,50 @@ class CompositeIterator:
         for idx, split in enumerate(self.splits):
             count = counts[idx]
             if count == 0: continue
-            split_name = split['name'] # Capture the source name
+            
+            split_name = split['name']
             gen_type = split['type']
+            
+            # Extract params strictly
+            d_params = split['d_params']
+
             if gen_type == 'video':
-                seq_conf = split['d_params'].get('sequence_structure', [{'res':32}])
+                # strict access assumes sequence_structure is set in config if type is video
+                # We can keep a .get here if the default is logic-dependent, or enforce in schema
+                seq_conf = d_params.get('sequence_structure', [{'res': 32}])
+                
+                # Check for resolution overrides (from Bucketing)
+                resolution = kwargs.get('resolution')
+                if resolution is not None:
+                    # Apply Relative Scaling Logic
+                    overridden_seq = []
+                    for frame_cfg in seq_conf:
+                        new_cfg = frame_cfg.copy()
+                        rel = new_cfg.get('relative_res', 1.0)
+                        # Abs = Bucket * Relative
+                        abs_res = int(resolution * rel)
+                        if abs_res % 2 != 0: abs_res += 1
+                        new_cfg['res'] = abs_res
+                        overridden_seq.append(new_cfg)
+                    seq_conf = overridden_seq
+
                 blocks = split['iterator'].generate_batch_list(count, seq_conf, start_group_id=global_group_id)
                 for b in blocks: b.source = split_name
-                # Video iterator increments group_id internally, need to resync global
                 if blocks: global_group_id = max(b.group_id for b in blocks) + 1
+            
             else:
-                d_params = {**kwargs, **split['d_params']}
-                res = d_params.get('resolution', 32)
-                blocks = split['iterator'].generate_batch_list(count, res, **d_params)
+                # Geometric Logic
+                # Merge kwargs (like resolution) with dataset params
+                merged_params = {**kwargs, **d_params}
                 
-                # Apply LogSNR metadata (Video handles this internally, geometric does not)
-                n_mode = split['n_mode']; n_params = split['n_params']
+                # Extract resolution to pass positionally
+                res = merged_params.pop('resolution', 32) # <--- FIX: pop() removes it from dict
+                
+                # Now passing **merged_params won't collide with 'res'
+                blocks = split['iterator'].generate_batch_list(count, res, **merged_params)
+                
+                n_mode = split['n_mode']
+                n_params = split['n_params']
                 raw_snrs = get_logsnr_batch(n_mode, len(blocks), res, res, self.device, n_params)
                 
                 for i, b in enumerate(blocks):

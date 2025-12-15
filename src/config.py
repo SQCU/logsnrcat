@@ -9,6 +9,7 @@ from typing import Literal, Dict, List, Optional, Tuple, Union, Any
 from pydantic import BaseModel, Field, model_validator
 import tomli
 
+import logging
 
 # =============================================================================
 # Model Components
@@ -62,6 +63,7 @@ class TimeSamplerConfig(BaseModel):
 
 class SequenceFrame(BaseModel):
     res: int = 32
+    relative_res: float = 1.0 
     noise_mode: Literal["uniform", "split"] = "uniform"
     noise_params: NoiseParams = Field(default_factory=NoiseParams)
 
@@ -77,19 +79,21 @@ class DatasetSplit(BaseModel):
     ratio: float = 1.0
     noise_mode: Literal["uniform", "split"] = "uniform"
     noise_params: NoiseParams = Field(default_factory=NoiseParams)
-    params: Optional[Dict[str, Any]] = None
+    
+    # FIX: Enforce non-nullable dictionary. 
+    # Missing TOML key -> {} instead of None.
+    params: Dict[str, Any] = Field(default_factory=dict)
     
     def to_iterator_config(self) -> Dict[str, Any]:
         """Convert to format expected by CompositeIterator."""
-        cfg = {
+        # Now we can just dump, knowing params is safe
+        return {
             "type": self.type,
             "ratio": self.ratio,
             "noise_mode": self.noise_mode,
-            "noise_params": self.noise_params.model_dump()
+            "noise_params": self.noise_params.model_dump(),
+            "params": self.params
         }
-        if self.params:
-            cfg["params"] = self.params
-        return cfg
 
 
 # =============================================================================
@@ -111,6 +115,24 @@ class AEOptimizerConfig(BaseModel):
     max_lr: float = 1e-3
     pct_start: float = 0.1
 
+class ResolutionBucketConfig(BaseModel):
+    resolution: int
+    batch_size: Optional[int] = None
+    weight: float = 1.0
+
+class VideoBucketConfig(BaseModel):
+    context_resolution: int
+    target_resolution: int
+    num_context_frames: int = 3
+    batch_size: Optional[int] = None
+
+class BucketingConfig(BaseModel):
+    enabled: bool = False
+    base_resolution: int = 32
+    base_batch_size: int = 128
+    image_buckets: List[ResolutionBucketConfig] = Field(default_factory=list)
+    video_buckets: List[VideoBucketConfig] = Field(default_factory=list)
+
 
 class TrainingConfig(BaseModel):
     ae_steps: int = 500
@@ -123,6 +145,9 @@ class TrainingConfig(BaseModel):
     schedule_bounds: Tuple[float, float] = (5.0, -4.0)
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     ae_optimizer: AEOptimizerConfig = Field(default_factory=AEOptimizerConfig)
+        
+    # NEW: Register Bucketing Config
+    bucketing: BucketingConfig = Field(default_factory=BucketingConfig)
 
     precision: str = "fp32"  # <--- ENABLE THIS # Options: "fp32", "bf16", "fp16"
 
@@ -184,10 +209,32 @@ class ExperimentConfig(BaseModel):
         return self.model_dump()
 
 
-def load_config(path: str | Path | None = None) -> ExperimentConfig:
+def sanitize_config(cfg: Union[ExperimentConfig, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    The Great Filter.
+    1. Converts Pydantic 'Magical Dreamland' objects into honest, working-class Dictionaries.
+    2. Strips away dot-notation access privileges.
+    3. Ensures downstream code crashes on missing keys instead of guessing.
+    """
+    if isinstance(cfg, BaseModel):
+        # model_dump() converts nested Pydantic models to nested dicts automatically
+        return cfg.model_dump()
+    elif isinstance(cfg, dict):
+        return cfg
+    else:
+        raise TypeError(f"Config must be Pydantic Model or Dict, got {type(cfg)}")
+
+def load_config(path: str | Path | None = None) -> Dict[str, Any]:
+    """
+    Loads TOML and immediately sanitizes it to a Dict.
+    Downstream code should never see an ExperimentConfig object.
+    """
     if path is None:
-        return ExperimentConfig()
-    return ExperimentConfig.from_toml(path)
+        raw_cfg = ExperimentConfig()
+    else:
+        raw_cfg = ExperimentConfig.from_toml(path)
+    
+    return sanitize_config(raw_cfg)
 
 
 if __name__ == "__main__":

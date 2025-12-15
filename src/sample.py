@@ -5,10 +5,51 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 
 from .model import ContextBlock
-from .train import (
-    get_schedule, logsnr_to_alpha_sigma, euler_reverse_step,
+from .utils import (
+    get_schedule, logsnr_to_alpha_sigma,
     predict_velocity_from_blocks
 )
+
+
+def euler_forward_step(x0, logsnr, noise=None):
+    """
+    Diffuses x0 -> z_t. Returns z_t and the target velocity v_true.
+    """
+    if noise is None:
+        noise = torch.randn_like(x0)
+    
+    alpha, sigma = logsnr_to_alpha_sigma(logsnr)
+    
+    # Broadcast check: logsnr might be [B, 1, H, W] or [B]
+    if alpha.ndim == 1:
+        alpha = alpha.view(-1, 1, 1, 1)
+        sigma = sigma.view(-1, 1, 1, 1)
+        
+    z_t = x0 * alpha + noise * sigma
+    v_true = alpha * noise - sigma * x0
+    return z_t, v_true, noise
+
+def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
+    """
+    Denoises z_t -> z_{t-1}.
+    """
+    alpha_from, sigma_from = logsnr_to_alpha_sigma(logsnr_from)
+    alpha_to, sigma_to = logsnr_to_alpha_sigma(logsnr_to)
+    
+    if alpha_from.ndim == 1:
+        alpha_from = alpha_from.view(-1, 1, 1, 1)
+        sigma_from = sigma_from.view(-1, 1, 1, 1)
+        alpha_to = alpha_to.view(-1, 1, 1, 1)
+        sigma_to = sigma_to.view(-1, 1, 1, 1)
+
+    # Reconstruct x0 (prediction)
+    x0_pred = alpha_from * z_t - sigma_from * v_pred
+    # Reconstruct eps (prediction)
+    eps_pred = sigma_from * z_t + alpha_from * v_pred
+    
+    # Step to next level
+    z_next = alpha_to * x0_pred + sigma_to * eps_pred
+    return z_next
 
 
 @torch.no_grad()
@@ -171,127 +212,109 @@ def sample_viz_split_topology(components, iterator, config):
 @torch.no_grad()
 def sample_viz_causal_sweep(components, iterator, config):
     """
-    Demonstrates Information Flow by sweeping Prefix SNR, specifically using video sequences.
+    Demonstrates Information Flow by sweeping Prefix SNR.
+    Requires 'video_source_name' to be explicitly defined in config.
     """
     model, _, _, _ = components
     model.eval()
-    device = model.text_embed.weight.device
     
+    # 1. Strict Configuration Extraction
     N = config.get('num_sweep_sequences', 4)
     M = config.get('sequence_length', 4)
     snr_start, snr_end = config.get('prefix_snr_range', (2.0, -4.0))
     video_sequence_structure = config.get('video_sequence_structure')
-    video_source_name_filter = config.get('video_source_name', None) # Optional filter for a specific video split
+    source_name = config.get('video_source_name') # Strict requirement
     
     if not video_sequence_structure:
-        print("⚠️ Warning: 'video_sequence_structure' not provided for causal sweep. Cannot fetch video data.")
-        return plt.figure() # Return an empty figure
+        print("⚠️ Causal Sweep skipped: 'video_sequence_structure' missing.")
+        return None
+    
+    if not source_name:
+        raise ValueError("sample_viz_causal_sweep requires explicit 'video_source_name'")
 
-    # --- Find and use a Video Iterator instance ---
-    video_iterator_instance = None
-    for split in iterator.splits: # 'iterator' is a CompositeIterator
-        if split['type'] == 'video':
-            # If a specific source name is requested, match it
-            if video_source_name_filter and split['name'] != video_source_name_filter:
-                continue
-            video_iterator_instance = split['iterator']
+    # 2. Strict Iterator Lookup (No searching/guessing)
+    target_split = None
+    for split in iterator.splits:
+        if split['name'] == source_name:
+            target_split = split
             break
-    
-    if video_iterator_instance is None:
-        print(f"⚠️ Warning: No 'video' type iterator found in CompositeIterator (matching '{video_source_name_filter}' if specified) for causal sweep.")
-        return plt.figure()
+            
+    if target_split is None:
+        raise ValueError(f"Causal Sweep Error: Requested video source '{source_name}' not found in iterator.")
+        
+    if target_split['type'] != 'video':
+        raise ValueError(f"Causal Sweep Error: Source '{source_name}' is type '{target_split['type']}', expected 'video'.")
 
-    # Request N sequences from the video iterator, each of length M
-    # The VideoFolderIterator's generate_batch_list returns a FLAT list of ContextBlocks
-    # for N * M frames.
-    flat_blocks_from_video_iterator = video_iterator_instance.generate_batch_list(N, video_sequence_structure)
+    video_iterator_instance = target_split['iterator']
+
+    # 3. Fetch Data (Directly from the specific sub-iterator)
+    flat_blocks = video_iterator_instance.generate_batch_list(N, video_sequence_structure)
     
-    # --- Re-group the flat list of blocks into N sequences ---
+    # 4. Re-group sequences
     sequences = []
-    current_sequence_blocks = []
-    
-    if flat_blocks_from_video_iterator:
-        current_group_id = flat_blocks_from_video_iterator[0].group_id
-        
-        for block in flat_blocks_from_video_iterator:
-            if block.group_id == current_group_id:
-                current_sequence_blocks.append(block)
+    current_seq = []
+    if flat_blocks:
+        curr_gid = flat_blocks[0].group_id
+        for b in flat_blocks:
+            if b.group_id == curr_gid:
+                current_seq.append(b)
             else:
-                # New sequence starts. Add the previous one if it's the correct length.
-                if len(current_sequence_blocks) == M: 
-                    sequences.append(sorted(current_sequence_blocks, key=lambda x: x.id))
-                current_sequence_blocks = [block]
-                current_group_id = block.group_id
-        
-        # Add the very last sequence after the loop
-        if len(current_sequence_blocks) == M:
-            sequences.append(sorted(current_sequence_blocks, key=lambda x: x.id))
+                if len(current_seq) == M: sequences.append(sorted(current_seq, key=lambda x: x.id))
+                current_seq = [b]
+                curr_gid = b.group_id
+        if len(current_seq) == M: sequences.append(sorted(current_seq, key=lambda x: x.id))
     
-    # Ensure we don't exceed N sequences or have sequences of incorrect length
-    sequences = [s for s in sequences if len(s) == M]
-    sequences = sequences[:N] 
-    
-    if len(sequences) < N:
-        print(f"⚠️ Warning: Requested {N} sequences, but only found {len(sequences)} of length {M} after fetching from video iterator. Adjusting N.")
-        if not sequences:
-            return plt.figure() # Return empty if no sequences
-        N = len(sequences) # Adjust N if fewer sequences are available
+    sequences = sequences[:N]
+    if not sequences:
+        print(f"⚠️ Video iterator {source_name} returned no valid sequences.")
+        return None
 
-    # 2. Setup Plot
-    fig, axes = plt.subplots(N * 2, M, figsize=(3 * M, 4 * N))
+    # 5. Visualization Setup
+    N_actual = len(sequences)
+    fig, axes = plt.subplots(N_actual * 2, M, figsize=(3 * M, 4 * N_actual))
+    if N_actual == 1 and M == 1: axes = np.array([[axes]])
+    elif N_actual == 1: axes = axes.reshape(2, M)
+    
     plt.subplots_adjust(hspace=0.3, wspace=0.1)
+    sweep_snrs = torch.linspace(snr_start, snr_end, N_actual)
     
-    # Linear SNR schedule for the SWEEP (Row by Row)
-    sweep_snrs = torch.linspace(snr_start, snr_end, N)
-    
-    print(f"🧪 Running Causal Information Sweep (Prefix SNR {snr_start} -> {snr_end})...")
+    print(f"🧪 Running Causal Sweep on '{source_name}' (Prefix SNR {snr_start} -> {snr_end})...")
 
     for i, seq in enumerate(sequences):
         prefix_snr = sweep_snrs[i].item()
-        
-        # Prepare Solver Inputs
-        start_blocks = []
-        fixed_data = [] # Constraints
-        gt_visuals = [] # For MSE calc
-        
-        # Identify suffix index (last frame)
         suffix_idx = M - 1
+        
+        start_blocks = []
+        fixed_data = []
+        gt_visuals = []
         
         for t in range(M):
             block = seq[t]
             gt_visuals.append(block.content)
             
             if t < suffix_idx:
-                # --- PREFIX (Information Source) ---
-                # Noise level determined by sweep
+                # Prefix (Source)
                 l_map = torch.full_like(block.logsnr, prefix_snr)
                 alpha, sigma = logsnr_to_alpha_sigma(l_map)
-                eps = torch.randn_like(block.content)
-                z_t = block.content * alpha + eps * sigma
+                z_t = block.content * alpha + torch.randn_like(block.content) * sigma
                 
-                # We FIX this latent. The solver will NOT update it.
-                # It acts purely as a Key/Value source for the Suffix.
                 start_blocks.append(ContextBlock(
                     content=z_t, logsnr=l_map, type='latent', causal=True,
                     shape_meta=block.shape_meta, group_id=block.group_id, id=block.id
                 ))
                 fixed_data.append(z_t)
-                
             else:
-                # --- SUFFIX (Information Sink) ---
-                # Always starts at Pure Noise (-4.0)
+                # Suffix (Sink) - Pure Noise
                 l_map = torch.full_like(block.logsnr, -4.0)
-                alpha, sigma = logsnr_to_alpha_sigma(l_map)
-                z_t = block.content * alpha + torch.randn_like(block.content) * sigma
+                z_t = torch.randn_like(block.content) # Pure noise assumption for generation
                 
-                # We EVOLVE this latent.
                 start_blocks.append(ContextBlock(
                     content=z_t, logsnr=l_map, type='latent', causal=True,
                     shape_meta=block.shape_meta, group_id=block.group_id, id=block.id
                 ))
-                fixed_data.append(None) # None = Solve me
+                fixed_data.append(None)
 
-        # Run Solver
+        # Solver
         z_final = spatial_euler_solver(
             components, start_blocks, 
             target_logsnr=config.get('target_logsnr', 10.0),
@@ -301,31 +324,25 @@ def sample_viz_causal_sweep(components, iterator, config):
             fixed_data=fixed_data
         )
         
-        # 3. Visualization Logic
+        # Plotting
         row_top = i * 2
         row_bot = i * 2 + 1
         
         for t in range(M):
-            viz_tens = z_final[t].permute(1,2,0).cpu().clamp(0,1).numpy()
-            
-            ax_img = axes[row_top, t] if N > 1 else axes[t]
-            ax_img.imshow(viz_tens)
+            # Image
+            ax_img = axes[row_top, t] if N_actual > 1 else axes[t]
+            viz = z_final[t].detach().cpu().permute(1,2,0).clamp(0,1).numpy()
+            ax_img.imshow(viz)
             ax_img.axis('off')
             
-            if t == 0:
-                ax_img.set_title(f"Prefix SNR: {prefix_snr:.1f}\n(Input)", fontsize=10, loc='left')
-            elif t == suffix_idx:
-                ax_img.set_title("Generated Suffix\n(Output)", fontsize=10, fontweight='bold')
-                
+            if t == 0: ax_img.set_title(f"Prefix: {prefix_snr:.1f}", fontsize=9)
+            
+            # Error
             gt = gt_visuals[t]
             diff = (z_final[t] - gt).pow(2).mean(dim=0).cpu().numpy()
-            
             ax_err = axes[row_bot, t]
-            im_err = ax_err.imshow(diff, cmap='inferno', vmin=0, vmax=0.1)
+            ax_err.imshow(diff, cmap='inferno', vmin=0, vmax=0.1)
             ax_err.axis('off')
-            
-            if t == 0:
-                ax_err.set_title("MSE Field vs GT", fontsize=10, loc='left')
 
     model.train()
     return fig

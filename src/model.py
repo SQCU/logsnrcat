@@ -12,7 +12,179 @@ try:
 except ImportError:
     update_kv_cache = None  # Not needed for ZC mode
 
-from .utils import PageTable
+### MODEL PROVIDES PAGETABLE, CORE DATA STRUCTURES ALLOWING INFERENCE
+
+class PageTable:
+    """
+    Manages the mapping between Logical Blocks (Sequence) and Physical Blocks (Heap).
+    Implements the 'convert_logical_block_mask' primitive for Paged FlexAttention.
+    """
+    def __init__(self, 
+                 num_blocks: int, 
+                 block_size: int, 
+                 max_batch_size: int, 
+                 max_logical_blocks: int,
+                 device='cuda'):
+        
+        self.block_size = block_size
+        self.device = device
+        
+        # [logical_batch_idx, logical_block_idx] -> physical_page_idx
+        self.page_table = torch.full(
+            (max_batch_size, max_logical_blocks), -1, 
+            dtype=torch.int32, device=device
+        )
+        
+        # [logical_batch_idx, physical_page_idx] -> logical_page_idx
+        # Used by the mask_mod to reverse-lookup logical positions
+        self.physical_to_logical = torch.full(
+            (max_batch_size, num_blocks), -1,
+            dtype=torch.int32, device=device
+        )
+
+    def convert_logical_block_mask(
+        self,
+        logical_mask: BlockMask,
+        batch_idx: torch.Tensor 
+    ) -> BlockMask:
+        """
+        Teleports a BlockMask from Logical Space to Physical Space.
+        
+        Args:
+            logical_mask: Mask computed on logical sequences (e.g. 0..L).
+            batch_idx: [B] Tensor mapping Kernel Batch Index -> Logical Request ID.
+                       (Used to look up the specific Page Table row).
+        
+        Returns:
+            A new BlockMask instance valid for the Paged KV Cache.
+        """
+        
+        # 1. Identify Active Page Tables
+        # Select the rows corresponding to the active requests in this kernel batch
+        # shape: [B, Max_Logical_Blocks]
+        active_page_table = self.page_table[batch_idx.long()]
+        
+        # 2. Extract Logical Indices (Sparse)
+        # These are indices into the Logical Block sequence (0, 1, 2...)
+        # kv_indices shape: [B, H, Q_Blocks, K_Blocks_Sparse]
+        # (Note: FlexAttention usually broadcasts B if masks are identical, 
+        #  but for PagedAttention we assume uniqueness per batch item or handle broadcast).
+        
+        # We assume logical_mask batch dim matches active_page_table batch dim (B).
+        # If logical_mask is shared (B=1) but we have multiple requests, expand it.
+        B_kernel = batch_idx.size(0)
+        
+        kv_indices = logical_mask.kv_indices
+        full_kv_indices = logical_mask.full_kv_indices
+        kv_num_blocks = logical_mask.kv_num_blocks
+        full_kv_num_blocks = logical_mask.full_kv_num_blocks
+
+        if kv_indices.size(0) == 1 and B_kernel > 1:
+            kv_indices = kv_indices.expand(B_kernel, -1, -1, -1)
+            full_kv_indices = full_kv_indices.expand(B_kernel, -1, -1, -1)
+            kv_num_blocks = kv_num_blocks.expand(B_kernel, -1, -1)
+            full_kv_num_blocks = full_kv_num_blocks.expand(B_kernel, -1, -1)
+
+        # 3. Map to Physical Indices
+        # We need to gather the physical block IDs using the logical block IDs.
+        # active_page_table: [B, Max_Log]
+        # indices: [B, H, Q, K_Sparse]
+        
+        # Reshape page_table for broadcasting against H, Q dimensions
+        # [B, 1, 1, Max_Log]
+        pt_view = active_page_table.view(B_kernel, 1, 1, -1)
+        
+        # Gather Physical Indices for Partial Blocks
+        phys_kv_indices = torch.gather(
+            pt_view.expand(-1, kv_indices.size(1), kv_indices.size(2), -1),
+            3, 
+            kv_indices.long()
+        )
+        
+        # Gather Physical Indices for Full Blocks
+        phys_full_kv_indices = torch.gather(
+            pt_view.expand(-1, full_kv_indices.size(1), full_kv_indices.size(2), -1),
+            3, 
+            full_kv_indices.long()
+        )
+
+        # 4. Wrap the Mask Mod
+        # The kernel calls mask_mod(b, h, q, k_phys).
+        # We must translate k_phys -> k_log to check the original geometry condition.
+        
+        original_mod = logical_mask.mask_mod
+        
+        def physical_mask_mod(b, h, q_idx, k_phys_idx):
+            # 1. Get Logical Request ID
+            # b is the kernel batch index (0..B-1)
+            logical_req_id = batch_idx[b]
+            
+            # 2. Get Logical Block ID
+            phys_block = k_phys_idx // self.block_size
+            offset = k_phys_idx % self.block_size
+            
+            # self.physical_to_logical: [Max_Reqs, Max_Phys]
+            log_block = self.physical_to_logical[logical_req_id, phys_block]
+            
+            # 3. Reconstruct Logical K Index
+            log_k_idx = log_block * self.block_size + offset
+            
+            # 4. Delegate to Original Logic
+            return original_mod(b, h, q_idx, log_k_idx)
+
+        # 5. Construct New BlockMask
+        # We clone the object (shallow copy) and overwrite the tensor attributes.
+        physical_mask = copy.copy(logical_mask)
+        
+        physical_mask.kv_indices = phys_kv_indices.int()
+        physical_mask.full_kv_indices = phys_full_kv_indices.int()
+        physical_mask.kv_num_blocks = kv_num_blocks.int()
+        physical_mask.full_kv_num_blocks = full_kv_num_blocks.int()
+        physical_mask.mask_mod = physical_mask_mod
+        
+        # We retain BLOCK_SIZE and other metadata from logical_mask
+        
+        return physical_mask
+        
+    def convert_flattened_block_mask(
+        self,
+        logical_mask: BlockMask,
+        flat_page_table: torch.Tensor,     # [Total_Logical_Blocks] -> Phys_Block
+        inverse_page_table: torch.Tensor   # [Capacity_Blocks] -> Log_Block
+    ) -> BlockMask:
+        """
+        Teleports a BlockMask from Logical Space to Physical Space for B=1 (Flattened) execution.
+        """
+        # 1. Map Logical Indices to Physical Indices (Sparse)
+        # logical_mask.kv_indices has shape [1, H, Q_blocks, K_sparse_blocks]
+        phys_kv_indices = flat_page_table[logical_mask.kv_indices.long()]
+        
+        # 2. Map Full Blocks (Dense)
+        phys_full_kv_indices = flat_page_table[logical_mask.full_kv_indices.long()]
+
+        # 3. Wrap Mask Mod
+        original_mod = logical_mask.mask_mod
+        
+        def physical_mask_mod(b, h, q_idx, k_phys_idx):
+            # Map Physical Heap Index -> Logical Sequence Index
+            phys_block = k_phys_idx // self.block_size
+            offset = k_phys_idx % self.block_size
+            
+            # Lookup
+            log_block = inverse_page_table[phys_block]
+            
+            # Reconstruct Logical Index
+            log_k_idx = log_block * self.block_size + offset
+            
+            return original_mod(b, h, q_idx, log_k_idx)
+
+        # 4. Construct New BlockMask
+        physical_mask = copy.copy(logical_mask)
+        physical_mask.kv_indices = phys_kv_indices.int()
+        physical_mask.full_kv_indices = phys_full_kv_indices.int()
+        physical_mask.mask_mod = physical_mask_mod
+        
+        return physical_mask
 
 # === Initialization Helpers ===
 
@@ -213,7 +385,10 @@ class SigmoidMoE(nn.Module):
         top_k_scores, top_k_indices = torch.topk(scores, self.num_active, dim=-1)
         
         # Normalize weights
-        router_weights = top_k_scores / (top_k_scores.sum(dim=-1, keepdim=True) + 1e-6)
+        # FIX 1: Prevent float promotion by casting result back to input dtype
+        denom = top_k_scores.sum(dim=-1, keepdim=True) + 1e-6
+        router_weights = top_k_scores / denom
+        router_weights = router_weights.to(x.dtype)
         
         # 2. Flatten for efficient indexing
         # Shape: [N, D] where N = B*L
@@ -237,19 +412,24 @@ class SigmoidMoE(nn.Module):
             active_indices = torch.nonzero(token_mask).flatten()
             
             # C. Gather Weights & Input
-            # Aggregate weight for expert 'e' per token (usually just one slot, but sums if dupes)
+            # FIX 2: Use .to(x.dtype) instead of .float()
+            mask_cast = match_mask.to(x.dtype)
+            
+            # Aggregate weight for expert 'e' per token
             # [N] -> [Num_Selected]
-            active_weights = (weights_flat * match_mask.float()).sum(dim=-1)[active_indices]
+            active_weights = (weights_flat * mask_cast).sum(dim=-1)[active_indices]
             
             # Gather inputs: [Num_Selected, D]
-            # (If active_indices is empty, this is [0, D], which works fine in Linear layers)
-            active_x = x_flat[active_indices]
+            active_x = x_flat[active_indices].to(x.dtype)
             
             # D. Compute Expert
             expert_out = self.experts[e](active_x)
             
             # E. Scale & Scatter Add
-            weighted_out = expert_out * active_weights.unsqueeze(-1)
+            # ensure active_weights is [Num_Selected, 1] for broadcasting
+            weighted_out = expert_out * active_weights.unsqueeze(-1).to(x.dtype)
+            
+            # weighted_out is now strictly x.dtype (e.g. bf16)
             out_flat.index_add_(0, active_indices, weighted_out)
         
         aux_loss = 1e-2 * (router_logits ** 2).mean()
@@ -332,15 +512,40 @@ class ContextualPatchEmbedder(nn.Module):
     def param_init(self):
         for block in self.res_blocks: block.param_init()
         init_linear(self.input_proj)
+
+    def _pad_and_patch(self, x):
+        # 1. Standard Reflection Pad (Context Window)
+        x_pad = F.pad(x, (self.padding,)*4, mode='reflect')
+        
+        # 2. Dynamic Safety Pad (Stride Alignment)
+        # Unfold drops the last patch if dimensions don't fit perfectly.
+        # We calculate the remaining length after context, and if it's not div by stride, we pad.
+        _, h, w = x_pad.shape
+        
+        # Effective area available for striding after the first context window
+        h_rem = (h - self.context_size) % self.stride
+        w_rem = (w - self.context_size) % self.stride
+        
+        pad_bottom = (self.stride - h_rem) % self.stride
+        pad_right = (self.stride - w_rem) % self.stride
+        
+        if pad_bottom > 0 or pad_right > 0:
+            x_pad = F.pad(x_pad, (0, pad_right, 0, pad_bottom), mode='replicate')
+            
+        patches = x_pad.unfold(1, self.context_size, self.stride).unfold(2, self.context_size, self.stride)
+        return patches
+
     def forward(self, x, logsnr_map):
         # x: [C, H, W], logsnr_map: [1, H, W]
-        x_pad = F.pad(x, (self.padding,)*4, mode='reflect')
-        logsnr_pad = F.pad(logsnr_map, (self.padding,)*4, mode='reflect')
-        patches_img = x_pad.unfold(1, self.context_size, self.stride).unfold(2, self.context_size, self.stride)
+        patches_img = self._pad_and_patch(x)
+        
         GH, GW = patches_img.shape[1], patches_img.shape[2]
         patches_img = patches_img.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1)
-        patches_logsnr = logsnr_pad.unfold(1, self.context_size, self.stride).unfold(2, self.context_size, self.stride)
+        
+        # Apply EXACT SAME padding/striding logic to logsnr
+        patches_logsnr = self._pad_and_patch(logsnr_map)
         patches_logsnr = patches_logsnr.permute(1, 2, 0, 3, 4).reshape(GH * GW, -1).mean(dim=-1, keepdim=True)
+        
         logsnr_features = self.fourier_enc(patches_logsnr)
         raw_input = torch.cat([patches_img, logsnr_features], dim=-1)
         h = self.input_proj(raw_input)
@@ -385,14 +590,6 @@ class ContextualPatchUnembedder(nn.Module):
 
 
 # ===== OUTSIDE MODEL: Span Processor =====
-@dataclass
-class Span:
-    type: str  # 'text' | 'latent'
-    start_idx: int
-    end_idx: int
-    shape: Tuple[int, ...] 
-    causal: bool    
-    doc_id: int 
 
 @dataclass
 class ContextBlock:
@@ -421,6 +618,18 @@ class ContextBlock:
              elif isinstance(self.content, torch.Tensor) and self.type == 'text':
                  self.shape_meta = (self.content.shape[0],)
 
+@dataclass
+class Span:
+    type: str  # 'text' | 'latent'
+    start_idx: int
+    end_idx: int
+    shape: Tuple[int, ...] 
+    causal: bool    
+    doc_id: int 
+    # NEW: Store original unpadded dimensions
+    original_shape: Optional[Tuple[int, ...]] = None
+
+
 class SpanEmbedder:
     def __init__(self, text_embedder, patch_embedder):
         self.text_emb = text_embedder
@@ -434,23 +643,28 @@ class SpanEmbedder:
         hash_spans = []
 
         for block in context_blocks:
+            original_shape = None
+            
             if block.type == 'text':
-                # Assuming content is already tokenized tensor or handle tokenization externally?
-                # The benchmark scripts pass tokenized tensors. 
-                # Let's assume input is Tensor[Long].
                 tokens = block.content
                 if isinstance(tokens, str): raise ValueError("SpanEmbedder expects tokenized text tensors, not strings.")
                 
                 emb = self.text_emb(tokens)
                 span_len = tokens.shape[0]
-                hash_spans.append({'type': 'text', 'shape': (span_len,), 'data': tokens.cpu().tolist()})
+                actual_shape = (span_len,)
+                hash_spans.append({'type': 'text', 'shape': actual_shape, 'data': tokens.cpu().tolist()})
                 
             elif block.type == 'latent':
                 img = block.content
                 logsnr = block.logsnr
+                
+                # CAPTURE ORIGINAL SHAPE
+                original_shape = img.shape[-2:]
+                
                 # Direct 3D Tensor processing
                 emb, grid_shape = self.patch_emb(img, logsnr)
                 span_len = emb.shape[0]
+                actual_shape = grid_shape
                 hash_spans.append({'type': 'latent', 'shape': grid_shape, 'id': block.id})
             
             all_embeds.append(emb)
@@ -458,9 +672,10 @@ class SpanEmbedder:
                 type=block.type,
                 start_idx=cursor,
                 end_idx=cursor + span_len,
-                shape=block.shape_meta,
+                shape=actual_shape,
                 causal=block.causal,
-                doc_id=block.group_id
+                doc_id=block.group_id,
+                original_shape=original_shape # PERSIST IT
             ))
             cursor += span_len
             
@@ -481,10 +696,19 @@ class SpanUnembedder:
             # Text Head (Always computable)
             spandict['text_logits'] = self.text_head(z_span)
             
-            # Latent Head (Always computable, handles 1D/2D)
-            reconstruction = self.patch_unembed(z_span, span.shape)
-            spandict['image_vpreds'] = reconstruction[:-1]
-            spandict['image_logsnrs'] = reconstruction[-1:]
+            # Latent Head
+            if span.type == 'latent':
+                # Reconstruct full padded grid
+                reconstruction = self.patch_unembed(z_span, span.shape)
+                
+                # CROP LOGIC: Slice back to original resolution
+                if span.original_shape is not None:
+                    orig_h, orig_w = span.original_shape
+                    # reconstruction is [C+1, H_pad, W_pad]
+                    reconstruction = reconstruction[:, :orig_h, :orig_w]
+                
+                spandict['image_vpreds'] = reconstruction[:-1]
+                spandict['image_logsnrs'] = reconstruction[-1:]
             
             outputs.append(spandict)
         return outputs
@@ -823,7 +1047,7 @@ class coolerLDTformerKVC(nn.Module):
         self.patch_unembedder = ContextualPatchUnembedder(
             output_channels=3,
             embed_dim=dim,
-            patch_size=2,
+            patch_size=stride,
             mlp_depth=mlp_depth
         )
         
@@ -918,7 +1142,7 @@ class coolerLDTformerZC(nn.Module):
         self.patch_unembedder = ContextualPatchUnembedder(
             output_channels=3,
             embed_dim=dim,
-            patch_size=2,
+            patch_size=stride,
             mlp_depth=mlp_depth
         )
         

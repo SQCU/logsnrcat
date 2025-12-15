@@ -1,5 +1,5 @@
 """
-src/utils.py - PageTable, logger, plotting
+src/utils.py - context management, sampling, logger, plotting
 
 Originally memory_manager.py - Implements the Content-Agnostic Paged Memory System.
 """
@@ -111,179 +111,6 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(bid)
-
-class PageTable:
-    """
-    Manages the mapping between Logical Blocks (Sequence) and Physical Blocks (Heap).
-    Implements the 'convert_logical_block_mask' primitive for Paged FlexAttention.
-    """
-    def __init__(self, 
-                 num_blocks: int, 
-                 block_size: int, 
-                 max_batch_size: int, 
-                 max_logical_blocks: int,
-                 device='cuda'):
-        
-        self.block_size = block_size
-        self.device = device
-        
-        # [logical_batch_idx, logical_block_idx] -> physical_page_idx
-        self.page_table = torch.full(
-            (max_batch_size, max_logical_blocks), -1, 
-            dtype=torch.int32, device=device
-        )
-        
-        # [logical_batch_idx, physical_page_idx] -> logical_page_idx
-        # Used by the mask_mod to reverse-lookup logical positions
-        self.physical_to_logical = torch.full(
-            (max_batch_size, num_blocks), -1,
-            dtype=torch.int32, device=device
-        )
-
-    def convert_logical_block_mask(
-        self,
-        logical_mask: BlockMask,
-        batch_idx: torch.Tensor 
-    ) -> BlockMask:
-        """
-        Teleports a BlockMask from Logical Space to Physical Space.
-        
-        Args:
-            logical_mask: Mask computed on logical sequences (e.g. 0..L).
-            batch_idx: [B] Tensor mapping Kernel Batch Index -> Logical Request ID.
-                       (Used to look up the specific Page Table row).
-        
-        Returns:
-            A new BlockMask instance valid for the Paged KV Cache.
-        """
-        
-        # 1. Identify Active Page Tables
-        # Select the rows corresponding to the active requests in this kernel batch
-        # shape: [B, Max_Logical_Blocks]
-        active_page_table = self.page_table[batch_idx.long()]
-        
-        # 2. Extract Logical Indices (Sparse)
-        # These are indices into the Logical Block sequence (0, 1, 2...)
-        # kv_indices shape: [B, H, Q_Blocks, K_Blocks_Sparse]
-        # (Note: FlexAttention usually broadcasts B if masks are identical, 
-        #  but for PagedAttention we assume uniqueness per batch item or handle broadcast).
-        
-        # We assume logical_mask batch dim matches active_page_table batch dim (B).
-        # If logical_mask is shared (B=1) but we have multiple requests, expand it.
-        B_kernel = batch_idx.size(0)
-        
-        kv_indices = logical_mask.kv_indices
-        full_kv_indices = logical_mask.full_kv_indices
-        kv_num_blocks = logical_mask.kv_num_blocks
-        full_kv_num_blocks = logical_mask.full_kv_num_blocks
-
-        if kv_indices.size(0) == 1 and B_kernel > 1:
-            kv_indices = kv_indices.expand(B_kernel, -1, -1, -1)
-            full_kv_indices = full_kv_indices.expand(B_kernel, -1, -1, -1)
-            kv_num_blocks = kv_num_blocks.expand(B_kernel, -1, -1)
-            full_kv_num_blocks = full_kv_num_blocks.expand(B_kernel, -1, -1)
-
-        # 3. Map to Physical Indices
-        # We need to gather the physical block IDs using the logical block IDs.
-        # active_page_table: [B, Max_Log]
-        # indices: [B, H, Q, K_Sparse]
-        
-        # Reshape page_table for broadcasting against H, Q dimensions
-        # [B, 1, 1, Max_Log]
-        pt_view = active_page_table.view(B_kernel, 1, 1, -1)
-        
-        # Gather Physical Indices for Partial Blocks
-        phys_kv_indices = torch.gather(
-            pt_view.expand(-1, kv_indices.size(1), kv_indices.size(2), -1),
-            3, 
-            kv_indices.long()
-        )
-        
-        # Gather Physical Indices for Full Blocks
-        phys_full_kv_indices = torch.gather(
-            pt_view.expand(-1, full_kv_indices.size(1), full_kv_indices.size(2), -1),
-            3, 
-            full_kv_indices.long()
-        )
-
-        # 4. Wrap the Mask Mod
-        # The kernel calls mask_mod(b, h, q, k_phys).
-        # We must translate k_phys -> k_log to check the original geometry condition.
-        
-        original_mod = logical_mask.mask_mod
-        
-        def physical_mask_mod(b, h, q_idx, k_phys_idx):
-            # 1. Get Logical Request ID
-            # b is the kernel batch index (0..B-1)
-            logical_req_id = batch_idx[b]
-            
-            # 2. Get Logical Block ID
-            phys_block = k_phys_idx // self.block_size
-            offset = k_phys_idx % self.block_size
-            
-            # self.physical_to_logical: [Max_Reqs, Max_Phys]
-            log_block = self.physical_to_logical[logical_req_id, phys_block]
-            
-            # 3. Reconstruct Logical K Index
-            log_k_idx = log_block * self.block_size + offset
-            
-            # 4. Delegate to Original Logic
-            return original_mod(b, h, q_idx, log_k_idx)
-
-        # 5. Construct New BlockMask
-        # We clone the object (shallow copy) and overwrite the tensor attributes.
-        physical_mask = copy.copy(logical_mask)
-        
-        physical_mask.kv_indices = phys_kv_indices.int()
-        physical_mask.full_kv_indices = phys_full_kv_indices.int()
-        physical_mask.kv_num_blocks = kv_num_blocks.int()
-        physical_mask.full_kv_num_blocks = full_kv_num_blocks.int()
-        physical_mask.mask_mod = physical_mask_mod
-        
-        # We retain BLOCK_SIZE and other metadata from logical_mask
-        
-        return physical_mask
-        
-    def convert_flattened_block_mask(
-        self,
-        logical_mask: BlockMask,
-        flat_page_table: torch.Tensor,     # [Total_Logical_Blocks] -> Phys_Block
-        inverse_page_table: torch.Tensor   # [Capacity_Blocks] -> Log_Block
-    ) -> BlockMask:
-        """
-        Teleports a BlockMask from Logical Space to Physical Space for B=1 (Flattened) execution.
-        """
-        # 1. Map Logical Indices to Physical Indices (Sparse)
-        # logical_mask.kv_indices has shape [1, H, Q_blocks, K_sparse_blocks]
-        phys_kv_indices = flat_page_table[logical_mask.kv_indices.long()]
-        
-        # 2. Map Full Blocks (Dense)
-        phys_full_kv_indices = flat_page_table[logical_mask.full_kv_indices.long()]
-
-        # 3. Wrap Mask Mod
-        original_mod = logical_mask.mask_mod
-        
-        def physical_mask_mod(b, h, q_idx, k_phys_idx):
-            # Map Physical Heap Index -> Logical Sequence Index
-            phys_block = k_phys_idx // self.block_size
-            offset = k_phys_idx % self.block_size
-            
-            # Lookup
-            log_block = inverse_page_table[phys_block]
-            
-            # Reconstruct Logical Index
-            log_k_idx = log_block * self.block_size + offset
-            
-            return original_mod(b, h, q_idx, log_k_idx)
-
-        # 4. Construct New BlockMask
-        physical_mask = copy.copy(logical_mask)
-        physical_mask.kv_indices = phys_kv_indices.int()
-        physical_mask.full_kv_indices = phys_full_kv_indices.int()
-        physical_mask.mask_mod = physical_mask_mod
-        
-        return physical_mask
-
 
 
 # =========================================================
@@ -571,6 +398,115 @@ class KVTManager:
                 physical_slot = physical_block_id * self.block_size + offset
                 slots.append(physical_slot)
         return torch.tensor(slots, dtype=torch.int64, device=self.device)
+
+# ==============================================================================
+# 1. Math & Physics Helpers (Deduplicated)
+# ==============================================================================
+
+def get_schedule(t, schedule_bounds: tuple = (5, -4)):
+    """Linear LogSNR schedule."""
+    return schedule_bounds[0] - t * (schedule_bounds[1] - schedule_bounds[0])
+
+def logsnr_to_alpha_sigma(logsnr):
+    """
+    Returns alpha, sigma for a given logsnr.
+    Handles broadcasting if logsnr is [B, 1, H, W].
+    """
+    # Ensure numerical stability
+    sigmoid_lsnr = torch.sigmoid(logsnr)
+    sigmoid_neg_lsnr = torch.sigmoid(-logsnr)
+    alpha = torch.sqrt(sigmoid_lsnr)
+    sigma = torch.sqrt(sigmoid_neg_lsnr)
+    return alpha, sigma
+
+def get_image_spans(resolution):
+    latent_res = resolution // 2
+    length = latent_res * latent_res
+    return [{'type': 'latent', 'len': length, 'shape': (latent_res, latent_res), 'causal': False}]
+
+
+# ==============================================================================
+# 2. Model Wrappers 
+# ==============================================================================
+
+# Import necessary helpers from model.py
+# (Assuming ContextBlock and Span are defined in model.py based on previous patches)
+from .model import (
+    render_topology_embeddings, 
+    build_dual_masks, 
+    ContextBlock, 
+    Span
+)
+def run_model_forward(components, blocks: List[ContextBlock]):
+    """
+    Unified forward pass. 
+    The 'blocks' contain the Tensors (z_t) and the Metadata (logsnr, shape, id).
+    """
+    model, span_embedder, span_unembedder, page_table = components
+    device = model.text_embed.weight.device 
+    
+    # 1. Embed (Pass blocks directly)
+    z_flat, span_objects, _ = span_embedder.embed(blocks)
+    
+    # 2. Topology
+    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device)
+    
+    # 3. Masking
+    L_total = z_flat.shape[0]
+    block_size = page_table.block_size
+    num_blocks = (L_total + block_size - 1) // block_size
+    flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
+    
+    block_masks = build_dual_masks(
+        span_objects, topo_embeds, topo_embeds,
+        page_table, flat_page_table, None,
+        window_size=getattr(model, 'window_size', 10.0)
+    )
+    
+    # 4. Transformer
+    rope_scale = max(1.0, L_total / 64.0)
+    z_out, aux_loss = model(
+        z_flat.unsqueeze(0),
+        topo_embeds.unsqueeze(0),
+        slot_mapping=None,
+        block_masks=block_masks,
+        scale=rope_scale
+    )
+    
+    # 5. Unembed
+    decoded = span_unembedder.decode(z_out.squeeze(0), span_objects)
+    return decoded, aux_loss
+
+
+def predict_velocity_from_blocks(components, blocks: List[ContextBlock], mode='naive'):
+    """
+    Wrapper that calls model and processes outputs (factorization, etc).
+    """
+    decoded, aux_loss = run_model_forward(components, blocks)
+    
+    v_final_list = []
+    pred_logsnr_list = []
+    
+    for i, d in enumerate(decoded):
+        if 'image_vpreds' in d:
+            v_raw = d['image_vpreds']
+            pred_l = d['image_logsnrs']
+            
+            if mode == 'factorized':
+                sigma_p = torch.sqrt(torch.sigmoid(-pred_l))
+                v_final = v_raw * sigma_p
+            else:
+                v_final = v_raw
+            
+            v_final_list.append(v_final)
+            pred_logsnr_list.append(pred_l)
+        else:
+            # For text-only blocks, we might not have vpreds relevant to diffusion loss
+            # Just append None or dummy
+            v_final_list.append(None)
+            pred_logsnr_list.append(None)
+        
+    return v_final_list, pred_logsnr_list, aux_loss
 
 # ==============================================================================
 # Logging & Plotting
