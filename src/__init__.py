@@ -4,5 +4,5 @@ from .model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, ContextBlock
 from .data import CompositeIterator
 from .train import train_autoembed, train_denoise
 from .sample import sample_viz_dset, sample_viz_split_topology, spatial_euler_solver
-from .utils import ExperimentLogger, plot_multimetric_analysis, plot_dset_reconstruction
+from .plotting import ExperimentLogger, plot_multimetric_analysis, plot_dset_reconstruction
 from .bucket_manager import BucketManager

@@ -23,8 +23,8 @@ stride = 4
 mlp_depth = 2
 
 [training]
-ae_steps = 1000
-steps = 2000
+ae_steps = 500
+steps = 1000
 lambda_coeff = 0.2
 mode = "naive"
 batch_size = 8
@@ -38,7 +38,7 @@ enabled = true
 # These two define the "Computational Budget" per step.
 # Cost = (base_resolution / stride)^2 * base_batch_size
 base_resolution = 32
-base_batch_size = 64 #128 if using base_res 16
+base_batch_size = 128 #128 if using base_res 16
 
 # --- Bucket 1: Low Res (32x32) ---
 # Auto-calculated Batch Size: ~128
@@ -84,16 +84,6 @@ enable_sweep = true          # Turn this on/off
 sweep_count = 4              # Number of rows (different sequences)
 sweep_length = 4             # Number of frames (3 context + 1 generated)
 sweep_range = [5.0, 1.0]    # LogSNR range for the Prefix (Clean -> Noisy)
-
-[sampling.sweep]
-enabled = true
-interval = 250
-num_sequences = 4
-sequence_length = 4
-prefix_snr_range = [5.0, 1.0] #-5 snr is really  toasted
-target_logsnr = 10.0
-sampling_steps = 20
-mode = "naive"
 
 [page_table]
 num_blocks = 1024

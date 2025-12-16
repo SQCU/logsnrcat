@@ -29,7 +29,7 @@ class ModelConfig(BaseModel):
     num_heads: int = 8
     topo_dim: int = 3
     mlp_depth: int = 1
-    vocab_size: int = 65536
+    vocab_size: int = 151646 #qwen 3 sized
     global_layer_interval: int = 4
     num_experts: int = 8
     num_active: int = 3
@@ -56,8 +56,8 @@ class NoiseParams(BaseModel):
 
 
 class TimeSamplerConfig(BaseModel):
-    min_pct: float = 0.001
-    max_pct: float = 0.05
+    min_pct: float = 0.01
+    max_pct: float = 1.0
     stride: Optional[int] = None
 
 

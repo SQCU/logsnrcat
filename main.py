@@ -8,21 +8,13 @@ Usage:
     python main.py configs/multisnr_default.toml --steps 1000
 """
 import argparse
-import sys
-from pathlib import Path
-
 import torch
-
-from src.config import load_config, ExperimentConfig
+from src.config import load_config
 from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, PageTable
-from src.utils import ExperimentLogger, plot_multimetric_analysis, plot_dset_reconstruction
-from src.data import CompositeIterator
+from src.data_iterator import CompositeIterator
 from src.train import train_autoembed, train_denoise
-from src.sample import (
-    sample_viz_dset, 
-    sample_viz_split_topology, 
-    sample_viz_causal_sweep  # <--- Add this
-)
+from src.plotting import plot_multimetric_analysis, ExperimentLogger, plot_dset_reconstruction
+import src.sample as sampler
 
 
 
@@ -144,81 +136,23 @@ def main():
     
     use_amp = (dtype_str != "fp32")
     # 6. Sampling & Plotting
+    
+    # Sample
     if cfg['logging']['sample_after_training']:
-        with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
-            print("\nGenerating samples...")
-            samp_cfg = cfg['sampling']
+        print("Sampling...")
+        samp_cfg = cfg['sampling']
+        
+        for res in samp_cfg['resolutions']:
+            # Construct dict for sampler
+            s_dict = samp_cfg.copy()
+            s_dict['mode'] = cfg['training']['mode']
+            s_dict['res'] = res
             
-            for res in samp_cfg['resolutions']:
-                # Create a localized config dict for the sampler
-                local_samp_config = {
-                    "mode": cfg['training']['mode'],
-                    "res": res,
-                    "num_samples": samp_cfg['num_samples'],
-                    "sampling_steps": samp_cfg['steps'],
-                    "target_logsnr": samp_cfg['target_logsnr'],
-                    "schedule_bounds": cfg['training']['schedule_bounds'],
-                }
-                
-                # Stratified
-                res_strat = sample_viz_dset(components, val_iterator, local_samp_config)
-                plot_dset_reconstruction(res_strat, logger, f"{cfg['training']['mode']}_stratified_{res}")
-                
-                # Split Topology
-                res_split = sample_viz_split_topology(components, val_iterator, local_samp_config)
-                plot_dset_reconstruction(res_split, logger, f"{cfg['training']['mode']}_split_{res}", show_map=True)
-                
-                # Causal Sweep (Video)
-                # --- CAUSAL SWEEP LOGIC ---
-                if samp_cfg.get('enable_sweep', False):
-                    print(f"Generating Causal Information Sweeps (Res: {res})...")
-                    
-                    # 1. Identify Target Video Sources
-                    # Look at dataset_mix to find all inputs of type 'video'
-                    video_sources = []
-                    
-                    # Check for an explicit override in config
-                    explicit_source = samp_cfg.get('sweep_video_source')
-                    
-                    if explicit_source:
-                        # If user forced one, use only that (and fail downstream if it doesn't exist)
-                        video_sources.append(explicit_source)
-                    else:
-                        # Otherwise, AUTO-DISCOVER all video splits
-                        for name, split_cfg in cfg['dataset_mix'].items():
-                            if split_cfg.get('type') == 'video':
-                                video_sources.append(name)
-                    
-                    if not video_sources:
-                        print("ℹ️ No video sources found for causal sweep.")
-                    
-                    # 2. Iterate and Generate
-                    M = samp_cfg.get('sweep_length', 4)
-                    
-                    # Define structure for the Iterator (how to format the batch)
-                    video_seq_structure = [{
-                        'res': res, 
-                        'noise_mode': 'uniform',
-                        'noise_params': {'min_snr': -4.0, 'max_snr': 1.0} 
-                    } for _ in range(M)]
-                    
-                    for source_name in video_sources:
-                        # Construct precise config for THIS source
-                        sweep_cfg = {
-                            "mode": cfg['training']['mode'],
-                            "target_logsnr": samp_cfg['target_logsnr'],
-                            "sampling_steps": samp_cfg['steps'],
-                            "num_sweep_sequences": samp_cfg.get('sweep_count', 4),
-                            "sequence_length": M,
-                            "prefix_snr_range": samp_cfg.get('sweep_range', (2.0, -4.0)),
-                            "video_sequence_structure": video_seq_structure,
-                            # THE KEY FIX: Explicitly pass the name we want
-                            "video_source_name": source_name, 
-                        }
-                        
-                        fig_sweep = sample_viz_causal_sweep(components, val_iterator, sweep_cfg)
-                        if fig_sweep:
-                            logger.save_figure(fig_sweep, f"{cfg['training']['mode']}_sweep_{source_name}_{res}")
+            sampler.sample_viz_dset(components, val_iterator, s_dict, logger)
+            
+            if samp_cfg.get('enable_sweep'):
+                 sampler.sample_viz_causal_sweep(components, val_iterator, s_dict, logger)
+
 
     print(f"\nDone! Results in {logger.run_dir}")
 

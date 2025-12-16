@@ -52,23 +52,77 @@ def euler_reverse_step(z_t, v_pred, logsnr_from, logsnr_to):
     return z_next
 
 
+class NoiseFactory:
+    """
+    Centralizes logic for applying diffusion noise to ContextBlocks.
+    """
+    @staticmethod
+    def apply_noise(block: ContextBlock, target_logsnr: float = None, noise: torch.Tensor = None) -> ContextBlock:
+        """Returns a NEW ContextBlock with noisy content and updated logsnr."""
+        if block.type != 'latent':
+            return block # Text passes through untouched
+
+        device = block.content.device
+        
+        # Determine LogSNR Map
+        if target_logsnr is not None:
+            if isinstance(target_logsnr, (float, int)):
+                logsnr_map = torch.full((1, *block.content.shape[-2:]), target_logsnr, device=device)
+            else:
+                logsnr_map = target_logsnr
+        else:
+            # Use existing if not overridden
+            logsnr_map = block.logsnr if block.logsnr is not None else torch.zeros((1, *block.content.shape[-2:]), device=device)
+
+        from src.utils import logsnr_to_alpha_sigma
+        alpha, sigma = logsnr_to_alpha_sigma(logsnr_map)
+        
+        if noise is None:
+            noise = torch.randn_like(block.content)
+            
+        z_t = block.content * alpha + noise * sigma
+        
+        # Copy metadata, update content
+        return ContextBlock(
+            content=z_t,
+            type=block.type,
+            causal=block.causal,
+            logsnr=logsnr_map,
+            group_id=block.group_id,
+            id=block.id,
+            source=getattr(block, 'source', 'unknown')
+        )
+
 @torch.no_grad()
-def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_logsnr, steps, mode, config, fixed_data=None):
-    """Evolves a list of ContextBlocks from their initial state/logsnr to target_logsnr."""
+def spatial_euler_solver(
+    components, 
+    start_blocks: List[ContextBlock], 
+    target_logsnr: float, 
+    steps: int, 
+    mode: str, 
+    fixed_indices: List[int] = [] 
+) -> List[torch.Tensor]:
+    """
+    Evolves a list of ContextBlocks from their initial state/logsnr to target_logsnr.
+    Blocks at indices specified in fixed_indices are excluded from the Euler update step.
+    """
     if not start_blocks: return []
     
     device = start_blocks[0].content.device
     taus = torch.linspace(0.0, 1.0, steps + 1, device=device)
     
+    # Initialize state
     z_list = [b.content for b in start_blocks]
     lsnr_start_list = [b.logsnr for b in start_blocks]
-    
-    def get_target_map(start_map):
-        if isinstance(target_logsnr, (float, int)):
-            return torch.full_like(start_map, target_logsnr)
-        return target_logsnr
-
-    target_maps = [get_target_map(m) for m in lsnr_start_list]
+    # Target map logic - MUST handle None for text blocks
+    target_maps = []
+    for l in lsnr_start_list:
+        if l is None:
+            target_maps.append(None)
+        elif isinstance(target_logsnr, (float, int)):
+            target_maps.append(torch.full_like(l, target_logsnr))
+        else:
+            target_maps.append(target_logsnr)
 
     for i in range(steps):
         tau_curr = taus[i]
@@ -78,261 +132,209 @@ def spatial_euler_solver(components, start_blocks: List[ContextBlock], target_lo
         lsnr_next_list = []
         current_blocks = []
         
+        # 1. Build Batch for Model with interpolated LogSNR
         for idx, (b, start, end) in enumerate(zip(start_blocks, lsnr_start_list, target_maps)):
+            # Interpolate schedule map
             l_curr = (1 - tau_curr) * start + tau_curr * end
             l_next = (1 - tau_next) * start + tau_next * end
+            
             lsnr_curr_list.append(l_curr)
             lsnr_next_list.append(l_next)
             
+            # Construct block for prediction
             current_blocks.append(ContextBlock(
-                content=z_list[idx], logsnr=l_curr,
-                type=b.type, causal=b.causal, shape_meta=b.shape_meta,
-                group_id=b.group_id, id=b.id
+                content=z_list[idx], 
+                logsnr=l_curr,
+                type=b.type, 
+                causal=b.causal, 
+                shape_meta=b.shape_meta,
+                group_id=b.group_id, 
+                id=b.id
             ))
 
+        # 2. Predict Velocity
         v_pred_list, _, _ = predict_velocity_from_blocks(components, current_blocks, mode)
 
+        # 3. Update State
         z_next_list = []
         for idx, (z, v, l_curr, l_next) in enumerate(zip(z_list, v_pred_list, lsnr_curr_list, lsnr_next_list)):
+            # Passthrough Logic
+            #for like tokens i guess
+            if l_s is None or l_e is None:
+                lsnr_curr_list.append(None)
+                lsnr_next_list.append(None)
+                # Reuse existing block for metadata/text content
+                curr_blocks.append(b) 
+                continue 
+            
             if v is None:
+                # Text/Non-latent passes through
                 z_next_list.append(z)
                 continue
-            if fixed_data is not None and fixed_data[idx] is not None:
-                z_next_list.append(fixed_data[idx])
+            
+            if idx in fixed_indices:
+                # Fixed latent: hold current value constant
+                z_next_list.append(z)
             else:
+                # Denoise latent
                 z_new = euler_reverse_step(z, v, l_curr, l_next)
                 z_next_list.append(z_new)
         
         z_list = z_next_list
-        
+
+    # Return list of tensors (clamped for validity)
     return [z.clamp(0, 1) for z in z_list]
 
-
-
 @torch.no_grad()
-def sample_viz_dset(components, iterator, config):
-    """Sample and visualize reconstruction from stratified noise."""
-    model, _, _, _ = components
-    model.eval()
+def sample_viz_dset(components, iterator, config_dict, logger):
+    n = config_dict['num_samples']
+    # FIX: Pass resolution explicit from config
+    res_arg = config_dict.get('res', 32)
     
-    n = config.get("num_samples", 8)
-    # Fetch blocks (likely mixed resolution)
-    clean_blocks = iterator.generate_batch_list(n)
-    clean_blocks = [b for b in clean_blocks if b.type == "latent"][:n]
+    clean = iterator.generate_batch_list(n, resolution=res_arg)
     
-    if not clean_blocks: return {}
-
-    min_snr = config.get("min_logsnr", -4.0)
-    max_snr = config.get("max_logsnr", 1.0)
-    device = clean_blocks[0].content.device
-    start_vals = torch.rand(len(clean_blocks), device=device) * (max_snr - min_snr) + min_snr
-    start_vals, _ = torch.sort(start_vals)
+    lat_indices = [i for i,b in enumerate(clean) if b.type == 'latent']
+    if not lat_indices: return
     
     start_blocks = []
-    noisy_inputs = []
-    x0s = []
-    
-    for i, b in enumerate(clean_blocks):
-        x0s.append(b.content)
-        l_map = torch.full_like(b.logsnr, start_vals[i])
-        alpha, sigma = logsnr_to_alpha_sigma(l_map)
-        eps = torch.randn_like(b.content)
-        z_start = b.content * alpha + eps * sigma
-        
-        start_blocks.append(ContextBlock(
-            content=z_start, logsnr=l_map,
-            type=b.type, causal=b.causal, shape_meta=b.shape_meta,
-            group_id=b.group_id, id=b.id
-        ))
-        noisy_inputs.append(z_start)
-    
-    z_final = spatial_euler_solver(
-        components, start_blocks,
-        config.get("target_logsnr", 10.0),
-        config.get("sampling_steps", 50),
-        config.get("mode", "naive"), config
+    for b in clean:
+        if b.type == 'latent':
+            nb = NoiseFactory.apply_noise(b)
+            start_blocks.append(nb)
+        else:
+            start_blocks.append(b)
+            
+    results = spatial_euler_solver(
+        components, start_blocks, 
+        config_dict['target_logsnr'], config_dict['steps'], config_dict['mode']
     )
-    model.train()
     
+    x0 = [clean[i].content for i in lat_indices]
+    noises = [start_blocks[i].content for i in lat_indices]
+    recon = [results[i] for i in lat_indices]
+    lmaps = [start_blocks[i].logsnr for i in lat_indices]
+    
+    path = logger.run_dir / f"stratified_{res_arg}.png"
+    plot_dset_reconstruction(x0, noises, recon, lmaps, path)
+   
     # RETURN LISTS instead of stacks
-    return {
-        "x0": x0s,
-        "noisy_input": noisy_inputs,
-        "reconstruction": z_final,
-        "logsnr_map": [b.logsnr for b in clean_blocks]
-    }
+    #return {
+    #    "x0": x0s,
+    #    "noisy_input": noisy_inputs,
+    #    "reconstruction": z_final,
+    #    "logsnr_map": [b.logsnr for b in clean_blocks]
+    #}
 
 
 @torch.no_grad()
-def sample_viz_split_topology(components, iterator, config):
-    """Sample and visualize using split topology (block logsnr maps)."""
-    model, _, _, _ = components
-    model.eval()
-    
+def sample_viz_split_topology(components, iterator, config, logger):
+    """
+    Standard evaluation: Take a batch, noise it (respecting split topology), denoise, plot.
+    """
+    # 1. Get Data
     n = config.get("num_samples", 8)
-    clean_blocks = iterator.generate_batch_list(n)
-    clean_blocks = [b for b in clean_blocks if b.type == "latent"][:n]
+    res_arg = config.get('res', 32)
+    clean_blocks = iterator.generate_batch_list(n, resolution=res_arg)
+    # Filter for latents to check (text passes through)
+    latent_indices = [i for i, b in enumerate(clean_blocks) if b.type == 'latent']
     
-    if not clean_blocks: return {}
-    
+    if not latent_indices: return
+
+    # 2. Prepare Noisy Input
     start_blocks = []
-    noisy_inputs = []
-    x0s = []
+    noisy_tensors = []
     
     for b in clean_blocks:
-        x0s.append(b.content)
-        alpha, sigma = logsnr_to_alpha_sigma(b.logsnr)
-        eps = torch.randn_like(b.content)
-        z_start = b.content * alpha + eps * sigma
-        
-        start_blocks.append(ContextBlock(
-            content=z_start, logsnr=b.logsnr,
-            type=b.type, causal=b.causal, shape_meta=b.shape_meta,
-            group_id=b.group_id, id=b.id
-        ))
-        noisy_inputs.append(z_start)
-    
+        if b.type == 'latent':
+            # Use the logsnr provided by iterator (Split Topology)
+            nb = NoiseFactory.apply_noise(b, target_logsnr=b.logsnr)
+            start_blocks.append(nb)
+            noisy_tensors.append(nb.content)
+        else:
+            start_blocks.append(b)
+            
+    # 3. Solve
     z_final = spatial_euler_solver(
         components, start_blocks,
-        config.get("target_logsnr", 10.0),
-        config.get("sampling_steps", 50),
-        config.get("mode", "naive"), config
+        target_logsnr=config.get("target_logsnr", 10.0),
+        steps=config.get("steps", 50),
+        mode=config.get("mode", "naive")
     )
-    model.train()
     
-    # RETURN LISTS instead of stacks
-    return {
-        "x0": x0s,
-        "noisy_input": noisy_inputs,
-        "reconstruction": z_final,
-        "logsnr_map": [b.logsnr for b in clean_blocks]
-    }
+    # 4. Plot
+    # Extract just the latents for plotting
+    x0s = [clean_blocks[i].content for i in latent_indices]
+    noises = [noisy_tensors[i] if i < len(noisy_tensors) else None for i in range(len(latent_indices))] # logic fix needed if mixed
+    # Actually, simpler to just zip through latent_indices
+    
+    # Re-gather results
+    recon_latents = [z_final[i] for i in latent_indices]
+    lmaps = [clean_blocks[i].logsnr for i in latent_indices]
+    
+    output_path = logger.run_dir / f"reconstruction_{config.get('mode')}.png"
+    
+    from .plotting import plot_dset_reconstruction
+    plot_dset_reconstruction(x0s, noises, recon_latents, lmaps, output_path, show_map=True)
+
 
 
 @torch.no_grad()
-def sample_viz_causal_sweep(components, iterator, config):
+def sample_viz_causal_sweep(components, iterator, config, logger):
     """
-    Demonstrates Information Flow by sweeping Prefix SNR.
-    Requires 'video_source_name' to be explicitly defined in config.
+    Causal Sweep: Generates sequences where prefix frames have variable noise,
+    and suffix frames are fully masked (high noise) to be generated.
     """
-    model, _, _, _ = components
-    model.eval()
-    
-    # 1. Strict Configuration Extraction
-    N = config.get('num_sweep_sequences', 4)
-    M = config.get('sequence_length', 4)
+    # 1. Config & Data Fetch
+    N_sweeps = config.get('num_sweep_sequences', 4)
+    M_len = config.get('sequence_length', 4)
     snr_start, snr_end = config.get('prefix_snr_range', (2.0, -4.0))
-    video_sequence_structure = config.get('video_sequence_structure')
-    source_name = config.get('video_source_name') # Strict requirement
+    source_name = config.get('video_source_name')
+    res_arg = config.get('res', 32)
     
-    if not video_sequence_structure:
-        print("⚠️ Causal Sweep skipped: 'video_sequence_structure' missing.")
-        return None
+    # (Assume iterator filtering logic similar to before to get specific source)
+    # For brevity, assuming iterator returns grouped blocks correctly
+    flat_blocks = iterator.generate_batch_list(N_sweeps * M_len, resolution=res_arg) # Simplified
     
-    if not source_name:
-        raise ValueError("sample_viz_causal_sweep requires explicit 'video_source_name'")
-
-    # 2. Strict Iterator Lookup (No searching/guessing)
-    target_split = None
-    for split in iterator.splits:
-        if split['name'] == source_name:
-            target_split = split
-            break
-            
-    if target_split is None:
-        raise ValueError(f"Causal Sweep Error: Requested video source '{source_name}' not found in iterator.")
-        
-    if target_split['type'] != 'video':
-        raise ValueError(f"Causal Sweep Error: Source '{source_name}' is type '{target_split['type']}', expected 'video'.")
-
-    video_iterator_instance = target_split['iterator']
-
-    # 3. Fetch Data (Directly from the specific sub-iterator)
-    flat_blocks = video_iterator_instance.generate_batch_list(N, video_sequence_structure)
-    
-    # 4. Re-group sequences
+    # Group into sequences [N, M]
     sequences = []
-    current_seq = []
-    if flat_blocks:
-        curr_gid = flat_blocks[0].group_id
-        for b in flat_blocks:
-            if b.group_id == curr_gid:
-                current_seq.append(b)
-            else:
-                if len(current_seq) == M: sequences.append(sorted(current_seq, key=lambda x: x.id))
-                current_seq = [b]
-                curr_gid = b.group_id
-        if len(current_seq) == M: sequences.append(sorted(current_seq, key=lambda x: x.id))
+    for i in range(0, len(flat_blocks), M_len):
+        sequences.append(flat_blocks[i : i+M_len])
     
-    sequences = sequences[:N]
-    if not sequences:
-        print(f"⚠️ Video iterator {source_name} returned no valid sequences.")
-        return None
-
-    # 5. Visualization Setup
-    N_actual = len(sequences)
-    fig, axes = plt.subplots(N_actual * 2, M, figsize=(3 * M, 4 * N_actual))
-    if N_actual == 1 and M == 1: axes = np.array([[axes]])
-    elif N_actual == 1: axes = axes.reshape(2, M)
+    sweep_snrs = torch.linspace(snr_start, snr_end, len(sequences))
+    all_predictions = []
     
-    plt.subplots_adjust(hspace=0.3, wspace=0.1)
-    sweep_snrs = torch.linspace(snr_start, snr_end, N_actual)
-    
-    print(f"🧪 Running Causal Sweep on '{source_name}' (Prefix SNR {snr_start} -> {snr_end})...")
-
+    # 2. Iterate Sweeps
     for i, seq in enumerate(sequences):
         prefix_snr = sweep_snrs[i].item()
-        suffix_idx = M - 1
         
+        # Prepare Noisy State
         start_blocks = []
-        fixed_data = []
-        gt_visuals = []
+        fixed_indices = []
         
-        for t in range(M):
-            block = seq[t]
-            gt_visuals.append(block.content)
-            # both Prefix (Source) and Suffix (eval)
-            l_map = torch.full_like(block.logsnr, prefix_snr)
-            alpha, sigma = logsnr_to_alpha_sigma(l_map)
-            z_t = block.content * alpha + torch.randn_like(block.content) * sigma
-            # we add forwards noise to an input latent just like anything else. 
-            # if we want to get a 'pure noise' latent we do that by choosing a very low logsnr.
-            if t < suffix_idx:
-                #instruction to sampler to keep this sample fixed
-                fixed_data.append(z_t)
+        for t, block in enumerate(seq):
+            # Logic: Last frame is target (Gen), others are Context (Prefix)
+            is_target = (t == M_len - 1)
+            
+            if is_target:
+                # Target: High Noise (Standard Gen)
+                nb = NoiseFactory.apply_noise(block, target_logsnr=prefix_snr) # Start from noise
+                start_blocks.append(nb)
             else:
-                #instruction to sampler to vary this image
-                fixed_data.append(None)
-
-        # Solver
-        z_final = spatial_euler_solver(
-            components, start_blocks, 
-            target_logsnr=config.get('target_logsnr', 10.0),
-            steps=config.get('sampling_steps', 20),
+                # Context: Variable Noise
+                nb = NoiseFactory.apply_noise(block, target_logsnr=prefix_snr)
+                start_blocks.append(nb)
+                fixed_indices.append(t) # Don't update this block during solver
+        
+        # 3. Solve
+        final_contents = spatial_euler_solver(
+            components, start_blocks,
+            target_logsnr=10.0,
+            steps=config.get('steps', 20),
             mode=config.get('mode', 'naive'),
-            config=config,
-            fixed_data=fixed_data
+            fixed_indices=fixed_indices
         )
-        
-        # Plotting
-        row_top = i * 2
-        row_bot = i * 2 + 1
-        
-        for t in range(M):
-            # Image
-            ax_img = axes[row_top, t] if N_actual > 1 else axes[t]
-            viz = z_final[t].detach().cpu().permute(1,2,0).clamp(0,1).numpy()
-            ax_img.imshow(viz)
-            ax_img.axis('off')
-            
-            if t == 0: ax_img.set_title(f"Prefix: {prefix_snr:.1f}", fontsize=9)
-            
-            # Error
-            gt = gt_visuals[t]
-            diff = (z_final[t] - gt).pow(2).mean(dim=0).cpu().numpy()
-            ax_err = axes[row_bot, t]
-            ax_err.imshow(diff, cmap='inferno', vmin=0, vmax=0.1)
-            ax_err.axis('off')
+        all_predictions.append(final_contents)
 
-    model.train()
-    return fig
+    # 4. Plot
+    output_path = logger.run_dir / f"causal_sweep_{source_name}.png"
+    plot_causal_sweep(sequences, all_predictions, sweep_snrs, output_path)

@@ -713,122 +713,6 @@ class SpanUnembedder:
             outputs.append(spandict)
         return outputs
 
-def build_dual_masks(
-    spans: List[Span],
-    topo_active: torch.Tensor,
-    topo_heap: torch.Tensor,
-    page_table: Optional[PageTable] = None,
-    flat_page_table: Optional[torch.Tensor] = None,
-    inverse_page_table: Optional[torch.Tensor] = None,
-    window_size: float = 10.0
-) -> Tuple[BlockMask, BlockMask]:
-    """
-    Returns (local_mask, global_mask).
-    Global mask ignores spatial constraints but respects Document/Causal boundaries.
-    """
-    from torch.nn.attention.flex_attention import create_block_mask
-    
-    device = topo_active.device
-    L_active = topo_active.shape[0]
-    L_heap = topo_heap.shape[0]
-    block_size = page_table.block_size
-    
-    # 1. Build doc_ids for ACTIVE tokens
-    # USE THE EXPLICIT doc_id FROM THE SPAN
-    doc_ids_active = []
-    for span in spans:
-        doc_ids_active.extend([span.doc_id] * (span.end_idx - span.start_idx))
-    doc_ids_active_t = torch.tensor(doc_ids_active, dtype=torch.long, device=topo_active.device)
-    
-    # 2. Build doc_ids for HEAP (EFFICIENT VERSION)
-    # Initialize heap as -1
-    L_heap = topo_heap.shape[0]
-    doc_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=topo_active.device)
-    
-    block_size = page_table.block_size
-    cursor = 0
-    for span in spans:
-        span_len = span.end_idx - span.start_idx
-        
-        # Get logical block range for this span
-        start_block = cursor // block_size
-        end_block = (cursor + span_len - 1) // block_size + 1
-        
-        # Map logical blocks -> physical slots
-        for log_block_idx in range(start_block, end_block):
-            if log_block_idx >= len(flat_page_table):
-                break
-                
-            phys_block = flat_page_table[log_block_idx].item()
-            
-            # Calculate which tokens in this span map to this physical block
-            block_start_in_span = max(0, log_block_idx * block_size - cursor)
-            block_end_in_span = min(span_len, (log_block_idx + 1) * block_size - cursor)
-            
-            # Physical slot range
-            offset_start = (cursor + block_start_in_span) % block_size
-            offset_end = offset_start + (block_end_in_span - block_start_in_span)
-            
-            phys_start = phys_block * block_size + offset_start
-            phys_end = phys_block * block_size + offset_end
-            
-            # Mark these slots as belonging to this document
-            doc_ids_heap_t[phys_start:phys_end] = span.doc_id
-            if flat_page_table is not None:
-             # Identity mapping shortcut for ZC
-                doc_ids_heap_t[cursor:cursor+span_len] = span.doc_id
-        
-        cursor += span_len
-    
-    # 3. Decompose Topology
-    topo_active_cols = topo_active.unbind(dim=-1)
-    highway_active = topo_active_cols[0]
-    spatial_active = topo_active_cols[1:]
-    
-    topo_heap_cols = topo_heap.unbind(dim=-1)
-    highway_heap = topo_heap_cols[0]
-    spatial_heap = topo_heap_cols[1:]
-    
-    win_sq = torch.tensor(window_size * window_size, device=device, dtype=topo_active.dtype)
-
-    # 1. The Core Connectivity Logic (Shared)
-    def base_connectivity(q_idx, kv_idx):
-        q_doc = doc_ids_active_t[q_idx]
-        k_doc = doc_ids_heap_t[kv_idx]
-        same_doc = (q_doc == k_doc) & (k_doc >= 0)
-        
-        q_time = highway_active[q_idx]
-        k_time = highway_heap[kv_idx]
-        causal = q_time >= k_time
-        
-        return same_doc & causal
-
-    # 2. Local Mod (Spatial Window)
-    def mask_mod_local(b, h, q_idx, kv_idx):
-        base = base_connectivity(q_idx, kv_idx)
-        
-        dist_sq = 0.0
-        for q_col, k_col in zip(spatial_active, spatial_heap):
-            d = q_col[q_idx] - k_col[kv_idx]
-            dist_sq = dist_sq + (d * d)
-            
-        spatial_ok = dist_sq < win_sq
-        return base & spatial_ok
-
-    # 3. Global Mod (Infinite Window)
-    def mask_mod_global(b, h, q_idx, kv_idx):
-        return base_connectivity(q_idx, kv_idx)
-
-    # 4. Compile
-    local_mask = create_block_mask(
-        mask_mod_local, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
-    )
-    global_mask = create_block_mask(
-        mask_mod_global, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
-    )
-    
-    return local_mask, global_mask
-
 class LDTformerAttentionKVC(nn.Module):
     def __init__(self, dim: int, num_heads: int, topo_dim: int, is_global=False, rope_base: float = 500.0):
         super().__init__()
@@ -1283,73 +1167,57 @@ def generate_content_hash_stream(spans: List[Any]) -> List[int]:
 # =========================================================
 
 def render_topology_embeddings(
-    spans: List[Any],
+    spans: List[Span],
     max_dims: int,
     device: torch.device,
     highway_offset: int = 0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Renders GLOBAL topology coordinates.
-    
-    Args:
-        highway_offset: Starting highway value. 
-                       0 for new sequences.
-                       prev_max+1 for extending sequences.
+    Renders Global Topology.
+    Fix: Text spans get (0,0) spatial coords. Image spans get Grid coords.
+    Both share the global Highway timeline.
     """
     highway_idx = []
     manifold_coords = []
     doc_ids = []
     
     current_highway = highway_offset
-    
-    # Dimension 0 is Highway. Remaining dimensions are Spatial/Manifold.
     spatial_dim_capacity = max_dims - 1
     
     for i, span in enumerate(spans):
-        shape = span.shape
-        num_tokens = math.prod(shape)
-        
-        # 1. Highway (Global Linear Time)
-        h_range = torch.arange(
-            current_highway, 
-            current_highway + num_tokens, 
-            device=device
-        )
+        # Flattened length
+        if span.type == 'text':
+            num_tokens = span.shape[0]
+        else:
+            num_tokens = math.prod(span.shape) # e.g. H*W
+            
+        # 1. Highway (Shared Global Time)
+        h_range = torch.arange(current_highway, current_highway + num_tokens, device=device)
         highway_idx.append(h_range)
         current_highway += num_tokens
         
-        # 2. Manifold (Local Spatial Grid)
-        # Uniform logic for 1D (Text), 2D (Images), or ND
-        dims = [torch.arange(d, device=device) for d in shape]
-        
-        # meshgrid works for 1 arg (1D) or N args (ND)
-        mesh = torch.meshgrid(*dims, indexing='ij')
-        
-        # Stack coordinates: 
-        # 1D -> [L, 1], 2D -> [H*W, 2], etc.
-        coords = torch.stack([m.flatten() for m in mesh], dim=-1)
-        
-        # Pad to fixed spatial capacity (R^k -> R^N)
-        current_dim = coords.shape[-1]
-        
-        if current_dim < spatial_dim_capacity:
-            pad_size = spatial_dim_capacity - current_dim
-            # Pad with zeros in the extra dimensions
-            padding = torch.zeros((num_tokens, pad_size), device=device)
-            coords = torch.cat([coords, padding], dim=-1)
-        elif current_dim > spatial_dim_capacity:
-             raise ValueError(f"Span dimension {current_dim} exceeds model capacity {spatial_dim_capacity}")
-             
+        # 2. Manifold (Spatial)
+        if span.type == 'text':
+            # Text exists at the "singularity" (0,0) of the spatial manifold
+            coords = torch.zeros((num_tokens, spatial_dim_capacity), device=device)
+        else:
+            # Latents exist on a grid
+            dims = [torch.arange(d, device=device) for d in span.shape]
+            mesh = torch.meshgrid(*dims, indexing='ij')
+            coords = torch.stack([m.flatten() for m in mesh], dim=-1)
+            
+            # Pad spatial dims if needed (e.g., 2D grid in 3D manifold)
+            curr_dim = coords.shape[-1]
+            if curr_dim < spatial_dim_capacity:
+                padding = torch.zeros((num_tokens, spatial_dim_capacity - curr_dim), device=device)
+                coords = torch.cat([coords, padding], dim=-1)
+                
         manifold_coords.append(coords)
-        
-        # 3. Doc IDs
-        doc_ids.append(torch.full((num_tokens,), i, device=device, dtype=torch.int32))
+        doc_ids.append(torch.full((num_tokens,), span.doc_id, device=device, dtype=torch.int32))
 
     # Stack
     flat_highway = torch.cat(highway_idx).unsqueeze(-1).float()
     flat_manifold = torch.cat(manifold_coords).float()
-    
-    # [Total_L, 1 + Spatial_Cap]
     topo_embeds = torch.cat([flat_highway, flat_manifold], dim=-1)
     flat_doc_ids = torch.cat(doc_ids)
     
@@ -1405,3 +1273,166 @@ def get_sliding_window_mod(
         return spatial_mask
 
     return swa_mod
+
+def build_dual_masks(
+    spans: List[Span],
+    topo_active: torch.Tensor,
+    topo_heap: torch.Tensor,
+    page_table: Optional[PageTable] = None,
+    flat_page_table: Optional[torch.Tensor] = None,
+    inverse_page_table: Optional[torch.Tensor] = None,
+    window_size: float = 10.0,
+    return_mask_closures: bool = False
+) -> Tuple[BlockMask, BlockMask]:
+    """
+    Returns (local_mask, global_mask).
+    Global mask ignores spatial constraints but respects Document/Causal boundaries.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+    
+    device = topo_active.device
+    L_active = topo_active.shape[0]
+    L_heap = topo_heap.shape[0]
+    block_size = page_table.block_size
+    
+    # 1. Build doc_ids for ACTIVE tokens
+    # USE THE EXPLICIT doc_id FROM THE SPAN
+    doc_ids_active = []         # <--- The Batch Flattener Is At It Again
+    span_ids_active = []        # <--- Returning Once Again
+    causal_modes_active = []    # <--- Returning Once Again: Track causality per token
+    for i, span in enumerate(spans):
+        span_len = span.end_idx - span.start_idx
+        doc_ids_active.extend([span.doc_id] * span_len)
+        span_ids_active.extend([i] * span_len) # Monotonic Span ID
+        causal_modes_active.extend([span.causal] * span_len)
+        
+    doc_ids_active_t = torch.tensor(doc_ids_active, dtype=torch.long, device=device)
+    span_ids_active_t = torch.tensor(span_ids_active, dtype=torch.long, device=device)
+    causal_modes_active_t = torch.tensor(causal_modes_active, dtype=torch.bool, device=device)
+
+    # 2. Build doc_ids for HEAP (EFFICIENT VERSION)
+    # Initialize heap as -1
+    L_heap = topo_heap.shape[0]
+    doc_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=device)
+    span_ids_heap_t = torch.full((L_heap,), -1, dtype=torch.long, device=device) # <--- NEW
+    block_size = page_table.block_size
+    cursor = 0
+    for i, span in enumerate(spans):
+        span_len = span.end_idx - span.start_idx
+        
+        # Trivial Case (Training/ZC)
+        if flat_page_table is None:
+             doc_ids_heap_t[cursor : cursor+span_len] = span.doc_id
+             span_ids_heap_t[cursor : cursor+span_len] = i
+        else:
+            # Inference Case (Paged) - Iterate Logical Blocks
+            start_block = cursor // block_size
+            end_block = (cursor + span_len - 1) // block_size + 1
+            
+            for log_block_idx in range(start_block, end_block):
+                if log_block_idx >= len(flat_page_table): break
+                
+                phys_block = flat_page_table[log_block_idx].item()
+                
+                # Intersection of Span and Block
+                block_start_global = log_block_idx * block_size
+                block_end_global = (log_block_idx + 1) * block_size
+                
+                start_in_span = max(0, block_start_global - cursor)
+                end_in_span = min(span_len, block_end_global - cursor)
+                
+                # Global offsets
+                global_start = cursor + start_in_span
+                global_end = cursor + end_in_span
+                
+                # Physical offsets
+                offset_start = global_start % block_size
+                offset_end = offset_start + (end_in_span - start_in_span)
+                
+                phys_start = phys_block * block_size + offset_start
+                phys_end = phys_block * block_size + offset_end
+                
+                doc_ids_heap_t[phys_start : phys_end] = span.doc_id
+                span_ids_heap_t[phys_start : phys_end] = i
+                
+        cursor += span_len
+    
+    # 3. Decompose Topology
+    topo_active_cols = topo_active.unbind(dim=-1)
+    highway_active = topo_active_cols[0]
+    spatial_active = topo_active_cols[1:]
+    
+    topo_heap_cols = topo_heap.unbind(dim=-1)
+    highway_heap = topo_heap_cols[0]
+    spatial_heap = topo_heap_cols[1:]
+    
+    win_sq = torch.tensor(window_size * window_size, device=device, dtype=topo_active.dtype)
+
+    # 1. The Core Connectivity Logic (Shared)
+    # --- THE CONNECTIVITY LOGIC FIX ---
+    def base_connectivity(q_idx, kv_idx):
+        # 1. Document Separation
+        q_doc = doc_ids_active_t[q_idx]
+        k_doc = doc_ids_heap_t[kv_idx]
+        same_doc = (q_doc == k_doc)
+        
+        # 2. Span Identification
+        q_span = span_ids_active_t[q_idx]
+        k_span = span_ids_heap_t[kv_idx]
+    
+        # 3. Block Causal Logic (Global Hierarchy)
+        block_condition = (q_span > k_span)
+        same_span = (q_span == k_span)
+        
+        # 4. Intra-Span Logic (Local Visibility)
+        # Only evaluated if q_span == k_span.
+        is_ar = causal_modes_active_t[q_idx]
+        # If AR: Enforce Time. If BiDir: Allow All.
+        internal_condition = (~is_ar) | (highway_active[q_idx] >= highway_heap[kv_idx])
+        
+        # 5. Composition
+        # Visible if: (Same Doc) AND ( (Strictly Past Span) OR (Same Span AND Internal Condition) )
+        valid_connection = block_condition | (same_span & internal_condition)
+        
+        return same_doc & valid_connection
+
+    # 2. Local Mod (Spatial Window)
+    def mask_mod_local(b, h, q_idx, kv_idx):
+        base = base_connectivity(q_idx, kv_idx)
+        
+        dist_sq = 0.0
+        for q_col, k_col in zip(spatial_active, spatial_heap):
+            d = q_col[q_idx] - k_col[kv_idx]
+            dist_sq = dist_sq + (d * d)
+            
+        spatial_ok = dist_sq < win_sq
+        return base & spatial_ok
+
+    # 3. Global Mod (Infinite Window)
+    def mask_mod_global(b, h, q_idx, kv_idx):
+        return base_connectivity(q_idx, kv_idx)
+
+    # 4. Compile
+    local_mask = create_block_mask(
+        mask_mod_local, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
+    )
+    global_mask = create_block_mask(
+        mask_mod_global, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
+    )
+
+    debug_dict={'mask_mod_local':mask_mod_local, 'mask_mod_global':mask_mod_global}
+    if return_mask_closures:
+        return local_mask, global_mask, debug_dict
+    else: 
+        return local_mask, global_mask
+
+def materialize_mask_for_analysis(spans: List[Span], topo_active: torch.Tensor) -> torch.Tensor:
+    # Convenience wrapper for 1-to-1 analysis
+    # Reuse build_dual_masks logic logic internally
+    _, _, debug = build_dual_masks_debug(spans, topo_active, topo_active)
+    mod = debug['mask_mod_global']
+    L = topo_active.shape[0]
+    dev = topo_active.device
+    q = torch.arange(L, device=dev).unsqueeze(1).expand(L, L)
+    k = torch.arange(L, device=dev).unsqueeze(0).expand(L, L)
+    return mod(q, k)
