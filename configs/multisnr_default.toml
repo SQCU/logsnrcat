@@ -18,8 +18,8 @@ window_size = 10.0
 [model.patch_embedder]
 input_channels = 3
 fourier_dim = 16
-context_size = 16
-stride = 8
+context_size = 6
+stride = 4
 mlp_depth = 2
 
 [training]
@@ -30,7 +30,7 @@ mode = "naive"
 batch_size = 8
 compile = true
 compile_dynamic = true
-schedule_bounds = [5.0, -4.0]
+schedule_bounds = [5.0, -4.0]       #this dictates what the 'x_0' lsnr is, vs what the 'z_T' lsnr is. controls some eval samplers too.
 precision = "bf16"  # <--- ENABLE THIS
 
 [training.bucketing]
@@ -38,7 +38,7 @@ enabled = true
 # These two define the "Computational Budget" per step.
 # Cost = (base_resolution / stride)^2 * base_batch_size
 base_resolution = 32
-base_batch_size = 32 #128 if using base_res 16
+base_batch_size = 64 #128 if using base_res 16
 
 # --- Bucket 1: Low Res (32x32) ---
 # Auto-calculated Batch Size: ~128
@@ -64,14 +64,14 @@ weight_decay = 0.1
 max_lr = 5e-4
 pct_start = 0.1
 div_factor = 10.0
-final_div_factor = 100.0
+final_div_factor = 25.0
 
 [training.ae_optimizer]
 lr = 5e-4
 weight_decay = 0.1
 max_lr = 5e-4
 pct_start = 0.1
-final_div_factor = 100.0
+final_div_factor = 25.0
 
 [sampling]
 num_samples = 8
@@ -83,14 +83,14 @@ resolutions = [32, 64, 128]
 enable_sweep = true          # Turn this on/off
 sweep_count = 4              # Number of rows (different sequences)
 sweep_length = 4             # Number of frames (3 context + 1 generated)
-sweep_range = [4.0, -2.0]    # LogSNR range for the Prefix (Clean -> Noisy)
+sweep_range = [5.0, 1.0]    # LogSNR range for the Prefix (Clean -> Noisy)
 
 [sampling.sweep]
 enabled = true
 interval = 250
 num_sequences = 4
 sequence_length = 4
-prefix_snr_range = [5.0, -2.0] #-5 snr is really  toasted
+prefix_snr_range = [5.0, 1.0] #-5 snr is really  toasted
 target_logsnr = 10.0
 sampling_steps = 20
 mode = "naive"
@@ -147,7 +147,7 @@ ratio = 0.8
 # No global noise_mode here; it is defined per-frame in sequence_structure
 
 [dataset_mix.video_causal_zoom.params]
-path = "C:/dox/recordings/rl_capture/capture_run_1760343426/videos"
+path = "C:/dox/recordings/rl_capture/capture_run_1760343426/videos/proxies"
 
 # Time Sampler: Pick a 0.1% to 5% slice of the video for the sequence
 [dataset_mix.video_causal_zoom.params.time_sampler]

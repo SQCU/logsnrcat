@@ -291,27 +291,17 @@ def sample_viz_causal_sweep(components, iterator, config):
         for t in range(M):
             block = seq[t]
             gt_visuals.append(block.content)
-            
+            # both Prefix (Source) and Suffix (eval)
+            l_map = torch.full_like(block.logsnr, prefix_snr)
+            alpha, sigma = logsnr_to_alpha_sigma(l_map)
+            z_t = block.content * alpha + torch.randn_like(block.content) * sigma
+            # we add forwards noise to an input latent just like anything else. 
+            # if we want to get a 'pure noise' latent we do that by choosing a very low logsnr.
             if t < suffix_idx:
-                # Prefix (Source)
-                l_map = torch.full_like(block.logsnr, prefix_snr)
-                alpha, sigma = logsnr_to_alpha_sigma(l_map)
-                z_t = block.content * alpha + torch.randn_like(block.content) * sigma
-                
-                start_blocks.append(ContextBlock(
-                    content=z_t, logsnr=l_map, type='latent', causal=True,
-                    shape_meta=block.shape_meta, group_id=block.group_id, id=block.id
-                ))
+                #instruction to sampler to keep this sample fixed
                 fixed_data.append(z_t)
             else:
-                # Suffix (Sink) - Pure Noise
-                l_map = torch.full_like(block.logsnr, -4.0)
-                z_t = torch.randn_like(block.content) # Pure noise assumption for generation
-                
-                start_blocks.append(ContextBlock(
-                    content=z_t, logsnr=l_map, type='latent', causal=True,
-                    shape_meta=block.shape_meta, group_id=block.group_id, id=block.id
-                ))
+                #instruction to sampler to vary this image
                 fixed_data.append(None)
 
         # Solver
