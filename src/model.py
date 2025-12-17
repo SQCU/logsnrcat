@@ -3,14 +3,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, BlockMask
-from typing import Tuple, List, Dict, Any, Optional, Union
+from typing import Tuple, List, Dict, Any, Optional, Union, Callable
 from dataclasses import dataclass, field
 import math
-
-try:
-    from nvllm_flex_attention import update_kv_cache
-except ImportError:
-    update_kv_cache = None  # Not needed for ZC mode
+import copy
 
 ### MODEL PROVIDES PAGETABLE, CORE DATA STRUCTURES ALLOWING INFERENCE
 
@@ -720,6 +716,46 @@ class SpanUnembedder:
             outputs.append(spandict)
         return outputs
 
+
+def update_kv_cache(
+    k_new: torch.Tensor, 
+    v_new: torch.Tensor, 
+    k_cache: torch.Tensor, 
+    v_cache: torch.Tensor, 
+    slot_mapping: torch.Tensor
+):
+    """
+    Writes new KV tokens into the persistent cache using scatter/indexing.
+    
+    Args:
+        k_new: [B*L, H, 1, D] - Incoming K tokens
+        v_new: [B*L, H, 1, D] - Incoming V tokens
+        k_cache: [1, H, Capacity, D] - Physical Heap
+        v_cache: [1, H, Capacity, D] - Physical Heap
+        slot_mapping: [B*L] - Physical indices for the incoming stream
+    """
+    # Squeeze time dim: [B*L, H, 1, D] -> [B*L, H, D]
+    k_src = k_new.squeeze(2)
+    v_src = v_new.squeeze(2)
+    
+    # We want to write to k_cache[0, :, slot_mapping, :]
+    # k_cache[0] shape: [H, Capacity, D]
+    # k_src shape:      [BL, H, D] -> Permute to [H, BL, D] for alignment
+    
+    k_src_p = k_src.permute(1, 0, 2).to(k_cache.dtype)
+    v_src_p = v_src.permute(1, 0, 2).to(v_cache.dtype)
+    
+    # Vectorized advanced indexing:
+    # Dim 0 (H): Selects all heads (implicit broadcasting or slice)
+    # Dim 1 (Capacity): Selects specific slots via slot_mapping
+    # Dim 2 (D): Selects all features
+    
+    # Note: k_cache is [1, H, Cap, D], so we index at [0] first.
+    # usage of slice(None) is equivalent to ':'
+    
+    k_cache[0, :, slot_mapping, :] = k_src_p
+    v_cache[0, :, slot_mapping, :] = v_src_p
+
 class LDTformerAttentionKVC(nn.Module):
     def __init__(self, dim: int, num_heads: int, topo_dim: int, is_global=False, rope_base: float = 500.0):
         super().__init__()
@@ -912,7 +948,7 @@ class LDTformerBlockZC(nn.Module):
 # ===== INSIDE MODEL: Metadata-Agnostic =====
 
 class coolerLDTformerKVC(nn.Module):
-    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, mlp_depth=1, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base: int = 500):
+    def __init__(self, dim=256, depth=8, num_heads=8, topo_dim=4, mlp_depth=1, vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3, rope_base:int = 500, mlp_ratio: float = 4.0, jitter_noise: float = 0.1, context_size: int = 4, stride: int = 2, fourier_dim: int = 16, window_size: float = 10.0):
         super().__init__()
         
         # Embedding heads (used by SpanEmbedder)
@@ -1100,11 +1136,7 @@ class coolerLDTformerZC(nn.Module):
 
 # coupled concerns for embeddings stuff
 
-import torch
 import xxhash
-import numpy as np
-import math
-from typing import List, Dict, Tuple, Any, Callable, Optional
 
 # =========================================================
 # 1. CONTENT IDENTITY (Hashing Policy)
@@ -1436,7 +1468,7 @@ def build_dual_masks(
 def materialize_mask_for_analysis(spans: List[Span], topo_active: torch.Tensor) -> torch.Tensor:
     # Convenience wrapper for 1-to-1 analysis
     # Reuse build_dual_masks logic logic internally
-    _, _, debug = build_dual_masks_debug(spans, topo_active, topo_active)
+    _, _, debug = build_dual_masks(spans, topo_active, topo_active, return_mask_closures=True)
     mod = debug['mask_mod_global']
     L = topo_active.shape[0]
     dev = topo_active.device
