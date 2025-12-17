@@ -39,6 +39,28 @@ from src.model import (
     ContextBlock, Span,
     render_topology_embeddings, build_dual_masks, update_kv_cache
 )
+
+
+def compile_transformer_layers(model, mode='default'):
+    """
+    Compile ONLY the transformer layers, not embedding/unembedding.
+
+    Why selective compilation:
+    - Embedding: Dynamic shapes (variable span counts, gather ops)
+    - Transformer layers: Uniform access patterns, static shapes once embedded
+    - Unembedding: Selective gather/scatter for specific spans
+
+    The transformer stack is the compute-heavy part and benefits most from
+    fusion. Embedding/unembedding are memory-bound with dynamic control flow.
+
+    See PyTorch blog on static shapes for CUDA graphs:
+    "Instead of using the dynamic-shape tensors... we used static shape tensors
+    where a mask is used to indicate which elements are valid."
+    """
+    for i, layer in enumerate(model.layers):
+        model.layers[i] = torch.compile(layer, mode=mode, dynamic=False)
+    return model
+
 from src.utils import KVTManager, logsnr_to_alpha_sigma
 
 
@@ -327,9 +349,9 @@ def benchmark_concat_ar_zc(
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
 
-    # Compile model for fused flex_attention kernels
+    # Compile ONLY the transformer layers, not embedding/unembedding
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -492,7 +514,7 @@ def benchmark_concat_ar_kvc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -682,7 +704,7 @@ def benchmark_concat_ar_zc_batched(
     ).to(device=device, dtype=dtype)
 
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -885,7 +907,7 @@ def benchmark_concat_ar_kvc_batched(
     ).to(device=device, dtype=dtype)
 
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1146,9 +1168,9 @@ def benchmark_zc(
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
 
-    # Compile model for fused flex_attention kernels
+    # Compile ONLY transformer layers (not embedding/unembedding which have dynamic shapes)
     if use_compile and not with_grad:  # Don't compile training mode
-        model = torch.compile(model, mode='reduce-overhead')
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1259,7 +1281,7 @@ def benchmark_kvc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
