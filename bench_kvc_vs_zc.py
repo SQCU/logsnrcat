@@ -360,9 +360,22 @@ def benchmark_kvc(
     num_latents: int,
     latent_res: int,
     warmup_runs: int = 2,
-    timed_runs: int = 5
+    timed_runs: int = 5,
+    headroom_multiplier: float = 2.0  # Extra space for multi-turn / diffusion steps
 ) -> BenchmarkResult:
     """Benchmark KVC model."""
+
+    # Calculate token count FIRST to right-size allocations
+    block_size = cfg['page_table']['block_size']
+    latent_tokens_per_span = (latent_res // cfg['model']['patch_embedder']['stride'])**2
+    num_tokens = num_text + num_latents * latent_tokens_per_span
+
+    # Right-size the KV cache: actual blocks needed + headroom for multi-turn
+    needed_blocks = (num_tokens + block_size - 1) // block_size
+    max_blocks = max(needed_blocks * int(headroom_multiplier), 8)  # minimum 8 blocks
+
+    print(f"  KVC allocation: {num_tokens} tokens -> {needed_blocks} blocks needed, "
+          f"allocating {max_blocks} (headroom={headroom_multiplier}x)")
 
     # Build model
     model = coolerLDTformerKVC(
@@ -388,17 +401,17 @@ def benchmark_kvc(
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
 
     page_table = PageTable(
-        num_blocks=cfg['page_table']['num_blocks'],
-        block_size=cfg['page_table']['block_size'],
+        num_blocks=max_blocks,  # Right-sized
+        block_size=block_size,
         max_batch_size=cfg['page_table']['max_batch_size'],
-        max_logical_blocks=cfg['page_table']['max_logical_blocks'],
+        max_logical_blocks=max_blocks,  # Match
         device=device
     )
 
-    # KVT Manager for paged attention
+    # KVT Manager for paged attention - RIGHT-SIZED
     kvt_manager = KVTManager(
-        max_blocks=cfg['page_table']['num_blocks'],
-        block_size=cfg['page_table']['block_size'],
+        max_blocks=max_blocks,
+        block_size=block_size,
         kv_dim=cfg['model']['dim'],
         layers=cfg['model']['depth'],
         heads=cfg['model']['num_heads'],
@@ -409,9 +422,6 @@ def benchmark_kvc(
 
     # Create test data
     blocks = create_test_context(num_text, num_latents, latent_res, device, dtype)
-
-    # Calculate token count
-    num_tokens = num_text + num_latents * (latent_res // cfg['model']['patch_embedder']['stride'])**2
 
     # Warmup
     for i in range(warmup_runs):
