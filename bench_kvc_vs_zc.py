@@ -329,7 +329,7 @@ def benchmark_concat_ar_zc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model, dynamic=True)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -492,7 +492,7 @@ def benchmark_concat_ar_kvc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model, dynamic=True)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -682,7 +682,7 @@ def benchmark_concat_ar_zc_batched(
     ).to(device=device, dtype=dtype)
 
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model, dynamic=True)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -885,7 +885,7 @@ def benchmark_concat_ar_kvc_batched(
     ).to(device=device, dtype=dtype)
 
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model, dynamic=True)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1147,8 +1147,8 @@ def benchmark_zc(
     ).to(device=device, dtype=dtype)
 
     # Compile model for fused flex_attention kernels
-    if use_compile and not with_grad:  # Don't compile training mode
-        model = torch.compile(model, mode='reduce-overhead')
+    if use_compile:  # Don't compile training mode
+        model = torch.compile(model, dynamic=True)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1259,7 +1259,7 @@ def benchmark_kvc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, mode='reduce-overhead')
+        model = torch.compile(model, dynamic=True)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
