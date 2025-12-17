@@ -453,17 +453,18 @@ from .model import (
 )
 def run_model_forward(components, blocks: List[ContextBlock]):
     """
-    Unified forward pass. 
+    Unified forward pass.
     The 'blocks' contain the Tensors (z_t) and the Metadata (logsnr, shape, id).
     """
     model, span_embedder, span_unembedder, page_table = components
-    device = model.text_embed.weight.device 
-    
+    device = model.text_embed.weight.device
+    dtype = model.text_embed.weight.dtype  # Single source of truth for dtype
+
     # 1. Embed (Pass blocks directly)
     z_flat, span_objects, _ = span_embedder.embed(blocks)
-    
-    # 2. Topology
-    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device)
+
+    # 2. Topology (dtype inferred from model)
+    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
     
     # 3. Masking
     L_total = z_flat.shape[0]

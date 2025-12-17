@@ -1209,57 +1209,64 @@ def render_topology_embeddings(
     spans: List[Span],
     max_dims: int,
     device: torch.device,
-    highway_offset: int = 0
+    highway_offset: int = 0,
+    dtype: torch.dtype = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Renders Global Topology.
     Fix: Text spans get (0,0) spatial coords. Image spans get Grid coords.
     Both share the global Highway timeline.
+
+    Args:
+        dtype: If None, defaults to torch.float32. Pass model dtype for consistency.
     """
+    if dtype is None:
+        dtype = torch.float32
+
     highway_idx = []
     manifold_coords = []
     doc_ids = []
-    
+
     current_highway = highway_offset
     spatial_dim_capacity = max_dims - 1
-    
+
     for i, span in enumerate(spans):
         # Flattened length
         if span.type == 'text':
             num_tokens = span.shape[0]
         else:
             num_tokens = math.prod(span.shape) # e.g. H*W
-            
+
         # 1. Highway (Shared Global Time)
-        h_range = torch.arange(current_highway, current_highway + num_tokens, device=device)
+        h_range = torch.arange(current_highway, current_highway + num_tokens, device=device, dtype=dtype)
         highway_idx.append(h_range)
         current_highway += num_tokens
-        
+
         # 2. Manifold (Spatial)
         if span.type == 'text':
             # Text exists at the "singularity" (0,0) of the spatial manifold
-            coords = torch.zeros((num_tokens, spatial_dim_capacity), device=device)
+            coords = torch.zeros((num_tokens, spatial_dim_capacity), device=device, dtype=dtype)
         else:
             # Latents exist on a grid
-            dims = [torch.arange(d, device=device) for d in span.shape]
+            dims = [torch.arange(d, device=device, dtype=dtype) for d in span.shape]
             mesh = torch.meshgrid(*dims, indexing='ij')
             coords = torch.stack([m.flatten() for m in mesh], dim=-1)
-            
+
             # Pad spatial dims if needed (e.g., 2D grid in 3D manifold)
             curr_dim = coords.shape[-1]
             if curr_dim < spatial_dim_capacity:
-                padding = torch.zeros((num_tokens, spatial_dim_capacity - curr_dim), device=device)
+                padding = torch.zeros((num_tokens, spatial_dim_capacity - curr_dim), device=device, dtype=dtype)
                 coords = torch.cat([coords, padding], dim=-1)
-                
+
         manifold_coords.append(coords)
         doc_ids.append(torch.full((num_tokens,), span.doc_id, device=device, dtype=torch.int32))
 
-    # Stack
-    flat_highway = torch.cat(highway_idx).unsqueeze(-1).float()
-    flat_manifold = torch.cat(manifold_coords).float()
+    # Stack - dtype already correct, no .float() needed
+    flat_highway = torch.cat(highway_idx).unsqueeze(-1)
+    flat_manifold = torch.cat(manifold_coords)
     topo_embeds = torch.cat([flat_highway, flat_manifold], dim=-1)
     flat_doc_ids = torch.cat(doc_ids)
-    
+
     return topo_embeds, flat_doc_ids
 
 # =========================================================
