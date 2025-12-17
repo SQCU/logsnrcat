@@ -240,7 +240,7 @@ class HouseholderOrthogonal(nn.Module):
 
     def get_matrix(self):
         # Start with Identity
-        Q = torch.eye(self.dim, device=self.vs.device)
+        Q = torch.eye(self.dim, device=self.vs.device, dtype=self.vs.dtype)
         # Iteratively apply reflections: H = I - 2vv^T / ||v||^2
         for i in range(self.vs.shape[0]):
             v = self.vs[i].unsqueeze(1)
