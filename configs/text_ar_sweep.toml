@@ -1,0 +1,17 @@
+# configs/text_ar_sweep.toml
+
+[[queries]]
+mutation = "append_text"
+sampler = "discrete_logit"
+
+# Configuration for the new span
+[queries.new_span_config]
+# Initial content: [Start_Token] or similar. 
+# Using [0] as a safe default for a generic tokenizer.
+initial_content = [0]
+
+[queries.sampling_config]
+max_new_tokens = 128
+temperature = 1.0
+top_p = 0.9
+top_k = 50

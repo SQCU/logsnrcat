@@ -13,7 +13,7 @@ from .model import (
     coolerLDTformerZC, SpanEmbedder, SpanUnembedder, 
     build_dual_masks, ContextBlock, render_topology_embeddings, PageTable
 )
-from .data import CompositeIterator
+from .data_iterator import CompositeIterator
 from .utils import run_model_forward, predict_velocity_from_blocks
 from .sample import euler_forward_step, euler_reverse_step
 from .config import sanitize_config
@@ -75,7 +75,7 @@ def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
 
 from .bucket_manager import build_bucket_manager_from_config
 
-def train_autoembed(components, config, logger=None):
+def train_autoembed(components, config, iterator, logger=None):
     # 1. Enforce Dictionary Type
     config = sanitize_config(config)
     
@@ -100,18 +100,10 @@ def train_autoembed(components, config, logger=None):
     model_stride = model.patch_embedder.stride
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
     
-
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
     fused=True)
     scheduler = OneCycleLR(opt, max_lr=max_lr, total_steps=steps, pct_start=pct_start)
-    # FIX: Calculate cache size
-    caching_res = calculate_global_max_resolution(config)
     
-    iterator = CompositeIterator(
-        model.text_embed.weight.device, 
-        config=config['dataset_mix'],
-        caching_resolution=caching_res # Pass it down
-    )
     history = []
     bucketing_enabled = config['training']['bucketing']['enabled']
     # BF16 usually doesn't need a GradScaler, but FP16 does.
@@ -149,7 +141,8 @@ def train_autoembed(components, config, logger=None):
                     # AE training usually reconstructs from z_t. 
                     # For pure AE (identity), we can use z_t = x0 (clean).
                     # But let's stick to the script: x0 -> noise -> predict.
-                    z_t, _, _ = euler_forward_step(b.content, b.logsnr)
+                    noise = torch.randn_like(b.content)
+                    z_t, _, _ = euler_forward_step(b.content, b.logsnr, noise)
                     
                     # Construct input block
                     noisy_blocks.append(ContextBlock(
@@ -166,10 +159,12 @@ def train_autoembed(components, config, logger=None):
             decoded, aux = run_model_forward(components, noisy_blocks)
             
             loss_img = 0.0; loss_meta = 0.0; count = 0
+            latent_cursor = 0
             for j, res in enumerate(decoded):
                 if 'image_vpreds' in res:
-                    loss_img += F.mse_loss(res['image_vpreds'], target_imgs[j])
-                    loss_meta += F.l1_loss(res['image_logsnrs'], target_lsnrs[j])
+                    loss_img += F.mse_loss(res['image_vpreds'], target_imgs[latent_cursor])
+                    loss_meta += F.l1_loss(res['image_logsnrs'], target_lsnrs[latent_cursor])
+                    latent_cursor += 1
                     count += 1
             
             if count > 0:
@@ -192,7 +187,7 @@ def train_autoembed(components, config, logger=None):
             
     return pd.DataFrame(history)
 
-def train_denoise(components, config, logger=None):
+def train_denoise(components, config, iterator, logger=None):
     # 1. Enforce Dictionary Type
     config = sanitize_config(config)
     
@@ -200,9 +195,7 @@ def train_denoise(components, config, logger=None):
     mode = config['training']['mode']
     steps = config['training']['ae_steps']
     bs = config['training']['batch_size']
-
     lambda_coeff = config['training']['lambda_coeff']
-    
     
     # 4. Optimizer Params (Strict)
     opt_cfg = config['training']['ae_optimizer'] # distinct AE optimizer config
@@ -211,8 +204,6 @@ def train_denoise(components, config, logger=None):
     max_lr = opt_cfg['max_lr']
     pct_start = opt_cfg['pct_start']
 
-
-    
     print(f"\n--- Training: Denoiser ({mode.upper()}) ---")
     model = components[0]
     # 3. Build Manager
@@ -220,27 +211,17 @@ def train_denoise(components, config, logger=None):
     model_stride = model.patch_embedder.stride
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
     
-
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
     fused=True)
     scheduler = OneCycleLR(opt, max_lr=max_lr, total_steps=steps, pct_start=pct_start)
-    # FIX: Calculate cache size
-    caching_res = calculate_global_max_resolution(config)
-    
-    iterator = CompositeIterator(
-        model.text_embed.weight.device, 
-        config=config['dataset_mix'],
-        caching_resolution=caching_res # Pass it down
-    )
+
     history = []
     # Pre-fetch bucketing flag to avoid lookup in loop
     bucketing_enabled = config['training']['bucketing']['enabled']
-    # BF16 usually doesn't need a GradScaler, but FP16 does.
-    # We can use it conditionally.
     dtype = config['dtype']
     use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
-    # FIX: Use new torch.amp API
     scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
+    
     pbar = tqdm(range(steps), desc="train-ae")
     for i in pbar:
         opt.zero_grad()
@@ -266,7 +247,8 @@ def train_denoise(components, config, logger=None):
             
             for b in clean_blocks:
                 if b.type == 'latent':
-                    z, v, _ = euler_forward_step(b.content, b.logsnr)
+                    noise = torch.randn_like(b.content)
+                    z, v, _ = euler_forward_step(b.content, b.logsnr, noise)
                     # Pass source/id/metadata through to noisy block
                     noisy_blocks.append(ContextBlock(
                         content=z, logsnr=b.logsnr, type='latent', causal=b.causal,
@@ -278,77 +260,112 @@ def train_denoise(components, config, logger=None):
                 else:
                     noisy_blocks.append(b)
                     
-            # 3. Predict
-            v_preds, l_preds, aux = predict_velocity_from_blocks(components, noisy_blocks, mode)
+            # 3. Model Forward (Raw Decoded Output)
+            # we have text logits now so we are no longer using the get v from blocks wrapper
+            decoded_results, aux_loss = run_model_forward(components, noisy_blocks)
             
-            # 4. Loss & Harvest
+            # 4. Loss Calculation
             loss_v_accum = 0.0
             loss_lam_accum = 0.0
-            valid_samples = 0
+            loss_text_accum = 0.0
+            
+            valid_latent_samples = 0
+            valid_text_samples = 0
             step_stats = []
             
-            # Iterate over results to compute gradient AND harvest stats
-            for j, (block, vp, lp) in enumerate(zip(noisy_blocks, v_preds, l_preds)):
-                if vp is not None:
-                    # -- A. Velocity Loss (Exploded View) --
-                    # [C, H, W] -> [C, H, W]
-                    # Calculate elementwise squared error
-                    sq_err_v = F.mse_loss(vp,targets_v[valid_samples], reduction="none")
-                    
-                    # 1. For Gradient (Mean Reduction)
-                    loss_val = sq_err_v.mean()
-                    loss_v_accum += loss_val
-                    
-                    # 2. For Stats (Variance + Detached Mean)
-                    # We harvest the "shape" of the error distribution for this item
-                    stat_mse = loss_val.detach().item()
-                    stat_var = sq_err_v.var().detach().item()
-                    
-                    # -- B. Lambda Loss --
-                    loss_lam_val = F.l1_loss(lp, targets_l[valid_samples])
-                    loss_lam_accum += loss_lam_val
-                    
-                    # -- C. Metadata Extraction --
-                    # Calculate resolution area
-                    h_res = block.shape_meta[0] * block.shape_meta[1]
-                    # Mean LogSNR (Time proxy)
-                    h_lsnr = targets_l[valid_samples].mean().item()
-                    
-                    step_stats.append({
-                        'step': i,
-                        'source': getattr(block, 'source', 'unknown'),
-                        'resolution': h_res,
-                        'logsnr': h_lsnr,
-                        'loss': stat_mse,
-                        'loss_var': stat_var,
-                        'loss_lambda': loss_lam_val.detach().item()
-                    })
-                    
-                    valid_samples += 1
+            # We iterate through the aligned lists of Blocks and Results
+            latent_cursor = 0
             
-            if valid_samples > 0:
-                loss_v_accum /= valid_samples
-                loss_lam_accum /= valid_samples
+            for block, res in zip(noisy_blocks, decoded_results):
+                # --- A. Latent Diffusion Loss ---
+                if block.type == 'latent':
+                    if 'image_vpreds' in res:
+                        v_raw = res['image_vpreds']
+                        pred_l = res['image_logsnrs']
+                        
+                        # Factorization Logic (if enabled)
+                        if mode == 'factorized':
+                            sigma_p = torch.sqrt(torch.sigmoid(-pred_l))
+                            v_pred = v_raw * sigma_p
+                        else:
+                            v_pred = v_raw
+                            
+                        target_v = targets_v[latent_cursor]
+                        target_l = targets_l[latent_cursor]
+                        latent_cursor += 1
+                        
+                        # Velocity MSE
+                        sq_err_v = F.mse_loss(v_pred, target_v, reduction="none")
+                        loss_v_accum += sq_err_v.mean()
+                        
+                        # Lambda L1
+                        loss_lam_accum += F.l1_loss(pred_l, target_l)
+                        
+                        # Stats
+                        step_stats.append({
+                            'step': i,
+                            'source': getattr(block, 'source', 'unknown'),
+                            'type': 'latent',
+                            'loss': sq_err_v.mean().detach().item(),
+                            'loss_var': sq_err_v.var().detach().item(),
+                            'logsnr': target_l.mean().detach().item(),
+                            'resolution': block.content.shape[-1] * block.content.shape[-2]
+                        })
+                        valid_latent_samples += 1
+                
+                # --- B. Text Autoregressive Loss ---
+                elif block.type == 'text':
+                    if 'text_logits' in res:
+                        logits = res['text_logits'] # [L, Vocab]
+                        tokens = block.content      # [L]
+                        
+                        # Shift: Logit[t] predicts Token[t+1]
+                        # Input: A B C
+                        # Target: B C D (where D is from next block? For MVP we ignore cross-block prediction)
+                        
+                        shift_logits = logits[:-1, :].contiguous()
+                        shift_targets = tokens[1:].contiguous()
+                        
+                        if shift_targets.numel() > 0:
+                            loss_t = F.cross_entropy(shift_logits, shift_targets)
+                            loss_text_accum += loss_t
+                            
+                            step_stats.append({
+                                'step': i,
+                                'source': getattr(block, 'source', 'text'),
+                                'type': 'text',
+                                'loss': loss_t.detach().item(),
+                                'loss_var': 0.0 # Placeholder
+                            })
+                            valid_text_samples += 1
+
+            # Normalize Accumulators
+            if valid_latent_samples > 0:
+                loss_v_accum /= valid_latent_samples
+                loss_lam_accum /= valid_latent_samples
             
-            total_loss = loss_v_accum + lambda_coeff * loss_lam_accum + aux
-                # --- BACKWARD ---
+            if valid_text_samples > 0:
+                loss_text_accum /= valid_text_samples
+            
+            # Weighted Sum
+            total_loss = loss_v_accum + (lambda_coeff * loss_lam_accum) + loss_text_accum + aux_loss
+            
         if dtype == torch.float16:
             scaler.scale(total_loss).backward()
             scaler.step(opt)
             scaler.update()
             scheduler.step()
         else:
-            # BF16 or FP32: Standard backward
             total_loss.backward()
             opt.step()
             scheduler.step()
             
-        # Extend history with per-item stats (Rows = Batch Size * Steps)
         history.extend(step_stats)
         
-        if i % config['logging']['log_interval']== 0: 
-            # Log average of this batch for progress bar
-            avg_v = sum(s['loss'] for s in step_stats) / max(1, len(step_stats))
-            pbar.set_postfix({'v': f'{avg_v:.4f}'})
+        if i % config['logging']['log_interval'] == 0: 
+            pbar.set_postfix({
+                'v': f'{loss_v_accum:.3f}', 
+                'txt': f'{loss_text_accum:.3f}'
+            })
             
     return pd.DataFrame(history)

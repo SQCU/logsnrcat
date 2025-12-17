@@ -1,4 +1,5 @@
 # baseline config, we recommend these
+eval_configs = ["text_ar_sweep.toml"]
 
 [model]
 dim = 256
@@ -6,7 +7,7 @@ depth = 16
 num_heads = 8
 topo_dim = 3
 mlp_depth = 1
-vocab_size = 65536
+vocab_size = 151936 # it's qwen time
 global_layer_interval = 4
 num_experts = 8
 num_active = 3
@@ -38,7 +39,8 @@ enabled = true
 # These two define the "Computational Budget" per step.
 # Cost = (base_resolution / stride)^2 * base_batch_size
 base_resolution = 32
-base_batch_size = 128 #128 if using base_res 16
+base_batch_size = 64 #128 if using base_res 16
+caching_resolution = 128
 
 # --- Bucket 1: Low Res (32x32) ---
 # Auto-calculated Batch Size: ~128
@@ -78,7 +80,6 @@ num_samples = 8
 steps = 25
 target_logsnr = 10.0
 resolutions = [32, 64, 128]
-
 # --- Causal Sweep Configuration ---
 enable_sweep = true          # Turn this on/off
 sweep_count = 4              # Number of rows (different sequences)

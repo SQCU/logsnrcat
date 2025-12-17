@@ -1,4 +1,4 @@
-# src/data.py
+# src/data_iterator.py
 import torch
 import random
 from .model import ContextBlock
@@ -8,7 +8,7 @@ from .data_functional import (
     serialize_query
 )
 # Reuse existing noise functions
-from .data import get_logsnr_batch 
+from .data_functional import get_logsnr_batch 
 from typing import Tuple, List, Dict, Any, Optional, Union
 
 class FunctionalIterator:
@@ -63,7 +63,7 @@ class FunctionalIterator:
         return blocks
 
 class CompositeIterator:
-    def __init__(self, device, config: Dict[str, Any]):
+    def __init__(self, device, config: Dict[str, Any], **kwargs):
         self.device = device
         self.splits = []
         
@@ -88,7 +88,7 @@ class CompositeIterator:
                 # We will skip implementation for brevity unless requested, 
                 # but the Composite structure supports it.
                 from .data import VideoFolderIterator
-                iterator = VideoFolderIterator(params['path'], device=device)
+                iterator = VideoFolderIterator(params['path'], device=device, caching_resolution=kwargs['caching_resolution'])
             
             if iterator:
                 self.splits.append({
@@ -97,6 +97,7 @@ class CompositeIterator:
                     'ratio': ratio,
                     'type': sType,          # <--- Stored for dispatch
                     'params': params,       # <--- Stored for config lookup
+                    'noise_mode': split_cfg.get('noise_mode', 'uniform'),
                     'noise_params': split_cfg.get('noise_params', {})
                 })
         
@@ -142,6 +143,16 @@ class CompositeIterator:
             else:
                 # Functional iterators handle kwargs (resolution, etc.) directly
                 blocks = split['iterator'].generate_batch_list(count, start_group_id=global_gid, **kwargs)
+
+                # Assign LogSNR for functional latents (generated clean)
+                latents = [b for b in blocks if b.type == 'latent']
+                if latents:
+                    H, W = latents[0].content.shape[-2:]
+                    lsnrs = get_logsnr_batch(
+                        split['noise_mode'], len(latents), H, W, self.device, split['noise_params']
+                    )
+                    for b, l in zip(latents, lsnrs):
+                        b.logsnr = l
             
             for b in blocks: b.source = split['name']
             

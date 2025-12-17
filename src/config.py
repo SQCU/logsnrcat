@@ -29,7 +29,7 @@ class ModelConfig(BaseModel):
     num_heads: int = 8
     topo_dim: int = 3
     mlp_depth: int = 1
-    vocab_size: int = 151646 #qwen 3 sized
+    vocab_size: int = 151936 #qwen 3 sized
     global_layer_interval: int = 4
     num_experts: int = 8
     num_active: int = 3
@@ -130,6 +130,7 @@ class BucketingConfig(BaseModel):
     enabled: bool = False
     base_resolution: int = 32
     base_batch_size: int = 128
+    caching_resolution: int = 128
     image_buckets: List[ResolutionBucketConfig] = Field(default_factory=list)
     video_buckets: List[VideoBucketConfig] = Field(default_factory=list)
 
@@ -157,7 +158,6 @@ class SamplingConfig(BaseModel):
     steps: int = 50
     target_logsnr: float = 10.0
     resolutions: List[int] = Field(default_factory=lambda: [32, 64])
-
     # New Causal Sweep fields
     enable_sweep: bool = False
     sweep_count: int = 4
@@ -187,8 +187,13 @@ class ExperimentConfig(BaseModel):
     sampling: SamplingConfig = Field(default_factory=SamplingConfig)
     page_table: PageTableConfig = Field(default_factory=PageTableConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    # soon deprecating~!
     dataset_mix: Dict[str, DatasetSplit] = Field(default_factory=dict)
     
+    # Modular Config Paths
+    dataset_configs: List[str] = Field(default_factory=list)
+    eval_configs: List[str] = Field(default_factory=list)
+
     @model_validator(mode="after")
     def validate_model(self):
         if self.model.dim % self.model.num_heads != 0:
@@ -224,18 +229,69 @@ def sanitize_config(cfg: Union[ExperimentConfig, Dict[str, Any]]) -> Dict[str, A
     else:
         raise TypeError(f"Config must be Pydantic Model or Dict, got {type(cfg)}")
 
+def load_data_config(path: str | Path) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        return tomli.load(f)
+
+def load_eval_config(path: str | Path) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        return tomli.load(f)
+
 def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     """
-    Loads TOML and immediately sanitizes it to a Dict.
-    Downstream code should never see an ExperimentConfig object.
+    Loads TOML, processes modular includes, and sanitizes to Dict.
     """
     if path is None:
-        raw_cfg = ExperimentConfig()
+        base_data = {}
+        root_dir = Path(".")
     else:
-        raw_cfg = ExperimentConfig.from_toml(path)
+        p = Path(path)
+        root_dir = p.parent
+        with open(p, "rb") as f:
+            base_data = tomli.load(f)
     
-    return sanitize_config(raw_cfg)
+    # 1. Merge Modular Dataset Configs
+    ds_files = base_data.get('dataset_configs', [])
+    if ds_files:
+        if 'dataset_mix' not in base_data:
+            base_data['dataset_mix'] = {}
+            
+        for ds_path in ds_files:
+            p = Path(ds_path)
+            if not p.is_absolute():
+                p = root_dir / p
+            
+            if p.exists():
+                ds_data = load_data_config(p)
+                # Merge logic: If 'dataset_mix' is at root, use it; otherwise assume keys are splits
+                to_merge = ds_data.get('dataset_mix', ds_data)
+                base_data['dataset_mix'].update(to_merge)
+            else:
+                print(f"⚠️ Warning: Dataset config not found: {p}")
 
+    # 2. Merge Modular Eval Configs
+    eval_files = base_data.get('eval_configs', [])
+    if eval_files:
+        # Ensure path exists structure
+        if 'sampling' not in base_data: base_data['sampling'] = {}
+        if 'queries' not in base_data['sampling']: base_data['sampling']['queries'] = []
+            
+        for eval_path in eval_files:
+            p = Path(eval_path)
+            if not p.is_absolute():
+                p = root_dir / p
+                
+            if p.exists():
+                eval_data = load_eval_config(p)
+                queries = eval_data.get('queries', [])
+                if queries:
+                    base_data['sampling']['queries'].extend(queries)
+            else:
+                print(f"⚠️ Warning: Eval config not found: {p}")
+    
+    # 3. Validate and Sanitize
+    raw_cfg = ExperimentConfig(**base_data)
+    return sanitize_config(raw_cfg)
 
 if __name__ == "__main__":
     import json

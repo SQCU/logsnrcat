@@ -205,44 +205,78 @@ def plot_losses(df_naive, df_fact, logger, metric="loss_total", title="Training 
     logger.save_figure(fig, f"plot_{metric}")
 
 
+
 def plot_multimetric_analysis(df, logger, stringy="multimetric_analysis"):
     if df.empty: return
-    df["snr_bin"] = pd.cut(df["logsnr"], bins=20)
+    
+    # Ensure logsnr is present (text blocks might not have it, fill with nan)
+    if "logsnr" not in df.columns: df["logsnr"] = np.nan
+    
+    # Binning for Latent SNR analysis
+    # Filter for latents only for SNR plots
+    df_latent = df[df["type"] == "latent"].copy()
+    if not df_latent.empty:
+        df_latent["snr_bin"] = pd.cut(df_latent["logsnr"], bins=20, duplicates='drop')
+    
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    snr_grouped = df.groupby("snr_bin", observed=True)["loss"].mean()
-    snr_x = [i.mid for i in snr_grouped.index]
-    axes[0,0].plot(snr_x, snr_grouped.values, marker="o", linewidth=2)
-    axes[0,0].set_title("d_loss / d_logsnr")
-    axes[0,0].set_xlabel("LogSNR")
-    axes[0,0].set_ylabel("MSE Loss")
-    axes[0,0].grid(True, alpha=0.3)
-    axes[0,0].invert_xaxis()
-    if "resolution" in df.columns:
-        res_stats = df.groupby("resolution")["loss"].agg(["mean", "std"])
+    
+    # 1. d_loss / d_logsnr (Latent Only)
+    if not df_latent.empty:
+        snr_grouped = df_latent.groupby("snr_bin", observed=True)["loss"].mean()
+        snr_x = [i.mid for i in snr_grouped.index]
+        axes[0,0].plot(snr_x, snr_grouped.values, marker="o", linewidth=2)
+        axes[0,0].set_title("d_loss / d_logsnr (Latent)")
+        axes[0,0].set_xlabel("LogSNR")
+        axes[0,0].set_ylabel("MSE Loss")
+        axes[0,0].invert_xaxis()
+        axes[0,0].grid(True, alpha=0.3)
+    
+    # 2. d_loss / d_resolution (Latent Only, if resolution present)
+    if "resolution" in df.columns and not df_latent.empty:
+        res_stats = df_latent.groupby("resolution")["loss"].agg(["mean", "std"])
         axes[0,1].errorbar(res_stats.index, res_stats["mean"], yerr=res_stats["std"], fmt="-o", capsize=5)
         axes[0,1].set_title("d_loss / d_resolution")
         axes[0,1].set_xlabel("Tokens")
         axes[0,1].set_xscale("log")
         axes[0,1].grid(True, alpha=0.3)
-    for source, grp in df.groupby("source"):
+        
+    # 3. d_loss / d_source (Split by Type)
+    # Group by (Source, Type) to distinguish Latent vs Text curves
+    if "type" in df.columns:
+        groups = df.groupby(["source", "type"])
+    else:
+        groups = df.groupby("source")
+        
+    for name, grp in groups:
+        # name is tuple (source, type) or string source
+        if isinstance(name, tuple):
+            label = f"{name[0]} ({name[1]})"
+            style = '--' if name[1] == 'text' else '-'
+        else:
+            label = name
+            style = '-'
+            
         step_avg = grp.groupby("step")["loss"].mean()
         smooth = step_avg.rolling(window=50, min_periods=1).mean()
-        axes[1,0].plot(smooth.index, smooth.values, label=source)
+        axes[1,0].plot(smooth.index, smooth.values, label=label, linestyle=style)
+        
     axes[1,0].legend()
-    axes[1,0].set_title("d_loss / d_source")
+    axes[1,0].set_title("Training Loss Curves")
     axes[1,0].set_xlabel("Step")
     axes[1,0].set_yscale("log")
     axes[1,0].grid(True, alpha=0.3)
-    var_grouped = df.groupby("snr_bin", observed=True)["loss_var"].mean()
-    axes[1,1].plot([i.mid for i in var_grouped.index], var_grouped.values, color="orange", marker="s")
-    axes[1,1].set_title("Variance / d_logsnr")
-    axes[1,1].set_xlabel("LogSNR")
-    axes[1,1].invert_xaxis()
-    axes[1,1].grid(True, alpha=0.3)
+    
+    # 4. Variance / d_logsnr (Latent Only)
+    if not df_latent.empty and "loss_var" in df_latent.columns:
+        var_grouped = df_latent.groupby("snr_bin", observed=True)["loss_var"].mean()
+        axes[1,1].plot([i.mid for i in var_grouped.index], var_grouped.values, color="orange", marker="s")
+        axes[1,1].set_title("Variance / d_logsnr")
+        axes[1,1].set_xlabel("LogSNR")
+        axes[1,1].invert_xaxis()
+        axes[1,1].grid(True, alpha=0.3)
+        
     plt.tight_layout()
     logger.save_figure(fig, stringy)
-
-
 
 def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False):
     # Expect lists of tensors, potentially of mixed resolution
@@ -290,3 +324,68 @@ def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_ma
             
     plt.tight_layout()
     logger.save_figure(fig, name)
+
+def plot_causal_sweep(sequences_gt, sequences_pred, snr_values, output_path):
+    """
+    Visualizes Causal Sweep.
+    Row 2i: Sequence frames (Context[Noisy] -> Target[Denoised])
+    Row 2i+1: False color MSE (Diff between Output and GT)
+    """
+    N_seq = len(sequences_gt)
+    if N_seq == 0: return
+    M_len = len(sequences_gt[0])
+    
+    # 2 rows per sequence (Image, Error)
+    fig, axes = plt.subplots(N_seq * 2, M_len, figsize=(2 * M_len, 4 * N_seq))
+    if N_seq == 1 and M_len == 1: axes = np.array([[axes]])
+    # Reshape strictly to [2*N, M]
+    axes = axes.reshape(2 * N_seq, M_len)
+    
+    plt.subplots_adjust(hspace=0.1, wspace=0.1)
+
+    for i in range(N_seq):
+        snr = snr_values[i]
+        
+        row_img = i * 2
+        row_err = i * 2 + 1
+        
+        for t in range(M_len):
+            # 1. Get Data
+            # GT Block
+            gt_block = sequences_gt[i][t]
+            gt_tensor = gt_block.content
+            
+            # Pred Tensor (Raw from sampler)
+            pred_tensor = sequences_pred[i][t]
+            
+            # 2. Plot Image
+            ax_img = axes[row_img, t]
+            img_np = pred_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
+            ax_img.imshow(img_np)
+            ax_img.axis('off')
+            
+            # Labels
+            if i == 0 and t == 0:
+                ax_img.set_title(f"Ctx (Noisy)", fontsize=10)
+            elif i == 0 and t == M_len - 1:
+                ax_img.set_title(f"Gen (Clean)", fontsize=10)
+                
+            if t == 0:
+                ax_img.text(-0.2, 0.5, f"SNR {snr:.1f}", transform=ax_img.transAxes, 
+                            va='center', ha='right', fontsize=9, rotation=90)
+
+            # 3. Plot Error
+            ax_err = axes[row_err, t]
+            
+            # Calculate MSE Map
+            gt_np = gt_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
+            diff = (img_np - gt_np) ** 2
+            mse_map = diff.mean(axis=2) # Average over channels
+            
+            # Use fixed scale to make noise visible vs clean
+            im_err = ax_err.imshow(mse_map, cmap='inferno', vmin=0, vmax=0.1)
+            ax_err.axis('off')
+            
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)

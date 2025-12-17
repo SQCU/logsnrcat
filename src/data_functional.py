@@ -5,8 +5,72 @@ import math
 import json
 import random
 
+def generate_split_logsnr(B, H, W, device, min_snr=-4.0, max_snr=1.0, angle_range_deg=30.0, jitter_pct=0.05):
+    """
+    Generates a batch of logSNR maps with a randomized split-screen topology.
+    Equation: x*cos(theta) + y*sin(theta) > offset
+    """
+    # 1. Randomized Hyperplanes
+    angle_rad = angle_range_deg * math.pi / 180.0
+    theta = (torch.rand(B, device=device) * 2 - 1) * angle_rad 
+    
+    # Offset: +/- jitter_pct of min dimension
+    offset_scale = jitter_pct * min(H, W)
+    offset = (torch.rand(B, device=device) * 2 - 1) * offset_scale
+    
+    # Create coordinate grid [B, H, W]
+    y_grid, x_grid = torch.meshgrid(
+        torch.arange(H, device=device), 
+        torch.arange(W, device=device), 
+        indexing='ij'
+    )
+    # Center coordinates
+    y_c = y_grid - H / 2.0
+    x_c = x_grid - W / 2.0
+    
+    # Broadcast params to [B, H, W]
+    theta = theta.view(B, 1, 1)
+    offset = offset.view(B, 1, 1)
+    
+    # 2. Generate Masks
+    projection = x_c * torch.cos(theta) + y_c * torch.sin(theta)
+    mask_high = (projection > offset).float().unsqueeze(1) # [B, 1, H, W]
+    
+    # 3. Sample Noise Levels
+    # Side A: Standard training range (Noisy Side)
+    snr_low = torch.rand(B, device=device) * (max_snr - min_snr) + min_snr
+    
+    # Side B: Halfway between Side A and Max (Clean-ish Side)
+    snr_high_target = max_snr 
+    snr_high = snr_low + 0.5 * (snr_high_target - snr_low)
+    
+    # Expand to maps
+    snr_low_map = snr_low.view(B, 1, 1, 1).expand(B, 1, H, W)
+    snr_high_map = snr_high.view(B, 1, 1, 1).expand(B, 1, H, W)
+    
+    # 4. Composite
+    logsnr_map = mask_high * snr_high_map + (1.0 - mask_high) * snr_low_map
+    
+    return logsnr_map
+
+def generate_uniform_logsnr(B, H, W, device, min_snr=-4.0, max_snr=1.0):
+    """
+    Standard scalar noise level broadcast to spatial map.
+    """
+    snr = torch.rand(B, device=device) * (max_snr - min_snr) + min_snr
+    return snr.view(B, 1, 1, 1).expand(B, 1, H, W)
+
+def get_logsnr_batch(mode, B, H, W, device, params):
+    """Dispatcher for noise topology."""
+    if mode == "split":
+        return generate_split_logsnr(B, H, W, device, **params)
+    else:
+        # Filter to only params that uniform accepts
+        uniform_params = {k: v for k, v in params.items() if k in ("min_snr", "max_snr")}
+        return generate_uniform_logsnr(B, H, W, device, **uniform_params)
+
 # ==============================================================================
-# 1. Parameter Generation (Query Logic)
+#  Parameter Generation (Query Logic)
 # ==============================================================================
 
 def generate_checkerboard_query(seed: int, config: dict) -> dict:
@@ -97,7 +161,7 @@ def render_torus(query: dict, resolution: int, device: torch.device) -> torch.Te
 
     # 2. Camera Rays
     cx, cy, cz = dist * math.cos(yaw), dist * math.sin(pitch), dist * math.sin(yaw)
-    origin = torch.tensor([cx, cy, cz], device=device).view(1, 1, 3)
+    origin = torch.tensor([cx, cy, cz], device=device).view(1, 3) # Fix: View as [1, 3] for linear expansion
     target = torch.zeros(1, 1, 3, device=device) # Look at center
     
     # Basis
@@ -191,8 +255,19 @@ class TokenizerWrapper:
             # Return Long Tensor
             return torch.tensor(self.tok.encode(text), dtype=torch.long)
         else:
-            # Fallback: Ordinal mapping, shifted to avoid 0/1/2 specials if needed
+            # Fallback: Ordinal mapping
             return torch.tensor([ord(c) for c in text], dtype=torch.long)
+
+    def decode(self, tokens: torch.Tensor) -> str:
+        # Handle Tensor or List
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.tolist()
+            
+        if self.mode == "qwen":
+            return self.tok.decode(tokens)
+        else:
+            # Fallback: ASCII filtering
+            return "".join([chr(c) for c in tokens if 32 <= c <= 126])
 
 # Global singleton (lazy init)
 _TOKENIZER = None
