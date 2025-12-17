@@ -488,7 +488,7 @@ def execute_multiturn_session(
             span_cfg = query['new_span_config']
             init_content = span_cfg['initial_content']
             if not isinstance(init_content, torch.Tensor):
-                init_content = torch.tensor(init_content, dtype=init_content, device=device)
+                init_content = torch.tensor(init_content, dtype=torch.long, device=device)
             else:
                 init_content = init_content.to(device)
             
