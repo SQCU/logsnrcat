@@ -163,6 +163,9 @@ class SamplingConfig(BaseModel):
     sweep_count: int = 4
     sweep_length: int = 4
     sweep_range: Tuple[float, float] = (2.0, -4.0)
+    # Custom eval queries (loaded from eval_configs)
+    queries: List[Dict[str, Any]] = Field(default_factory=list)
+ 
 
 class PageTableConfig(BaseModel):
     num_blocks: int = 1024

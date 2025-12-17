@@ -173,48 +173,48 @@ def main():
                     s_dict['mode'] = cfg['training']['mode']
                     s_dict['res'] = res # Config injection for iterator
                     sampler.sample_viz_causal_sweep(components, val_iterator, s_dict, logger)
-                
-            # 3. Custom Queries (Text / Mixed)
-        if samp_cfg.get('queries'):
-            print(f"Running {len(samp_cfg['queries'])} custom eval sessions...")
- 
-            # Seed Context: Use FIRST split explicitly (avoids mixed resolution/type issues)
-            # For text generation, we want consistent context from a single source
-            split_names = val_iterator.get_split_names()
-            if not split_names:
-                print("    No splits available for seed context, skipping queries")
-            else:
-                # Prefer a functional split (checkerboard/torus) for consistent text+latent pairs
-                # Fall back to first available split
-                seed_split = split_names[0]
-                for name in split_names:
-                    if 'checker' in name or 'torus' in name:
-                        seed_split = name
-                        break
- 
-                print(f"    Seeding context from split: {seed_split}")
-                try:
-                    seed_batch = val_iterator.generate_from_split(seed_split, count=4, resolution=32)
-                    seed_ctx = sampler.MultiTurnContext(seed_batch)
- 
-                    # Execute
-                    results = sampler.execute_multiturn_session(components, seed_ctx, samp_cfg['queries'])
- 
-                    # Text Decoding & Logging
-                    print("\n--- Eval Session Outputs ---")
-                    for i, b in enumerate(results):
-                        if b.type == 'text':
-                            try:
-                                text = tokenizer.decode(b.content)
-                                log_msg = f"Block {i} (Text): {text[:200]}... (Len: {len(b.content)})"
-                                print(log_msg)
-                                logger.log_text("eval_outputs.txt", log_msg)
-                            except Exception as e:
-                                print(f"Failed to decode text block {i}: {e}")
-                        elif b.type == 'latent':
-                            print(f"Block {i} (Latent): shape={b.content.shape}")
-                except Exception as e:
-                    print(f"    Error running queries: {e}")
+                    
+                # 3. Custom Queries (Text / Mixed)
+            if samp_cfg.get('queries'):
+                print(f"Running {len(samp_cfg['queries'])} custom eval sessions...")
+    
+                # Seed Context: Use FIRST split explicitly (avoids mixed resolution/type issues)
+                # For text generation, we want consistent context from a single source
+                split_names = val_iterator.get_split_names()
+                if not split_names:
+                    print("    No splits available for seed context, skipping queries")
+                else:
+                    # Prefer a functional split (checkerboard/torus) for consistent text+latent pairs
+                    # Fall back to first available split
+                    seed_split = split_names[0]
+                    for name in split_names:
+                        if 'checker' in name or 'torus' in name:
+                            seed_split = name
+                            break
+    
+                    print(f"    Seeding context from split: {seed_split}")
+                    try:
+                        seed_batch = val_iterator.generate_from_split(seed_split, count=4, resolution=32)
+                        seed_ctx = sampler.MultiTurnContext(seed_batch)
+    
+                        # Execute
+                        results = sampler.execute_multiturn_session(components, seed_ctx, samp_cfg['queries'])
+    
+                        # Text Decoding & Logging
+                        print("\n--- Eval Session Outputs ---")
+                        for i, b in enumerate(results):
+                            if b.type == 'text':
+                                try:
+                                    text = tokenizer.decode(b.content)
+                                    log_msg = f"Block {i} (Text): {text[:200]}... (Len: {len(b.content)})"
+                                    print(log_msg)
+                                    logger.log_text("eval_outputs.txt", log_msg)
+                                except Exception as e:
+                                    print(f"Failed to decode text block {i}: {e}")
+                            elif b.type == 'latent':
+                                print(f"Block {i} (Latent): shape={b.content.shape}")
+                    except Exception as e:
+                        print(f"    Error running queries: {e}")
 
     print(f"\nDone! Results in {logger.run_dir}")
 

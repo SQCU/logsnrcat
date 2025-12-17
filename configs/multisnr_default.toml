@@ -86,6 +86,7 @@ sweep_count = 4              # Number of rows (different sequences)
 sweep_length = 4             # Number of frames (3 context + 1 generated)
 sweep_range = [5.0, 1.0]    # LogSNR range for the Prefix (Clean -> Noisy)
 
+
 [page_table]
 num_blocks = 1024
 block_size = 128
