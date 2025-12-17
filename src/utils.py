@@ -164,6 +164,7 @@ class KVTManager:
         self.req_tables: Dict[int, List[int]] = {}   # req_id -> block_table
         self.req_lengths: Dict[int, int] = {}        # req_id -> total_length
         self.req_highway_offset: Dict[int, int] = {} # req_id -> last highway val
+        self.req_content_hashes: Dict[int, List[int]] = {}  # req_id -> content hash stream
         
     def allocate_and_write_sequence(
         self,
@@ -177,14 +178,15 @@ class KVTManager:
         - Spatial dims are per-span coordinates (only non-zero for images)
         """
         block_table, fresh_blocks = self.block_manager.allocate(content_hashes)
-        
+
         # Write topology WITH GLOBAL COORDINATES
         self._write_topology_to_blocks(block_table, topo_data)
-        
+
         self.req_tables[req_id] = block_table
         self.req_lengths[req_id] = len(content_hashes)
         self.req_highway_offset[req_id] = topo_data[-1, 0].item()  # Last highway value
-        
+        self.req_content_hashes[req_id] = list(content_hashes)  # Store for extend_sequence
+
         return block_table, fresh_blocks
 
     def extend_sequence(
@@ -211,11 +213,12 @@ class KVTManager:
         # (old tokens already have their topology written)
         new_block_ids = new_table[len(old_table):]
         self._write_topology_to_blocks(new_block_ids, new_topo_data)
-        
+
         # Update tracking
         self.req_tables[req_id] = new_table
         self.req_lengths[req_id] = old_length + len(new_content_hashes)
         self.req_highway_offset[req_id] = new_topo_data[-1, 0].item()
+        self.req_content_hashes[req_id] = full_hashes  # Update stored hashes
 
     def _write_topology_to_blocks(self, block_ids: List[int], topo_data: torch.Tensor):
         """Internal: Writes topology data into physical blocks."""
@@ -242,6 +245,15 @@ class KVTManager:
         """Decrements ref counts and recycles blocks."""
         self.block_manager.free(block_table)
     
+    def get_cached_hashes(self, req_id: int) -> List[int]:
+        """
+        Returns the content hash stream for an existing request.
+        Used by extend_sequence to maintain prefix-cache compatibility.
+        """
+        if req_id not in self.req_content_hashes:
+            raise KeyError(f"Request {req_id} has no cached content hashes. Was it allocated?")
+        return list(self.req_content_hashes[req_id])  # Return copy to prevent mutation
+
     def free_request(self, req_id: int):
         """
         Completely frees a request and cleans up all metadata.
@@ -250,15 +262,17 @@ class KVTManager:
         if req_id not in self.req_tables:
             # Already freed or never allocated
             return
-        
+
         # Free the blocks
         block_table = self.req_tables[req_id]
         self.block_manager.free(block_table)
-        
+
         # Clean up metadata
         del self.req_tables[req_id]
         del self.req_lengths[req_id]
         del self.req_highway_offset[req_id]
+        if req_id in self.req_content_hashes:
+            del self.req_content_hashes[req_id]
     
     def get_attention_inputs(
         self,
