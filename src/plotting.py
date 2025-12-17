@@ -106,9 +106,10 @@ def run_pipeline_analysis(blocks, device):
     
     # 2. Embed Spans (Raw Data -> Z, Metadata)
     z_flat, span_objects, _ = span_emb.embed(blocks)
-    
-    # 3. Render Topology (Metadata -> Coords)
-    topo_embeds, doc_ids = render_topology_embeddings(span_objects, max_dims=3, device=device)
+
+    # 3. Render Topology (Metadata -> Coords) - dtype from model
+    dtype = model.text_embed.weight.dtype
+    topo_embeds, doc_ids = render_topology_embeddings(span_objects, max_dims=3, device=device, dtype=dtype)
     
     # 4. Setup PageTable Mocks for build_dual_masks
     # The mask builder requires these structures to resolve physical addresses, 

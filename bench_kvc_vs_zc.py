@@ -134,6 +134,7 @@ def run_zc_forward(
     Returns: (z_out, decoded_outputs, aux_loss)
     """
     device = model.text_embed.weight.device
+    dtype = model.text_embed.weight.dtype  # Infer dtype from model
 
     context_manager = torch.enable_grad() if with_grad else torch.no_grad()
 
@@ -141,8 +142,8 @@ def run_zc_forward(
         # 1. Embed
         z_flat, span_objects, _ = span_emb.embed(blocks)
 
-        # 2. Topology
-        topo_embeds, _ = render_topology_embeddings(span_objects, 3, device)
+        # 2. Topology (dtype from model)
+        topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
 
         # 3. Masking
         L_total = z_flat.shape[0]
@@ -190,13 +191,14 @@ def run_kvc_forward(
     Returns: (z_out, decoded_outputs, aux_loss)
     """
     device = model.text_embed.weight.device
+    dtype = model.text_embed.weight.dtype  # Infer dtype from model
 
     with torch.no_grad():
         # 1. Embed
         z_flat, span_objects, content_hashes = span_emb.embed(blocks)
 
-        # 2. Topology
-        topo_embeds, _ = render_topology_embeddings(span_objects, 3, device)
+        # 2. Topology (dtype from model)
+        topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
 
         # 3. Allocate in KVT Manager
         kvt_manager.allocate_and_write_sequence(req_id, content_hashes, topo_embeds)
