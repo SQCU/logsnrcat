@@ -346,7 +346,8 @@ class TorusIterator:
                 content=images[i],
                 type='latent',
                 causal=True,
-                group_id=i, # Independent
+                shape_meta=(resolution, resolution),  # Explicit: (H, W)
+                group_id=i,
                 id=f"torus_{i}"
             ))
         return blocks
@@ -381,7 +382,8 @@ class CheckerboardIterator:
                 content=imgs[i],
                 type='latent',
                 causal=True,
-                group_id=i, # Independent
+                shape_meta=(resolution, resolution),  # Explicit: (H, W)
+                group_id=i,
                 id=f"checker_{i}"
             ))
         return blocks
@@ -618,8 +620,13 @@ class VideoFolderIterator:
                 lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
                 
                 seq_blocks.append(ContextBlock(
-                    content=frame, type='latent', causal=True, logsnr=lsnr,
-                    group_id=batch_raw.group_id, id=f"vid_{batch_raw.group_id}_{t}"
+                    content=frame,
+                    type='latent',
+                    causal=True,
+                    shape_meta=(target_res, target_res),  # Explicit: (H, W) for broadcast
+                    logsnr=lsnr,
+                    group_id=batch_raw.group_id,
+                    id=f"vid_{batch_raw.group_id}_{t}"
                 ))
             
             out_blocks.extend(seq_blocks)
@@ -706,7 +713,7 @@ class CompositeIterator:
             if gen_type == 'video':
                 # strict access assumes sequence_structure is set in config if type is video
                 # We can keep a .get here if the default is logic-dependent, or enforce in schema
-                seq_conf = d_params.get('sequence_structure', [{'res': 32}])
+                seq_conf = d_params['sequence_structure']
                 
                 # Check for resolution overrides (from Bucketing)
                 resolution = kwargs.get('resolution')

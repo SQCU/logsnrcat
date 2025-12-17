@@ -383,12 +383,6 @@ SAMPLER_REGISTRY = {
     "discrete_logit": discrete_logit_sampling
 }
 
-
-SAMPLER_REGISTRY = {
-    "taufield_euler": taufield_spatial_sampling,
-    "discrete_logit": discrete_logit_sampling
-}
-
 # Default configuration acting as documentation and fallback
 multiturn_session_default_config = {
     # Latent Diffusion Defaults
@@ -623,116 +617,205 @@ def sample_viz_dset(components, iterator, config_dict, logger):
 def sample_viz_causal_sweep(components, iterator, config, logger):
     """
     Demonstrates Autoregressive Latent Generation (Append Logic).
-    Iterates through a range of SNRs, using them to set the noise level of the 
-    prefix context and the starting point of the appended generation.
+ 
+    Iterates over EACH dataset split separately, generating homogeneous sequences.
+    For each split, sweeps through SNR values to show denoising quality vs noise level.
+ 
+    This is eval code: we measure "given N-1 context frames, can we predict frame N?"
+    Works for video (temporal induction) AND functional datasets (pattern induction).
     """
-    # 1. Config & Data Fetch
-    n_sweeps = config.get('sweep_count', 4)
-    seq_len = config.get('sweep_length', 4)
-    snr_start, snr_end = config.get('sweep_range', (2.0, -4.0))
-    res_arg = config.get('res', 32)
-    
-    # Generate batch: N sequences * L length
-    # We use these as (L-1) Context + (1) GT Target
-    total_items = n_sweeps * seq_len
-    flat_blocks = iterator.generate_batch_list(total_items, resolution=res_arg)
-    
-    if not flat_blocks: return
-
-    # Group into sequences [N, L]
-    sequences = []
-    for i in range(0, len(flat_blocks), seq_len):
-        chunk = flat_blocks[i : i+seq_len]
-        if len(chunk) == seq_len:
-            sequences.append(chunk)
-            
-    # Calculate Sweep SNRs
-    if len(sequences) > 1:
+    # === Config (REQUIRED - no defaults that hide misconfiguration) ===
+    n_sweeps = config['sweep_count']
+    seq_len = config['sweep_length']
+    snr_start, snr_end = config['sweep_range']
+    res_arg = config['res']
+    steps = config.get('steps', 50)
+ 
+    # Get available splits from the iterator
+    split_names = iterator.get_split_names()
+ 
+    from .plotting import plot_causal_sweep_v2
+ 
+    # === Process each split independently ===
+    for split_name in split_names:
+        print(f"  Causal sweep: {split_name} @ {res_arg}px")
+ 
+        # --- 1. Generate homogeneous data from this split ---
+        # Request enough sequences: n_sweeps sequences, each seq_len items
+        # For functional iterators: each "item" may be (text, latent) pair
+        # For video: each "item" is one frame
+        try:
+            all_blocks = iterator.generate_from_split(
+                split_name,
+                count=n_sweeps * seq_len,
+                resolution=res_arg
+            )
+        except KeyError as e:
+            print(f"    Skipping {split_name}: {e}")
+            continue
+        except Exception as e:
+            print(f"    Error generating from {split_name}: {e}")
+            continue
+ 
+        if not all_blocks:
+            print(f"    Skipping {split_name}: no blocks generated")
+            continue
+ 
+        # --- 2. Group into sequences ---
+        # Two modes:
+        # - Video splits: group by group_id (natural sequences)
+        # - Functional splits: compose synthetic sequences from independent samples
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for b in all_blocks:
+            groups[b.group_id].append(b)
+ 
+        # Check if this split produces multi-latent sequences naturally
+        # If any group has >=2 latents, use group_id-based sequencing
+        has_natural_sequences = any(
+            len([b for b in seq if b.type == 'latent']) >= 2
+            for seq in groups.values()
+        )
+ 
+        sequences = []
+        if has_natural_sequences:
+            # Video-style: use group_id as sequence boundary
+            for gid in sorted(groups.keys()):
+                seq = groups[gid]
+                latents_in_seq = [b for b in seq if b.type == 'latent']
+                if len(latents_in_seq) >= 2:
+                    sequences.append({
+                        'all_blocks': seq,
+                        'latents': latents_in_seq,
+                        'group_id': gid
+                    })
+        else:
+            # Functional-style: compose synthetic sequences from independent samples
+            # Each group typically has [text, latent] or just [latent]
+            # We compose seq_len groups into one synthetic sequence
+            all_latents = [b for b in all_blocks if b.type == 'latent']
+            all_texts = [b for b in all_blocks if b.type == 'text']
+ 
+            # Create synthetic sequences of seq_len latents each
+            # Pair each latent with its text if available (same group_id)
+            latent_to_text = {}
+            for t in all_texts:
+                latent_to_text[t.group_id] = t
+ 
+            for i in range(0, len(all_latents) - seq_len + 1, seq_len):
+                chunk_latents = all_latents[i:i + seq_len]
+                if len(chunk_latents) < seq_len:
+                    break
+ 
+                # Build synthetic sequence with text prefixes
+                synthetic_blocks = []
+                for lat in chunk_latents:
+                    if lat.group_id in latent_to_text:
+                        synthetic_blocks.append(latent_to_text[lat.group_id])
+                    synthetic_blocks.append(lat)
+ 
+                sequences.append({
+                    'all_blocks': synthetic_blocks,
+                    'latents': chunk_latents,
+                    'group_id': f"synthetic_{i}"
+                })
+ 
+        if len(sequences) < n_sweeps:
+            print(f"    Note: {split_name} produced {len(sequences)} sequences (config wants {n_sweeps})")
+ 
+        sequences = sequences[:n_sweeps]  # Trim to requested count
+        if not sequences:
+            continue
+ 
+        # --- 3. Calculate sweep SNRs ---
         sweep_snrs = torch.linspace(snr_start, snr_end, len(sequences))
-    else:
-        sweep_snrs = torch.tensor([snr_start])
-
-    all_predictions = []
-    all_gt_sequences = []
-
-    # 2. Iterate Sweeps
-    for i, full_seq in enumerate(sequences):
-        current_snr = sweep_snrs[i].item()
-        
-        # Split: Prefix (0..L-2) vs Target (L-1)
-        # We simulate "generating the next frame" given the prefix.
-        prefix_blocks = full_seq[:-1]
-        gt_target = full_seq[-1]
-        
-        # Keep GT for plotting (Clone to preserve vs mutations)
-        # We want the full sequence GT [0..L-1]
-        gt_seq_clone = [
-            ContextBlock(
-                content=b.content.clone() if isinstance(b.content, torch.Tensor) else b.content,
-                type=b.type,
-                causal=b.causal,
-                shape_meta=b.shape_meta,
-                logsnr=b.logsnr,
-                group_id=b.group_id,
-                id=b.id,
-                source=b.source
-            ) for b in full_seq
-        ]
-        all_gt_sequences.append(gt_seq_clone)
-
-        # 3. Setup Context (Prefix)
-        # We manually inject noise into the prefix to match 'current_snr'
-        # This simulates a context that isn't perfectly clean, or just sets the conditioning environment.
-        ctx = MultiTurnContext(prefix_blocks)
-        device = prefix_blocks[0].content.device if prefix_blocks else torch.device('cuda')
-        
-        start_map = torch.full((1, *gt_target.shape_meta), current_snr, device=device)
-        
-        # Noise the prefix latents
-        for b in ctx.blocks:
-            if b.type == 'latent':
-                # Map for this block
-                H, W = b.content.shape[-2:]
-                b_map = torch.full((1, H, W), current_snr, device=device)
-                alpha, sigma = logsnr_to_alpha_sigma(b_map)
-                z_noisy = b.content * alpha + torch.randn_like(b.content) * sigma
-                b.content = z_noisy
-                b.logsnr = b_map
-
-        # 4. Construct Query: Append Logic
-        # "Copy last frame of context, start at current_snr, solve to 10.0"
-        query = {
-            "mutation": "append_latent",
-            "append_source": "copy_from",
-            "append_index": -1, # Last item of prefix
-            "sampler": "taufield_euler",
-            "new_span_config": {
-                # Shape is inferred from source in create_noisy_latent_span
-                "shape": (3, 32, 32), # Fallback, ignored
-                "start_logsnr": current_snr,
-                "target_logsnr": 10.0
-            },
-            "sampling_config": {
-                "steps": config.get('steps', 50),
-                "mode": config.get('mode', 'naive')
+ 
+        # --- 4. Run inference for each sequence ---
+        all_results = []  # List of dicts with metadata for plotting
+ 
+        for seq_idx, seq_data in enumerate(sequences):
+            current_snr = sweep_snrs[seq_idx].item()
+            latents = seq_data['latents']
+            all_seq_blocks = seq_data['all_blocks']
+ 
+            # Split: all but last latent as context, last latent as GT target
+            context_latents = latents[:-1]
+            gt_target = latents[-1]
+ 
+            # Build context: include ALL blocks (text + latent) except the target latent
+            # This preserves text conditioning if present
+            target_id = gt_target.id
+            prefix_blocks = [b for b in all_seq_blocks if b.id != target_id]
+ 
+            if not prefix_blocks:
+                continue
+ 
+            device = prefix_blocks[0].content.device
+ 
+            # Clone GT for comparison
+            gt_content = gt_target.content.clone()
+            gt_shape = gt_target.shape_meta
+ 
+            # --- 5. Setup context with noise injection ---
+            ctx = MultiTurnContext(prefix_blocks)
+ 
+            # Noise the prefix latents to current_snr
+            for b in ctx.blocks:
+                if b.type == 'latent':
+                    b_map = torch.full((1, *b.shape_meta), current_snr, device=device)
+                    alpha, sigma = logsnr_to_alpha_sigma(b_map)
+                    noise = torch.randn_like(b.content)
+                    b.content = b.content * alpha + noise * sigma
+                    b.logsnr = b_map
+ 
+            # --- 6. Build query: find last latent in context, use as init ---
+            # Filter context to latents and find the last one by position
+            ctx_latent_indices = [i for i, b in enumerate(ctx.blocks) if b.type == 'latent']
+            if not ctx_latent_indices:
+                print(f"    Skipping seq {seq_idx}: no latent in context")
+                continue
+ 
+            last_latent_idx = ctx_latent_indices[-1]
+            last_latent_shape = ctx.blocks[last_latent_idx].shape_meta
+ 
+            query = {
+                "mutation": "append_latent",
+                "append_source": "copy_from",
+                "append_index": last_latent_idx,  # Explicit index, not -1
+                "sampler": "taufield_euler",
+                "new_span_config": {
+                    "shape": last_latent_shape,  # Explicit shape from source
+                    "start_logsnr": current_snr,
+                    "target_logsnr": 10.0
+                },
+                "sampling_config": {
+                    "steps": steps,
+                    "mode": config.get('mode', 'naive')
+                }
             }
-        }
-        
-        # 5. Execute
-        final_blocks = execute_multiturn_session(components, ctx, [query])
-        
-        # Store result (Full sequence: Prefix + Generated)
-        # We grab content from blocks. 
-        # Note: Prefix blocks in 'final_blocks' are currently at 'current_snr' (noisy)
-        # because we didn't target them for denoising in the query, only the appended one.
-        # This is expected for the visualization (showing noise context + clean gen).
-        all_predictions.append([b.content for b in final_blocks])
-
-    # 6. Plot
-    # plot_causal_sweep expects lists of lists of blocks/tensors.
-    # It handles [Batch, Time] grid.
-    source_name = config.get('video_source_name', 'sweep')
-    output_path = logger.run_dir / f"causal_sweep_{source_name}.png"
-    
-    from .plotting import plot_causal_sweep
-    plot_causal_sweep(all_gt_sequences, all_predictions, sweep_snrs, output_path)
+ 
+            # --- 7. Execute ---
+            final_blocks = execute_multiturn_session(components, ctx, [query])
+ 
+            # --- 8. Extract results with explicit typing ---
+            # The generated block is the last one appended
+            generated_block = final_blocks[-1]
+            pred_content = generated_block.content
+ 
+            # Get noisy context latents for visualization
+            ctx_latent_contents = [b.content for b in final_blocks[:-1] if b.type == 'latent']
+ 
+            # Store result with explicit metadata
+            all_results.append({
+                'snr': current_snr,
+                'gt': gt_content,
+                'pred': pred_content,
+                'ctx_latents': ctx_latent_contents,
+                'shape': gt_shape,
+                'seq_idx': seq_idx
+            })
+ 
+        # --- 9. Plot with explicit metadata ---
+        if all_results:
+            output_path = logger.run_dir / f"causal_sweep_{split_name}_{res_arg}px.png"
+            plot_causal_sweep_v2(all_results, output_path, split_name)

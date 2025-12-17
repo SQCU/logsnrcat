@@ -30,36 +30,47 @@ class FunctionalIterator:
     def generate_batch_list(self, batch_size: int, resolution: int = 32, **kwargs) -> List[ContextBlock]:
         start_group_id = kwargs.get('start_group_id', 0)
         res = self.resolution_override if self.resolution_override else resolution
-        
         blocks = []
         for i in range(batch_size):
             # 1. Generate Params
             query = self.gen_func(self.seed, self.config)
             self.seed += 1
             curr_gid = start_group_id + i
-            
+ 
             # 2. Determine Layout
             layout = self.text_pos
             if layout == 'random':
                 layout = random.choice(['prefix', 'suffix', 'none'])
-                
+ 
+            # 3. Create blocks with EXPLICIT shape_meta
+            text_content = serialize_query(query).to(self.device)
             text_block = ContextBlock(
-                content=serialize_query(query).to(self.device),
-                type='text', causal=True, group_id=curr_gid, id=f"txt_{curr_gid}"
+                content=text_content,
+                type='text',
+                causal=True,
+                shape_meta=(text_content.shape[0],),  # Explicit: (seq_len,)
+                group_id=curr_gid,
+                id=f"txt_{curr_gid}"
             )
+ 
+            img_content = self.render_func(query, res, self.device)
             img_block = ContextBlock(
-                content=self.render_func(query, res, self.device),
-                type='latent', causal=False, group_id=curr_gid, id=f"img_{curr_gid}"
+                content=img_content,
+                type='latent',
+                causal=False,
+                shape_meta=(res, res),  # Explicit: (H, W) for broadcast with (C, H, W)
+                group_id=curr_gid,
+                id=f"img_{curr_gid}"
             )
-            
-            # 3. Assemble
+ 
+            # 4. Assemble
             if layout == 'prefix':
                 blocks.extend([text_block, img_block])
             elif layout == 'suffix':
                 blocks.extend([img_block, text_block])
-            else: # none
+            else:  # none
                 blocks.append(img_block)
-                
+ 
         return blocks
 
 class CompositeIterator:
@@ -123,7 +134,7 @@ class CompositeIterator:
             if split['type'] == 'video':
                 # Video requires 'sequence_config' positional argument
                 # 1. Retrieve base structure
-                seq_conf = split['params'].get('sequence_structure', [{'res': 32}])
+                seq_conf = split['params']['sequence_structure']
                 
                 # 2. Check for resolution override from kwargs
                 if 'resolution' in kwargs:
@@ -164,3 +175,64 @@ class CompositeIterator:
                 global_gid += used
                 
         return all_blocks
+
+ 
+    def get_split_names(self) -> List[str]:
+        """Returns list of available split names."""
+        return [s['name'] for s in self.splits]
+ 
+    def generate_from_split(self, split_name: str, count: int, **kwargs) -> List[ContextBlock]:
+        """
+        Generate blocks from a specific split by name.
+ 
+        This is the correct interface for eval code that needs homogeneous batches.
+        Fails loudly if split doesn't exist - no silent defaults.
+        """
+        split = None
+        for s in self.splits:
+            if s['name'] == split_name:
+                split = s
+                break
+ 
+        if split is None:
+            available = self.get_split_names()
+            raise KeyError(f"Split '{split_name}' not found. Available: {available}")
+ 
+        global_gid = kwargs.pop('start_group_id', 0)
+ 
+        # --- Dispatch by type (same logic as generate_batch_list, but single split) ---
+        if split['type'] == 'video':
+            # Video REQUIRES sequence_structure - no defaults
+            seq_conf = split['params']['sequence_structure']
+ 
+            if 'resolution' in kwargs:
+                res_target = kwargs['resolution']
+                overridden = []
+                for frame in seq_conf:
+                    f = frame.copy()
+                    # relative_res is REQUIRED for video frames
+                    rel = f['relative_res']
+                    f['res'] = int(res_target * rel)
+                    if f['res'] % 2 != 0: f['res'] += 1
+                    overridden.append(f)
+                seq_conf = overridden
+ 
+            blocks = split['iterator'].generate_batch_list(count, seq_conf, start_group_id=global_gid)
+        else:
+            # Functional iterators
+            blocks = split['iterator'].generate_batch_list(count, start_group_id=global_gid, **kwargs)
+ 
+            # Assign LogSNR for functional latents
+            latents = [b for b in blocks if b.type == 'latent']
+            if latents:
+                H, W = latents[0].content.shape[-2:]
+                lsnrs = get_logsnr_batch(
+                    split['noise_mode'], len(latents), H, W, self.device, split['noise_params']
+                )
+                for b, l in zip(latents, lsnrs):
+                    b.logsnr = l
+ 
+        for b in blocks:
+            b.source = split['name']
+ 
+        return blocks

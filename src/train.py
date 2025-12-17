@@ -45,13 +45,13 @@ def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
     
     for split_name, split_cfg in dataset_mix.items():
         if split_cfg.get('type') == 'video':
-            params = split_cfg.get('params', {}) or {} # Handle None
-            seq_struct = params.get('sequence_structure', [])
+            params = split_cfg['params']
+            seq_struct = params['sequence_structure']
             for frame in seq_struct:
                 # Track absolute max defined in config
-                max_seq_res_abs = max(max_seq_res_abs, frame.get('res', 32))
+                max_seq_res_abs = max(max_seq_res_abs, frame['res'])
                 # Track relative max
-                max_seq_rel = max(max_seq_rel, frame.get('relative_res', 1.0))
+                max_seq_rel = max(max_seq_rel, frame['relative_res'])
     
     # 3. Compute Global Max
     if bucketing.get('enabled', False):

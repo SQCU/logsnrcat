@@ -325,77 +325,129 @@ def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_ma
     plt.tight_layout()
     logger.save_figure(fig, name)
 
-def plot_causal_sweep(sequences_gt, sequences_pred, snr_values, output_path):
+ 
+ 
+def plot_causal_sweep_v2(results: list, output_path, split_name: str):
     """
-    Visualizes Causal Sweep.
-    Row 2i: Sequence frames (Context[Noisy] -> Target[Denoised])
-    Row 2i+1: False color MSE (Diff between Output and GT)
+    Visualizes Causal Sweep with explicit metadata - no tensor shape inference.
+ 
+    Args:
+        results: List of dicts, each containing:
+            - 'snr': float, the SNR value for this sequence
+            - 'gt': Tensor [C,H,W], ground truth target
+            - 'pred': Tensor [C,H,W], predicted target
+            - 'ctx_latents': List[Tensor], context latent frames (noisy)
+            - 'shape': tuple, the expected shape
+            - 'seq_idx': int, sequence index
+        output_path: Path to save the figure
+        split_name: Name of the dataset split (for title)
     """
-    N_seq = len(sequences_gt)
-    if N_seq == 0: return
-    M_len = len(sequences_gt[0])
-    
-    # 2 rows per sequence (Image, Error)
-    fig, axes = plt.subplots(N_seq * 2, M_len, figsize=(2 * M_len, 4 * N_seq))
-    if N_seq == 1 and M_len == 1: axes = np.array([[axes]])
-    # Reshape strictly to [2*N, M]
-    axes = axes.reshape(2 * N_seq, M_len)
-    
-    plt.subplots_adjust(hspace=0.1, wspace=0.1)
-
-    for i in range(N_seq):
-        snr = snr_values[i]
-        
+    if not results:
+        return
+ 
+    n_seq = len(results)
+ 
+    # Determine max context length for uniform grid
+    max_ctx = max(len(r['ctx_latents']) for r in results)
+    n_cols = max_ctx + 2  # context frames + pred + GT
+ 
+    # Layout: 2 rows per sequence (images, error maps)
+    fig, axes = plt.subplots(n_seq * 2, n_cols, figsize=(2 * n_cols, 3 * n_seq))
+    if n_seq == 1:
+        axes = axes.reshape(2, -1)
+    axes = axes.reshape(n_seq * 2, n_cols)
+ 
+    fig.suptitle(f"Causal Sweep: {split_name}", fontsize=12)
+ 
+    def to_img(t):
+        """Safe tensor to numpy conversion."""
+        return t.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+ 
+    def resize_for_comparison(img, target_shape):
+        """Resize image if needed for MSE comparison."""
+        if img.shape[:2] != target_shape[:2]:
+            # Use simple resize via numpy/torch
+            import torch.nn.functional as F
+            t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+            t = F.interpolate(t, size=target_shape[:2], mode='bilinear', align_corners=False)
+            return t.squeeze(0).permute(1, 2, 0).numpy()
+        return img
+ 
+    for i, r in enumerate(results):
+        snr = r['snr']
+        gt = r['gt']
+        pred = r['pred']
+        ctx_latents = r['ctx_latents']
+ 
         row_img = i * 2
         row_err = i * 2 + 1
-        
-        for t in range(M_len):
-            # 1. Get Data
-            # GT Block
-            gt_block = sequences_gt[i][t]
-            gt_tensor = gt_block.content
-            
-            # Pred Tensor (Raw from sampler)
-            pred_tensor = sequences_pred[i][t]
-            
-            # 2. Plot Image
-            ax_img = axes[row_img, t]
-            # Handle dimensionality (Skip 1D Text blocks)
-            img_np = None
-            if pred_tensor.ndim == 3:
-                img_np = pred_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
-                ax_img.imshow(img_np)
-            else:
-                ax_img.text(0.5, 0.5, "Text/Meta", ha='center', va='center')
-                
-            ax_img.axis('off')
-            
-            # Labels
-            if i == 0 and t == 0:
-                ax_img.set_title(f"Ctx (Noisy)", fontsize=10)
-            elif i == 0 and t == M_len - 1:
-                ax_img.set_title(f"Gen (Clean)", fontsize=10)
-                
-            if t == 0:
-                ax_img.text(-0.2, 0.5, f"SNR {snr:.1f}", transform=ax_img.transAxes, 
-                            va='center', ha='right', fontsize=9, rotation=90)
-
-            # 3. Plot Error
-            ax_err = axes[row_err, t]
-            
-            # Calculate MSE Map
-            if img_np is not None and gt_tensor.ndim == 3:
-                gt_np = gt_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
-                diff = (img_np - gt_np) ** 2
-                mse_map = diff.mean(axis=2) # Average over channels
-                
-                # Use fixed scale to make noise visible vs clean
-                im_err = ax_err.imshow(mse_map, cmap='inferno', vmin=0, vmax=0.1)
-            else:
-                ax_err.text(0.5, 0.5, "N/A", ha='center', va='center')
-                
+ 
+        # --- Plot context frames ---
+        for j, ctx_t in enumerate(ctx_latents):
+            ax = axes[row_img, j]
+            ax.imshow(to_img(ctx_t))
+            ax.axis('off')
+            if i == 0 and j == 0:
+                ax.set_title("Context", fontsize=9)
+ 
+            # Error row: context vs context (self, just show placeholder)
+            ax_err = axes[row_err, j]
+            ax_err.imshow(np.zeros((8, 8)), cmap='inferno', vmin=0, vmax=0.1)
             ax_err.axis('off')
-            
+ 
+        # Blank out unused context columns
+        for j in range(len(ctx_latents), max_ctx):
+            axes[row_img, j].axis('off')
+            axes[row_err, j].axis('off')
+ 
+        # --- Plot prediction ---
+        pred_col = max_ctx
+        ax_pred = axes[row_img, pred_col]
+        pred_np = to_img(pred)
+        ax_pred.imshow(pred_np)
+        ax_pred.axis('off')
+        if i == 0:
+            ax_pred.set_title("Pred", fontsize=9)
+ 
+        # --- Plot GT ---
+        gt_col = max_ctx + 1
+        ax_gt = axes[row_img, gt_col]
+        gt_np = to_img(gt)
+        ax_gt.imshow(gt_np)
+        ax_gt.axis('off')
+        if i == 0:
+            ax_gt.set_title("GT", fontsize=9)
+ 
+        # --- SNR label ---
+        axes[row_img, 0].text(
+            -0.3, 0.5, f"SNR {snr:.1f}",
+            transform=axes[row_img, 0].transAxes,
+            va='center', ha='right', fontsize=8, rotation=90
+        )
+ 
+        # --- Error map: pred vs GT ---
+        ax_err_pred = axes[row_err, pred_col]
+ 
+        # Handle potential shape mismatch explicitly
+        if pred_np.shape != gt_np.shape:
+            # Resize pred to match GT for comparison
+            pred_np_resized = resize_for_comparison(pred_np, gt_np.shape)
+            diff = (pred_np_resized - gt_np) ** 2
+        else:
+            diff = (pred_np - gt_np) ** 2
+ 
+        mse_map = diff.mean(axis=2)
+        ax_err_pred.imshow(mse_map, cmap='inferno', vmin=0, vmax=0.1)
+        ax_err_pred.axis('off')
+        if i == 0:
+            ax_err_pred.set_title("MSE", fontsize=9)
+ 
+        # GT error (vs self = 0)
+        ax_err_gt = axes[row_err, gt_col]
+        ax_err_gt.imshow(np.zeros_like(mse_map), cmap='inferno', vmin=0, vmax=0.1)
+        ax_err_gt.axis('off')
+ 
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+    print(f"    Saved: {output_path}")

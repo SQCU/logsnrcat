@@ -596,27 +596,34 @@ class ContextBlock:
     """
     Canonical atomic unit of the dataset.
     Holds raw data and its topological metadata.
+ 
+    shape_meta: For latents, this is (H, W) - the spatial dimensions of content.
+                For text, this is (seq_len,) - the token count.
+                Must broadcast correctly with content for logsnr map operations.
     """
-    content: Union[torch.Tensor, str] # [3, H, W] or String
+    content: Union[torch.Tensor, str] # [C, H, W] for latent or [L] for text tokens
     type: str = 'latent'
     causal: bool = True
     # Metadata
     shape_meta: Tuple[int, ...] = field(default_factory=tuple)
-    logsnr: Optional[torch.Tensor] = None # [1, H, W]
+    logsnr: Optional[torch.Tensor] = None # [1, H, W] for latents
     group_id: int = 0
     id: str = ""
-        # NEW FIELD
-    source: str = "unknown" 
-
+    source: str = "unknown"
+ 
     def __post_init__(self):
-        if not self.shape_meta:
-             if isinstance(self.content, torch.Tensor) and self.type == 'latent':
-                 h, w = self.content.shape[-2:]
-                 self.shape_meta = (h // 2, w // 2)
-             elif isinstance(self.content, str) and self.type == 'text':
-                 self.shape_meta = (len(self.content),)
-             elif isinstance(self.content, torch.Tensor) and self.type == 'text':
-                 self.shape_meta = (self.content.shape[0],)
+        # Derive shape_meta from content if not explicitly set
+        # This is a fallback - prefer explicit setting in iterators
+        if not self.shape_meta and isinstance(self.content, torch.Tensor):
+            if self.type == 'latent':
+                # shape_meta = (H, W) for broadcasting with (C, H, W) content
+                #h, w = self.content.shape[-2:]
+                #self.shape_meta = (h, w)
+                print(f"type inference of pre-pooling image shape from an unknown tensor of unknown source is not possible.")
+                raise TypeError("we are crashing this run... with no survivors.")
+            elif self.type == 'text':
+                # shape_meta = (seq_len,) for text tokens
+                self.shape_meta = (self.content.shape[0],)
 
 @dataclass
 class Span:
