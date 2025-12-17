@@ -286,7 +286,8 @@ def benchmark_concat_ar_zc(
     latent_res: int,
     num_latents: int = 3,       # Outer AR steps (number of latents to generate)
     steps_per_latent: int = 5,  # Inner diffusion steps per latent
-    warmup_runs: int = 1
+    warmup_runs: int = 1,
+    use_compile: bool = True
 ) -> ConcatARResult:
     """
     Concatenative AR benchmark with ZC (baseline).
@@ -323,6 +324,10 @@ def benchmark_concat_ar_zc(
         fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
+
+    # Compile model for fused flex_attention kernels
+    if use_compile:
+        model = torch.compile(model, mode='reduce-overhead')
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -442,7 +447,8 @@ def benchmark_concat_ar_kvc(
     latent_res: int,
     num_latents: int = 3,
     steps_per_latent: int = 5,
-    warmup_runs: int = 1
+    warmup_runs: int = 1,
+    use_compile: bool = True
 ) -> ConcatARResult:
     """
     Concatenative AR benchmark with KVC (prefix caching).
@@ -481,6 +487,10 @@ def benchmark_concat_ar_kvc(
         fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
+
+    # Compile model for fused flex_attention kernels
+    if use_compile:
+        model = torch.compile(model, mode='reduce-overhead')
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -671,7 +681,8 @@ def benchmark_zc(
     latent_res: int,
     with_grad: bool,
     warmup_runs: int = 2,
-    timed_runs: int = 5
+    timed_runs: int = 5,
+    use_compile: bool = True
 ) -> BenchmarkResult:
     """Benchmark ZC model."""
 
@@ -694,6 +705,10 @@ def benchmark_zc(
         fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
+
+    # Compile model for fused flex_attention kernels
+    if use_compile and not with_grad:  # Don't compile training mode
+        model = torch.compile(model, mode='reduce-overhead')
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -765,7 +780,8 @@ def benchmark_kvc(
     latent_res: int,
     warmup_runs: int = 2,
     timed_runs: int = 5,
-    headroom_multiplier: float = 2.0  # Extra space for multi-turn / diffusion steps
+    headroom_multiplier: float = 2.0,  # Extra space for multi-turn / diffusion steps
+    use_compile: bool = True
 ) -> BenchmarkResult:
     """Benchmark KVC model."""
 
@@ -800,6 +816,10 @@ def benchmark_kvc(
         fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
+
+    # Compile model for fused flex_attention kernels
+    if use_compile:
+        model = torch.compile(model, mode='reduce-overhead')
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -976,12 +996,18 @@ def main():
                         help="Number of latents in concatenative AR test (context grows)")
     parser.add_argument("--skip-trajectory", action="store_true",
                         help="Skip the concatenative AR benchmark")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Skip torch.compile (flex_attention designed for compilation)")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Batch size for parallel AR benchmark (default: 1)")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(exist_ok=True)
     results_file = output_dir / "kvc_vs_zc_results.json"
     plot_file = output_dir / "kvc_vs_zc_comparison.png"
+
+    use_compile = not args.no_compile
 
     if args.plot_only:
         if results_file.exists():
@@ -1005,34 +1031,40 @@ def main():
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Dtype: {dtype}")
+    print(f"Compile: {use_compile}")
+    print(f"Batch size: {args.batch_size}")
     print(f"Context: {args.num_text} text tokens + {args.num_latents}x {args.latent_res}x{args.latent_res} latents")
     print(f"Model: {cfg['model']['dim']}d, {cfg['model']['depth']}L, {cfg['model']['num_heads']}H")
     print("=" * 60)
 
     results = []
+    compile_str = " (compiled)" if use_compile else ""
 
-    # 1. ZC with gradients (training mode)
+    # 1. ZC with gradients (training mode) - never compiled
     print("\n[1/3] Benchmarking ZC (with gradients)...")
     try:
-        r = benchmark_zc(cfg, device, dtype, args.num_text, args.num_latents, args.latent_res, with_grad=True)
+        r = benchmark_zc(cfg, device, dtype, args.num_text, args.num_latents, args.latent_res,
+                        with_grad=True, use_compile=False)  # Training not compiled in benchmark
         results.append(r)
         print(f"  -> {r.latency_ms:.2f}ms, {r.vram_peak_mb:.1f}MB peak")
     except Exception as e:
         print(f"  -> FAILED: {e}")
 
     # 2. ZC without gradients (inference baseline)
-    print("\n[2/3] Benchmarking ZC (no gradients)...")
+    print(f"\n[2/3] Benchmarking ZC (no gradients){compile_str}...")
     try:
-        r = benchmark_zc(cfg, device, dtype, args.num_text, args.num_latents, args.latent_res, with_grad=False)
+        r = benchmark_zc(cfg, device, dtype, args.num_text, args.num_latents, args.latent_res,
+                        with_grad=False, use_compile=use_compile)
         results.append(r)
         print(f"  -> {r.latency_ms:.2f}ms, {r.vram_peak_mb:.1f}MB peak")
     except Exception as e:
         print(f"  -> FAILED: {e}")
 
     # 3. KVC (paged attention)
-    print("\n[3/3] Benchmarking KVC (paged attention)...")
+    print(f"\n[3/3] Benchmarking KVC (paged attention){compile_str}...")
     try:
-        r = benchmark_kvc(cfg, device, dtype, args.num_text, args.num_latents, args.latent_res)
+        r = benchmark_kvc(cfg, device, dtype, args.num_text, args.num_latents, args.latent_res,
+                         use_compile=use_compile)
         results.append(r)
         print(f"  -> {r.latency_ms:.2f}ms, {r.vram_peak_mb:.1f}MB peak")
     except Exception as e:
@@ -1070,12 +1102,14 @@ def main():
         print(f"  {args.ar_latents} latents × {args.diffusion_steps} steps/latent")
         print("=" * 60)
 
-        print(f"\n[4/5] Benchmarking ZC concat-AR...")
+        compile_str = " (compiled)" if use_compile else " (eager)"
+        print(f"\n[4/5] Benchmarking ZC concat-AR{compile_str}...")
         try:
             zc_ar = benchmark_concat_ar_zc(
                 cfg, device, dtype, args.num_text, args.latent_res,
                 num_latents=args.ar_latents,
-                steps_per_latent=args.diffusion_steps
+                steps_per_latent=args.diffusion_steps,
+                use_compile=use_compile
             )
             print(f"  -> {zc_ar.total_latency_ms:.2f}ms total, "
                   f"{zc_ar.avg_ms_per_forward:.2f}ms avg/forward, "
@@ -1086,12 +1120,13 @@ def main():
             traceback.print_exc()
             zc_ar = None
 
-        print(f"\n[5/5] Benchmarking KVC concat-AR...")
+        print(f"\n[5/5] Benchmarking KVC concat-AR{compile_str}...")
         try:
             kvc_ar = benchmark_concat_ar_kvc(
                 cfg, device, dtype, args.num_text, args.latent_res,
                 num_latents=args.ar_latents,
-                steps_per_latent=args.diffusion_steps
+                steps_per_latent=args.diffusion_steps,
+                use_compile=use_compile
             )
             print(f"  -> {kvc_ar.total_latency_ms:.2f}ms total, "
                   f"{kvc_ar.avg_ms_per_forward:.2f}ms avg/forward, "
