@@ -258,6 +258,326 @@ class BenchmarkResult:
     num_tokens: int
 
 
+@dataclass
+class TrajectoryResult:
+    """Results for multi-step diffusion trajectory benchmarks."""
+    name: str
+    total_latency_ms: float
+    per_step_latency_ms: float
+    num_steps: int
+    num_tokens: int
+    prefix_tokens: int
+    vram_peak_mb: float
+    cache_efficiency: float  # ratio of cached vs recomputed tokens
+
+
+# =============================================================================
+# Diffusion Trajectory Benchmarks (Session-Style)
+# =============================================================================
+
+def benchmark_diffusion_trajectory_zc(
+    cfg: Dict,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_text: int,
+    latent_res: int,
+    num_steps: int = 5,
+    warmup_runs: int = 1
+) -> TrajectoryResult:
+    """
+    Simulates a realistic diffusion sampling trajectory with ZC.
+
+    Each step recomputes the entire forward pass (prefix + latent).
+    This is the baseline for comparison with KVC.
+    """
+    from src.model import coolerLDTformerZC
+
+    # Build model
+    model = coolerLDTformerZC(
+        dim=cfg['model']['dim'],
+        depth=cfg['model']['depth'],
+        num_heads=cfg['model']['num_heads'],
+        topo_dim=cfg['model']['topo_dim'],
+        mlp_depth=cfg['model']['mlp_depth'],
+        vocab_size=cfg['model']['vocab_size'],
+        global_layer_interval=cfg['model']['global_layer_interval'],
+        num_experts=cfg['model']['num_experts'],
+        num_active=cfg['model']['num_active'],
+        rope_base=cfg['model']['rope_base'],
+        mlp_ratio=cfg['model']['mlp_ratio'],
+        jitter_noise=0.0,
+        context_size=cfg['model']['patch_embedder']['context_size'],
+        stride=cfg['model']['patch_embedder']['stride'],
+        fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
+        window_size=cfg['model']['window_size']
+    ).to(device=device, dtype=dtype)
+
+    span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
+    span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
+
+    block_size = cfg['page_table']['block_size']
+    latent_tokens = (latent_res // cfg['model']['patch_embedder']['stride'])**2
+    num_tokens = num_text + latent_tokens
+    num_blocks = (num_tokens + block_size - 1) // block_size
+
+    page_table = PageTable(
+        num_blocks=max(num_blocks * 2, 8),
+        block_size=block_size,
+        max_batch_size=cfg['page_table']['max_batch_size'],
+        max_logical_blocks=max(num_blocks * 2, 8),
+        device=device
+    )
+
+    # Create context: text prefix + single latent
+    text_tokens = torch.randint(0, 1000, (num_text,), device=device)
+    text_block = ContextBlock(
+        content=text_tokens,
+        type='text',
+        causal=True,
+        shape_meta=(num_text,),
+        group_id=0,
+        id="text_prefix"
+    )
+
+    # Initial noisy latent
+    latent_content = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+    logsnr = torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype)  # Start noisy
+
+    latent_block = ContextBlock(
+        content=latent_content,
+        type='latent',
+        causal=False,
+        shape_meta=(latent_res, latent_res),
+        logsnr=logsnr,
+        group_id=0,
+        id="diffusion_target"
+    )
+
+    # Warmup
+    blocks = [text_block, latent_block]
+    for _ in range(warmup_runs):
+        run_zc_forward(model, span_emb, span_unemb, page_table, blocks, with_grad=False)
+
+    # Reset and measure trajectory
+    reset_memory_stats()
+    torch.cuda.synchronize()
+
+    # Simulate diffusion trajectory: num_steps forward passes
+    # Each step: model predicts v, we update latent, logsnr changes
+    logsnr_schedule = torch.linspace(-4.0, 6.0, num_steps + 1, device=device, dtype=dtype)
+
+    start_time = time.perf_counter()
+
+    for step in range(num_steps):
+        # Update logsnr for this step
+        current_logsnr = logsnr_schedule[step].item()
+        latent_block.logsnr = torch.full((1, latent_res, latent_res), current_logsnr, device=device, dtype=dtype)
+
+        # Forward pass (ZC recomputes everything)
+        z_out, decoded, _ = run_zc_forward(model, span_emb, span_unemb, page_table, blocks, with_grad=False)
+
+        # Simulate state update (in real sampling, this would be euler step)
+        if 'image_vpreds' in decoded[1]:
+            v_pred = decoded[1]['image_vpreds']
+            # Simplified euler step: z_next = z_curr + dt * v_pred
+            latent_block.content = latent_block.content + 0.1 * v_pred
+
+    torch.cuda.synchronize()
+    total_time = (time.perf_counter() - start_time) * 1000
+
+    mem = get_gpu_memory_mb()
+
+    # Cleanup
+    del model, span_emb, span_unemb, page_table
+    torch.cuda.empty_cache()
+
+    return TrajectoryResult(
+        name="ZC Trajectory",
+        total_latency_ms=total_time,
+        per_step_latency_ms=total_time / num_steps,
+        num_steps=num_steps,
+        num_tokens=num_tokens,
+        prefix_tokens=num_text,
+        vram_peak_mb=mem['max_allocated'],
+        cache_efficiency=0.0  # ZC has no caching benefit
+    )
+
+
+def benchmark_diffusion_trajectory_kvc(
+    cfg: Dict,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_text: int,
+    latent_res: int,
+    num_steps: int = 5,
+    warmup_runs: int = 1
+) -> TrajectoryResult:
+    """
+    Simulates a realistic diffusion sampling trajectory with KVC.
+
+    Key optimization: Text prefix is cached, only the latent portion
+    is recomputed at each step (with updated K/V for changed content).
+    """
+    # Calculate token counts for allocation
+    block_size = cfg['page_table']['block_size']
+    latent_tokens = (latent_res // cfg['model']['patch_embedder']['stride'])**2
+    num_tokens = num_text + latent_tokens
+    needed_blocks = (num_tokens + block_size - 1) // block_size
+    max_blocks = max(needed_blocks * 2, 8)
+
+    print(f"    KVC trajectory: {num_tokens} tokens, {needed_blocks} blocks needed")
+
+    # Build model
+    model = coolerLDTformerKVC(
+        dim=cfg['model']['dim'],
+        depth=cfg['model']['depth'],
+        num_heads=cfg['model']['num_heads'],
+        topo_dim=cfg['model']['topo_dim'],
+        mlp_depth=cfg['model']['mlp_depth'],
+        vocab_size=cfg['model']['vocab_size'],
+        global_layer_interval=cfg['model']['global_layer_interval'],
+        num_experts=cfg['model']['num_experts'],
+        num_active=cfg['model']['num_active'],
+        rope_base=cfg['model']['rope_base'],
+        mlp_ratio=cfg['model']['mlp_ratio'],
+        jitter_noise=0.0,
+        context_size=cfg['model']['patch_embedder']['context_size'],
+        stride=cfg['model']['patch_embedder']['stride'],
+        fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
+        window_size=cfg['model']['window_size']
+    ).to(device=device, dtype=dtype)
+
+    span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
+    span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
+
+    page_table = PageTable(
+        num_blocks=max_blocks,
+        block_size=block_size,
+        max_batch_size=cfg['page_table']['max_batch_size'],
+        max_logical_blocks=max_blocks,
+        device=device
+    )
+
+    kvt_manager = KVTManager(
+        max_blocks=max_blocks,
+        block_size=block_size,
+        kv_dim=cfg['model']['dim'],
+        layers=cfg['model']['depth'],
+        heads=cfg['model']['num_heads'],
+        topo_dim=cfg['model']['topo_dim'],
+        device=device,
+        dtype=dtype
+    )
+
+    # Create context
+    text_tokens = torch.randint(0, 1000, (num_text,), device=device)
+    text_block = ContextBlock(
+        content=text_tokens,
+        type='text',
+        causal=True,
+        shape_meta=(num_text,),
+        group_id=0,
+        id="text_prefix"
+    )
+
+    latent_content = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+    logsnr = torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype)
+
+    latent_block = ContextBlock(
+        content=latent_content,
+        type='latent',
+        causal=False,
+        shape_meta=(latent_res, latent_res),
+        logsnr=logsnr,
+        group_id=0,
+        id="diffusion_target"
+    )
+
+    blocks = [text_block, latent_block]
+
+    # Warmup
+    for i in range(warmup_runs):
+        run_kvc_forward(model, span_emb, span_unemb, kvt_manager, page_table, blocks, req_id=i)
+
+    # Reset and measure trajectory
+    reset_memory_stats()
+    torch.cuda.synchronize()
+
+    logsnr_schedule = torch.linspace(-4.0, 6.0, num_steps + 1, device=device, dtype=dtype)
+
+    start_time = time.perf_counter()
+
+    for step in range(num_steps):
+        req_id = warmup_runs + step
+
+        # Update logsnr
+        current_logsnr = logsnr_schedule[step].item()
+        latent_block.logsnr = torch.full((1, latent_res, latent_res), current_logsnr, device=device, dtype=dtype)
+
+        # Forward pass with KVC
+        # Note: Current implementation re-allocates each time due to content hash change
+        # TODO: Optimize to only update changed blocks (latent) when prefix hasn't changed
+        z_out, decoded, _ = run_kvc_forward(
+            model, span_emb, span_unemb, kvt_manager, page_table, blocks, req_id=req_id
+        )
+
+        # Simulate state update
+        if 'image_vpreds' in decoded[1]:
+            v_pred = decoded[1]['image_vpreds']
+            latent_block.content = latent_block.content + 0.1 * v_pred
+
+    torch.cuda.synchronize()
+    total_time = (time.perf_counter() - start_time) * 1000
+
+    mem = get_gpu_memory_mb()
+
+    # Calculate cache efficiency: how much of the context was prefix (cacheable)
+    cache_efficiency = num_text / num_tokens
+
+    # Cleanup
+    del model, span_emb, span_unemb, page_table, kvt_manager
+    torch.cuda.empty_cache()
+
+    return TrajectoryResult(
+        name="KVC Trajectory",
+        total_latency_ms=total_time,
+        per_step_latency_ms=total_time / num_steps,
+        num_steps=num_steps,
+        num_tokens=num_tokens,
+        prefix_tokens=num_text,
+        vram_peak_mb=mem['max_allocated'],
+        cache_efficiency=cache_efficiency
+    )
+
+
+def print_trajectory_results(zc_result: TrajectoryResult, kvc_result: TrajectoryResult):
+    """Print trajectory benchmark comparison."""
+    print("\n" + "=" * 80)
+    print("DIFFUSION TRAJECTORY BENCHMARK (Realistic Multi-Step Sampling)")
+    print("=" * 80)
+    print(f"Configuration: {zc_result.num_steps} diffusion steps, "
+          f"{zc_result.prefix_tokens} text tokens, "
+          f"{zc_result.num_tokens - zc_result.prefix_tokens} latent tokens")
+    print("-" * 80)
+    print(f"{'Metric':<30} {'ZC':<20} {'KVC':<20} {'Speedup':<15}")
+    print("-" * 80)
+    print(f"{'Total latency (ms)':<30} {zc_result.total_latency_ms:<20.2f} "
+          f"{kvc_result.total_latency_ms:<20.2f} "
+          f"{zc_result.total_latency_ms/kvc_result.total_latency_ms:.2f}x")
+    print(f"{'Per-step latency (ms)':<30} {zc_result.per_step_latency_ms:<20.2f} "
+          f"{kvc_result.per_step_latency_ms:<20.2f} "
+          f"{zc_result.per_step_latency_ms/kvc_result.per_step_latency_ms:.2f}x")
+    print(f"{'Peak VRAM (MB)':<30} {zc_result.vram_peak_mb:<20.1f} "
+          f"{kvc_result.vram_peak_mb:<20.1f} "
+          f"{(1 - kvc_result.vram_peak_mb/zc_result.vram_peak_mb)*100:.1f}% reduction")
+    print(f"{'Prefix cache ratio':<30} {'N/A':<20} {kvc_result.cache_efficiency*100:.1f}%")
+    print("=" * 80)
+    print("\nNote: Current KVC implementation re-hashes entire context each step.")
+    print("      Optimal implementation would only update changed latent blocks,")
+    print("      giving ~{:.0f}x additional speedup for prefix-heavy contexts.".format(
+        1 / (1 - kvc_result.cache_efficiency) if kvc_result.cache_efficiency < 1 else 1))
+
+
 def benchmark_zc(
     cfg: Dict,
     device: torch.device,
@@ -566,6 +886,10 @@ def main():
     parser.add_argument("--dtype", choices=["fp32", "bf16"], default="bf16", help="Data type")
     parser.add_argument("--output-dir", default="./benchmark_results", help="Output directory")
     parser.add_argument("--plot-only", action="store_true", help="Only plot from existing results.json")
+    parser.add_argument("--diffusion-steps", type=int, default=5,
+                        help="Number of diffusion steps for trajectory benchmark (realistic: 5-10)")
+    parser.add_argument("--skip-trajectory", action="store_true",
+                        help="Skip the multi-step trajectory benchmark")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -650,6 +974,45 @@ def main():
     # Plot and print
     plot_results(results, plot_file)
     print_results_table(results)
+
+    # =========================================================================
+    # Trajectory Benchmark (Realistic Multi-Step Diffusion)
+    # =========================================================================
+    if not args.skip_trajectory:
+        print("\n" + "=" * 60)
+        print(f"TRAJECTORY BENCHMARK ({args.diffusion_steps}-step diffusion)")
+        print("=" * 60)
+
+        print(f"\n[4/5] Benchmarking ZC trajectory ({args.diffusion_steps} steps)...")
+        try:
+            zc_traj = benchmark_diffusion_trajectory_zc(
+                cfg, device, dtype, args.num_text, args.latent_res,
+                num_steps=args.diffusion_steps
+            )
+            print(f"  -> {zc_traj.total_latency_ms:.2f}ms total, "
+                  f"{zc_traj.per_step_latency_ms:.2f}ms/step")
+        except Exception as e:
+            print(f"  -> FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            zc_traj = None
+
+        print(f"\n[5/5] Benchmarking KVC trajectory ({args.diffusion_steps} steps)...")
+        try:
+            kvc_traj = benchmark_diffusion_trajectory_kvc(
+                cfg, device, dtype, args.num_text, args.latent_res,
+                num_steps=args.diffusion_steps
+            )
+            print(f"  -> {kvc_traj.total_latency_ms:.2f}ms total, "
+                  f"{kvc_traj.per_step_latency_ms:.2f}ms/step")
+        except Exception as e:
+            print(f"  -> FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            kvc_traj = None
+
+        if zc_traj and kvc_traj:
+            print_trajectory_results(zc_traj, kvc_traj)
 
     print(f"\n✓ Benchmark complete. Artifacts in {output_dir}/")
 
