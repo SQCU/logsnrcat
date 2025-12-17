@@ -187,6 +187,12 @@ class ExperimentLogger:
         fig.savefig(filepath, dpi=150, bbox_inches="tight")
         plt.close(fig)
 
+    def log_text(self, filename, text):
+        """Append text to a log file in the run directory."""
+        filepath = self.run_dir / filename
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
 
 def plot_losses(df_naive, df_fact, logger, metric="loss_total", title="Training Loss"):
     if df_naive.empty and df_fact.empty: return
