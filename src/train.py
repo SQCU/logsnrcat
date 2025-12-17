@@ -193,7 +193,7 @@ def train_denoise(components, config, iterator, logger=None):
     
     # 2. Strict Access (No defaults allowed here - define them in Pydantic schema)
     mode = config['training']['mode']
-    steps = config['training']['ae_steps']
+    steps = config['training']['steps']
     bs = config['training']['batch_size']
     lambda_coeff = config['training']['lambda_coeff']
     

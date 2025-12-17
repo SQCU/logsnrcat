@@ -17,27 +17,6 @@ from src.train import train_autoembed, train_denoise
 from src.plotting import plot_multimetric_analysis, ExperimentLogger#, plot_dset_reconstruction
 import src.sample as sampler
 
-def merge_configs(base_cfg_dict, file_paths, key_path=None):
-    """
-    Helper to merge external TOMLs into the base config dictionary.
-    """
-    for path_str in file_paths:
-        path = Path(path_str)
-        if not path.exists():
-            print(f"⚠️ Warning: Config file not found: {path}")
-            continue
-            
-        with open(path, "rb") as f:
-            sub_cfg = tomli.load(f)
-            
-        # If key_path is provided (e.g. ['dataset_mix']), merge into that dict
-        target = base_cfg_dict
-        if key_path:
-            for k in key_path:
-                target = target.setdefault(k, {})
-                
-        # Shallow merge of top-level keys in sub_cfg
-        target.update(sub_cfg)
 
 def build_model(cfg, device: torch.device):
     """Instantiate model from raw config dictionary."""
