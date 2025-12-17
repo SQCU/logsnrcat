@@ -3,7 +3,7 @@ eval_configs = ["text_ar_sweep.toml"]
 
 [model]
 dim = 256
-depth = 16
+depth = 8
 num_heads = 8
 topo_dim = 3
 mlp_depth = 1
@@ -24,8 +24,8 @@ stride = 4
 mlp_depth = 2
 
 [training]
-ae_steps = 500
-steps = 1000
+ae_steps = 50
+steps = 300
 lambda_coeff = 0.2
 mode = "naive"
 batch_size = 8
@@ -39,7 +39,7 @@ enabled = true
 # These two define the "Computational Budget" per step.
 # Cost = (base_resolution / stride)^2 * base_batch_size
 base_resolution = 32
-base_batch_size = 64 #128 if using base_res 16
+base_batch_size = 128 #128 if using base_res 16
 caching_resolution = 128
 
 # --- Bucket 1: Low Res (32x32) ---

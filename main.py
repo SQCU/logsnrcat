@@ -206,8 +206,9 @@ def main():
                             if b.type == 'text':
                                 try:
                                     text = tokenizer.decode(b.content)
-                                    log_msg = f"Block {i} (Text): {text[:200]}... (Len: {len(b.content)})"
-                                    print(log_msg)
+                                    print_msg = f"Block {i} (Text): {text[:200]}... (Len: {len(b.content)})"
+                                    print(print_msg)
+                                    log_msg = f"{print_msg}\n{text}\n"
                                     logger.log_text("eval_outputs.txt", log_msg)
                                 except Exception as e:
                                     print(f"Failed to decode text block {i}: {e}")
