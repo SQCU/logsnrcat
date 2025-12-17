@@ -226,28 +226,55 @@ class HouseholderOrthogonal(nn.Module):
     Parametrized Orthogonal Matrix via product of Householder reflections.
     Used to project N-dimensional spatial coordinates into the rotation subspace.
     Reference: https://arxiv.org/abs/2504.06308
+
+    Caching: The orthogonal matrix Q is constant given fixed weights, so we cache
+    it and only recompute when weights change (training) or explicitly invalidated.
     """
     def __init__(self, dim, num_reflections=4):
         super().__init__()
         self.dim = dim
         self.num_reflections = num_reflections
         self.vs = nn.Parameter(torch.empty(num_reflections, dim))
+        # Cache for the computed orthogonal matrix
+        self._cached_Q: Optional[torch.Tensor] = None
+        self._cache_valid = False
         self.param_init()
 
     def param_init(self):
         # Initialize vectors with small random noise
         nn.init.normal_(self.vs, mean=0.0, std=0.02)
+        self._cache_valid = False
+
+    def invalidate_cache(self):
+        """Call after weight updates to force recomputation."""
+        self._cache_valid = False
+        self._cached_Q = None
 
     def get_matrix(self):
-        # Start with Identity
+        """
+        Computes Q = H_n * ... * H_1 * I where H_i = I - 2*v_i*v_i^T/||v_i||^2
+
+        Caches the result for inference efficiency (16 calls/forward pass otherwise).
+        """
+        # Return cached if valid and same device/dtype
+        if self._cache_valid and self._cached_Q is not None:
+            if (self._cached_Q.device == self.vs.device and
+                self._cached_Q.dtype == self.vs.dtype):
+                return self._cached_Q
+
+        # Compute fresh
         Q = torch.eye(self.dim, device=self.vs.device, dtype=self.vs.dtype)
-        # Iteratively apply reflections: H = I - 2vv^T / ||v||^2
         for i in range(self.vs.shape[0]):
             v = self.vs[i].unsqueeze(1)
             v_norm_sq = torch.sum(v ** 2) + 1e-8
-            # Q_new = (I - 2vv'/v'v) Q_old = Q_old - (2/v'v) v (v' Q_old)
             term = (2.0 / v_norm_sq) * v @ (v.t() @ Q)
             Q = Q - term
+
+        # Cache for inference (don't cache during training to allow gradients)
+        if not self.training:
+            self._cached_Q = Q.detach()
+            self._cache_valid = True
+
         return Q
 
     def forward(self, x, inverse=False):
@@ -646,11 +673,14 @@ class Span:
     type: str  # 'text' | 'latent'
     start_idx: int
     end_idx: int
-    shape: Tuple[int, ...] 
-    causal: bool    
-    doc_id: int 
-    # NEW: Store original unpadded dimensions
+    shape: Tuple[int, ...]
+    causal: bool
+    doc_id: int
+    # Store original unpadded dimensions
     original_shape: Optional[Tuple[int, ...]] = None
+    # Topology cache - computed once, reused across forward passes
+    cached_topo: Optional[torch.Tensor] = field(default=None, repr=False)  # [L, topo_dim]
+    topo_highway_offset: Optional[int] = None  # Highway offset when topo was computed
 
 
 class SpanEmbedder:
@@ -1298,6 +1328,39 @@ def generate_content_hash_stream(spans: List[Any]) -> List[int]:
 # 2. GEOMETRY (Topology Policy)
 # =========================================================
 
+def _compute_span_topology(
+    span: Span,
+    highway_offset: int,
+    max_dims: int,
+    device: torch.device,
+    dtype: torch.dtype
+) -> torch.Tensor:
+    """Compute topology for a single span. Returns [L, max_dims] tensor."""
+    spatial_dim_capacity = max_dims - 1
+
+    if span.type == 'text':
+        num_tokens = span.shape[0]
+    else:
+        num_tokens = math.prod(span.shape)
+
+    # Highway (global timeline)
+    highway = torch.arange(highway_offset, highway_offset + num_tokens, device=device, dtype=dtype)
+
+    # Spatial manifold
+    if span.type == 'text':
+        coords = torch.zeros((num_tokens, spatial_dim_capacity), device=device, dtype=dtype)
+    else:
+        dims = [torch.arange(d, device=device, dtype=dtype) for d in span.shape]
+        mesh = torch.meshgrid(*dims, indexing='ij')
+        coords = torch.stack([m.flatten() for m in mesh], dim=-1)
+        curr_dim = coords.shape[-1]
+        if curr_dim < spatial_dim_capacity:
+            padding = torch.zeros((num_tokens, spatial_dim_capacity - curr_dim), device=device, dtype=dtype)
+            coords = torch.cat([coords, padding], dim=-1)
+
+    return torch.cat([highway.unsqueeze(-1), coords], dim=-1)
+
+
 def render_topology_embeddings(
     spans: List[Span],
     max_dims: int,
@@ -1316,48 +1379,32 @@ def render_topology_embeddings(
     if dtype is None:
         dtype = torch.float32
 
-    highway_idx = []
-    manifold_coords = []
+    topo_chunks = []
     doc_ids = []
-
     current_highway = highway_offset
-    spatial_dim_capacity = max_dims - 1
 
-    for i, span in enumerate(spans):
-        # Flattened length
-        if span.type == 'text':
-            num_tokens = span.shape[0]
+    for span in spans:
+        num_tokens = span.shape[0] if span.type == 'text' else math.prod(span.shape)
+
+        # Check if we can reuse cached topology
+        # Cache is valid if: same highway offset AND same device/dtype
+        if (span.cached_topo is not None and
+            span.topo_highway_offset == current_highway and
+            span.cached_topo.device == device and
+            span.cached_topo.dtype == dtype):
+            topo = span.cached_topo
         else:
-            num_tokens = math.prod(span.shape) # e.g. H*W
+            # Compute fresh
+            topo = _compute_span_topology(span, current_highway, max_dims, device, dtype)
+            # Cache it
+            span.cached_topo = topo
+            span.topo_highway_offset = current_highway
 
-        # 1. Highway (Shared Global Time)
-        h_range = torch.arange(current_highway, current_highway + num_tokens, device=device, dtype=dtype)
-        highway_idx.append(h_range)
+        topo_chunks.append(topo)
+        doc_ids.append(torch.full((num_tokens,), span.doc_id, device=device, dtype=torch.int32))
         current_highway += num_tokens
 
-        # 2. Manifold (Spatial)
-        if span.type == 'text':
-            # Text exists at the "singularity" (0,0) of the spatial manifold
-            coords = torch.zeros((num_tokens, spatial_dim_capacity), device=device, dtype=dtype)
-        else:
-            # Latents exist on a grid
-            dims = [torch.arange(d, device=device, dtype=dtype) for d in span.shape]
-            mesh = torch.meshgrid(*dims, indexing='ij')
-            coords = torch.stack([m.flatten() for m in mesh], dim=-1)
-
-            # Pad spatial dims if needed (e.g., 2D grid in 3D manifold)
-            curr_dim = coords.shape[-1]
-            if curr_dim < spatial_dim_capacity:
-                padding = torch.zeros((num_tokens, spatial_dim_capacity - curr_dim), device=device, dtype=dtype)
-                coords = torch.cat([coords, padding], dim=-1)
-
-        manifold_coords.append(coords)
-        doc_ids.append(torch.full((num_tokens,), span.doc_id, device=device, dtype=torch.int32))
-
-    # Stack - dtype already correct, no .float() needed
-    flat_highway = torch.cat(highway_idx).unsqueeze(-1)
-    flat_manifold = torch.cat(manifold_coords)
-    topo_embeds = torch.cat([flat_highway, flat_manifold], dim=-1)
+    topo_embeds = torch.cat(topo_chunks, dim=0)
     flat_doc_ids = torch.cat(doc_ids)
 
     return topo_embeds, flat_doc_ids
