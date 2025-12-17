@@ -755,6 +755,8 @@ def sample_viz_causal_sweep(components, iterator, config, logger):
             # Clone GT for comparison
             gt_content = gt_target.content.clone()
             gt_shape = gt_target.shape_meta
+            # Save clean context latents BEFORE noise injection (for MSE comparison)
+            ctx_latents_gt = [lat.content.clone() for lat in context_latents]
  
             # --- 5. Setup context with noise injection ---
             ctx = MultiTurnContext(prefix_blocks)
@@ -810,7 +812,8 @@ def sample_viz_causal_sweep(components, iterator, config, logger):
                 'snr': current_snr,
                 'gt': gt_content,
                 'pred': pred_content,
-                'ctx_latents': ctx_latent_contents,
+                'ctx_latents': ctx_latent_contents,      # Noisy versions (what model sees)
+                'ctx_latents_gt': ctx_latents_gt,        # Clean versions (for MSE baseline)
                 'shape': gt_shape,
                 'seq_idx': seq_idx
             })

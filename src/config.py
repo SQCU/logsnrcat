@@ -285,6 +285,7 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
                 eval_data = load_eval_config(p)
                 queries = eval_data.get('queries', [])
                 if queries:
+                    print(f"  Loaded {len(queries)} eval queries from {p.name}")
                     base_data['sampling']['queries'].extend(queries)
             else:
                 print(f"⚠️ Warning: Eval config not found: {p}")

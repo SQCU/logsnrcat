@@ -330,6 +330,9 @@ def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_ma
 def plot_causal_sweep_v2(results: list, output_path, split_name: str):
     """
     Visualizes Causal Sweep with explicit metadata - no tensor shape inference.
+    Layout per sequence:
+        Row 1: [Context frames (noisy)] [Prediction] [GT]
+        Row 2: [MSE: noisy vs clean]    [MSE: pred vs GT] (GT col omitted)
  
     Args:
         results: List of dicts, each containing:
@@ -337,6 +340,7 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
             - 'gt': Tensor [C,H,W], ground truth target
             - 'pred': Tensor [C,H,W], predicted target
             - 'ctx_latents': List[Tensor], context latent frames (noisy)
+            - 'ctx_latents_gt': List[Tensor], context latent frames (clean, for MSE baseline)
             - 'shape': tuple, the expected shape
             - 'seq_idx': int, sequence index
         output_path: Path to save the figure
@@ -366,9 +370,8 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
     def resize_for_comparison(img, target_shape):
         """Resize image if needed for MSE comparison."""
         if img.shape[:2] != target_shape[:2]:
-            # Use simple resize via numpy/torch
             import torch.nn.functional as F
-            t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+            t = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0)
             t = F.interpolate(t, size=target_shape[:2], mode='bilinear', align_corners=False)
             return t.squeeze(0).permute(1, 2, 0).numpy()
         return img
@@ -378,21 +381,37 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
         gt = r['gt']
         pred = r['pred']
         ctx_latents = r['ctx_latents']
+        ctx_latents_gt = r.get('ctx_latents_gt', [])  # Clean versions for MSE baseline
  
         row_img = i * 2
         row_err = i * 2 + 1
  
-        # --- Plot context frames ---
+        gt_np = to_img(gt)
+ 
+        # --- Plot context frames and their MSE vs clean ---
         for j, ctx_t in enumerate(ctx_latents):
             ax = axes[row_img, j]
-            ax.imshow(to_img(ctx_t))
+            ctx_np = to_img(ctx_t)
+            ax.imshow(ctx_np)
             ax.axis('off')
             if i == 0 and j == 0:
                 ax.set_title("Context", fontsize=9)
  
-            # Error row: context vs context (self, just show placeholder)
+            # MSE: noisy context vs clean context (shows noise baseline)
             ax_err = axes[row_err, j]
-            ax_err.imshow(np.zeros((8, 8)), cmap='inferno', vmin=0, vmax=0.1)
+            if j < len(ctx_latents_gt):
+                ctx_gt_np = to_img(ctx_latents_gt[j])
+                # Resize noisy to match GT resolution if needed
+                if ctx_np.shape != ctx_gt_np.shape:
+                    ctx_np_resized = resize_for_comparison(ctx_np, ctx_gt_np.shape)
+                    diff = (ctx_np_resized - ctx_gt_np) ** 2
+                else:
+                    diff = (ctx_np - ctx_gt_np) ** 2
+                mse_map = diff.mean(axis=2)
+                ax_err.imshow(mse_map, cmap='inferno', vmin=0, vmax=0.1)
+            else:
+                # Fallback if no GT available
+                ax_err.imshow(np.zeros((8, 8)), cmap='inferno', vmin=0, vmax=0.1)
             ax_err.axis('off')
  
         # Blank out unused context columns
@@ -412,7 +431,6 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
         # --- Plot GT ---
         gt_col = max_ctx + 1
         ax_gt = axes[row_img, gt_col]
-        gt_np = to_img(gt)
         ax_gt.imshow(gt_np)
         ax_gt.axis('off')
         if i == 0:
@@ -425,12 +443,9 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
             va='center', ha='right', fontsize=8, rotation=90
         )
  
-        # --- Error map: pred vs GT ---
+        # --- Error map: pred vs GT (with resizing for resolution mismatch) ---
         ax_err_pred = axes[row_err, pred_col]
- 
-        # Handle potential shape mismatch explicitly
         if pred_np.shape != gt_np.shape:
-            # Resize pred to match GT for comparison
             pred_np_resized = resize_for_comparison(pred_np, gt_np.shape)
             diff = (pred_np_resized - gt_np) ** 2
         else:
@@ -442,12 +457,8 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
         if i == 0:
             ax_err_pred.set_title("MSE", fontsize=9)
  
-        # GT error (vs self = 0)
+        # GT column: no MSE (would be zeros, meaningless)
         ax_err_gt = axes[row_err, gt_col]
-        ax_err_gt.imshow(np.zeros_like(mse_map), cmap='inferno', vmin=0, vmax=0.1)
-        ax_err_gt.axis('off')
- 
-    plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"    Saved: {output_path}")
