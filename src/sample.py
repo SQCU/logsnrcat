@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 from .model import ContextBlock
 from .utils import (
     logsnr_to_alpha_sigma,
-    run_model_forward
+    run_model_forward,
+    run_model_forward_sampling
 )
 
 def euler_forward_step(x0, logsnr, noise=None):
@@ -214,6 +215,12 @@ class MultiTurnContext:
     """
     The Single Source of Truth for the simulation state.
     Wraps the list of ContextBlocks and handles updates.
+
+    Embedding Cache Management:
+        - Blocks track their own cached embeddings
+        - update_content() invalidates the block's embedding cache
+        - update_metadata() (logsnr only) also invalidates for latents
+        - append_span() adds new blocks without embeddings
     """
     def __init__(self, initial_blocks: List[ContextBlock]):
         # Deep copy to ensure we don't mutate the original dataset lists
@@ -226,23 +233,38 @@ class MultiTurnContext:
                 logsnr=b.logsnr.clone() if b.logsnr is not None else None,
                 group_id=b.group_id,
                 id=b.id,
-                source=b.source
+                source=b.source,
+                # Don't copy cached embeddings - they'll be computed fresh
+                cached_embedding=None,
+                embedding_content_hash=None
             ) for b in initial_blocks
         ]
 
     def update_content(self, idx: int, new_content: torch.Tensor):
+        """Update content and invalidate cached embedding."""
         if not isinstance(new_content, torch.Tensor):
             raise TypeError(f"Content update must be Tensor, got {type(new_content)}")
         self.blocks[idx].content = new_content
-        
+        # Content changed - embedding is now invalid
+        self.blocks[idx].invalidate_embedding()
+
     def update_metadata(self, idx: int, new_logsnr: torch.Tensor):
+        """Update logsnr and invalidate cached embedding for latents."""
         self.blocks[idx].logsnr = new_logsnr
+        # For latents, logsnr is part of the embedding input
+        if self.blocks[idx].type == 'latent':
+            self.blocks[idx].invalidate_embedding()
 
     def append_span(self, span: ContextBlock):
+        """Append a new span (embeddings will be computed on next forward)."""
         self.blocks.append(span)
-    
+
     def get_spans(self) -> List[ContextBlock]:
         return self.blocks
+
+    def get_active_indices(self) -> List[int]:
+        """Return indices of blocks that need unembedding (typically latents being sampled)."""
+        return [i for i, b in enumerate(self.blocks) if b.type == 'latent']
 
 
 @torch.no_grad()
@@ -256,53 +278,61 @@ def taufield_spatial_sampling(
     Executes a spatial sampling job.
     Driven by the Tau Field (Schedule) and explicit Targets.
     Does NOT invent noise. Does NOT guess targets.
+
+    Optimizations:
+    - Uses incremental embedding (cached embeddings for unchanged blocks)
+    - Selective unembedding (only decode target latents, not text/stable blocks)
     """
     if not targets:
         return # Nothing to do
-        
+
     steps = sampling_config.get('steps', 50)
-    device = context.blocks[targets[0]['idx']].content.device # Assume consistent device
-    
+    device = context.blocks[targets[0]['idx']].content.device
+
+    # Indices we need to unembed (just the target latents)
+    unembed_indices = [tgt['idx'] for tgt in targets]
+
     # 1. Construct the Field
-    # This defines the integration path length for every point in every target
     tau_field = construct_tau_field(targets, steps, device)
-    
+
     # 2. Integration Loop
     for step_idx, step_schedule in enumerate(tau_field):
-        
+
         # A. Sync Context Metadata
-        # We must update the context blocks so the model sees the correct 'Time' (LogSNR)
+        # update_metadata invalidates embedding cache for affected blocks
         for i, (l_curr, _) in enumerate(step_schedule):
             tgt_idx = targets[i]['idx']
             context.update_metadata(tgt_idx, l_curr)
-            
+
         # B. Observation (Model Forward)
+        # Uses incremental embedding - only re-embeds blocks whose content/logsnr changed
+        # Only unembeds the target latents (not text prefixes etc)
         current_blocks = context.get_spans()
-        decoded_outputs, _ = run_model_forward(components, current_blocks)
-        
+        _, decoded_outputs, _, num_recomputed = run_model_forward_sampling(
+            components, current_blocks, unembed_indices=unembed_indices
+        )
+
         # C. Integration (Step)
         for i, (l_curr, l_next) in enumerate(step_schedule):
             tgt_idx = targets[i]['idx']
-            
-            # Extract Velocity
+
+            # Extract Velocity from decoded outputs
             output_dict = decoded_outputs[tgt_idx]
-            if 'image_vpreds' not in output_dict:
+            if output_dict is None or 'image_vpreds' not in output_dict:
                 raise RuntimeError(f"Model did not return v-predictions for latent target at index {tgt_idx}.")
-            
+
             v_pred = output_dict['image_vpreds']
-            
+
             # Extract Current State
             z_curr = context.blocks[tgt_idx].content
-            
+
             # Pure Functional Step
             z_next = spatial_euler_step(z_curr, v_pred, l_curr, l_next)
-            
-            # Mutate State
+
+            # Mutate State (this invalidates embedding for this block)
             context.update_content(tgt_idx, z_next)
 
     # 3. Finalize
-    # Set final metadata to the target clean state (usually high logSNR)
-    # This is important if this context is reused in a subsequent turn.
     for tgt in targets:
         context.update_metadata(tgt['idx'], tgt['end_map'])
 
@@ -317,26 +347,35 @@ def discrete_logit_sampling(
     """
     Autoregressive Text Sampling.
     Grows text spans token-by-token using the model's text head.
+
+    Optimizations:
+    - Uses incremental embedding (caches embeddings for unchanged blocks)
+    - Selective unembedding (only decode target text spans)
     """
-    if not targets: 
+    if not targets:
         return
 
     max_new_tokens = sampling_config.get('max_new_tokens', 128)
     eos_token_id = sampling_config.get('eos_token_id', None)
-    
+
+    # Indices we need to unembed (just the target text spans)
+    unembed_indices = [tgt['idx'] for tgt in targets]
+
     # Track completion status for batch generation
     is_finished = {tgt['idx']: False for tgt in targets}
-    
+
     for _ in range(max_new_tokens):
         # 1. Early Exit
         if all(is_finished.values()):
             break
-            
-        # 2. Observe (Full Forward Pass)
-        # Note: Without KV caching, this is O(L^2) per token. 
-        # Correctness first, optimization (KV Cache) later.
+
+        # 2. Observe (Optimized Forward Pass)
+        # Uses incremental embedding - only re-embeds blocks whose content changed
+        # Only unembeds the target text spans (not latent prefixes etc)
         current_blocks = context.get_spans()
-        decoded_outputs, _ = run_model_forward(components, current_blocks)
+        _, decoded_outputs, _, _ = run_model_forward_sampling(
+            components, current_blocks, unembed_indices=unembed_indices
+        )
         
         # 3. Sample & Mutate
         for tgt in targets:

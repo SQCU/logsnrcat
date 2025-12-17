@@ -444,41 +444,65 @@ def get_image_spans(resolution):
 # ==============================================================================
 
 # Import necessary helpers from model.py
-# (Assuming ContextBlock and Span are defined in model.py based on previous patches)
 from .model import (
-    render_topology_embeddings, 
-    build_dual_masks, 
-    ContextBlock, 
+    render_topology_embeddings,
+    build_dual_masks,
+    ContextBlock,
     Span
 )
-def run_model_forward(components, blocks: List[ContextBlock]):
-    """
-    Unified forward pass.
-    The 'blocks' contain the Tensors (z_t) and the Metadata (logsnr, shape, id).
-    """
-    model, span_embedder, span_unembedder, page_table = components
-    device = model.text_embed.weight.device
-    dtype = model.text_embed.weight.dtype  # Single source of truth for dtype
 
-    # 1. Embed (Pass blocks directly)
-    z_flat, span_objects, _ = span_embedder.embed(blocks)
 
-    # 2. Topology (dtype inferred from model)
-    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
-    
-    # 3. Masking
+# =============================================================================
+# Factored Forward Pass (Embedding-Aware)
+# =============================================================================
+
+def run_forward_from_embeddings(
+    model,
+    z_flat: torch.Tensor,
+    topo_embeds: torch.Tensor,
+    span_objects: List[Span],
+    page_table,
+    unembed_fn=None,
+    unembed_indices: Optional[List[int]] = None
+):
+    """
+    Pure transformer forward from pre-computed embeddings.
+
+    This is the core forward pass - no embedding, just:
+    1. Build masks
+    2. Run transformer
+    3. Optionally unembed specific spans
+
+    Args:
+        model: The transformer model (ZC variant)
+        z_flat: Pre-computed embeddings [L_total, D]
+        topo_embeds: Topology embeddings [L_total, topo_dim]
+        span_objects: List of Span metadata
+        page_table: PageTable for masking
+        unembed_fn: Optional unembedding function (span_unembedder.decode)
+        unembed_indices: Which spans to unembed (None = all, [] = none)
+
+    Returns:
+        z_out: Transformer output [L_total, D]
+        decoded: Unembedded outputs (or None if unembed_fn not provided)
+        aux_loss: MoE auxiliary loss
+    """
+    device = z_flat.device
+    dtype = z_flat.dtype
+
+    # Build masks
     L_total = z_flat.shape[0]
     block_size = page_table.block_size
     num_blocks = (L_total + block_size - 1) // block_size
     flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
-    
+
     block_masks = build_dual_masks(
         span_objects, topo_embeds, topo_embeds,
         page_table, flat_page_table, None,
         window_size=getattr(model, 'window_size', 10.0)
     )
-    
-    # 4. Transformer
+
+    # Transformer forward
     rope_scale = max(1.0, L_total / 64.0)
     z_out, aux_loss = model(
         z_flat.unsqueeze(0),
@@ -487,10 +511,105 @@ def run_model_forward(components, blocks: List[ContextBlock]):
         block_masks=block_masks,
         scale=rope_scale
     )
-    
-    # 5. Unembed
-    decoded = span_unembedder.decode(z_out.squeeze(0), span_objects)
+    z_out = z_out.squeeze(0)
+
+    # Selective unembedding
+    decoded = None
+    if unembed_fn is not None:
+        if unembed_indices is None:
+            # Unembed all spans
+            decoded = unembed_fn(z_out, span_objects)
+        elif len(unembed_indices) > 0:
+            # Unembed only specified spans
+            selected_spans = [span_objects[i] for i in unembed_indices]
+            decoded = unembed_fn(z_out, selected_spans)
+            # Map back to full list with None placeholders
+            full_decoded = [None] * len(span_objects)
+            for i, idx in enumerate(unembed_indices):
+                full_decoded[idx] = decoded[i]
+            decoded = full_decoded
+        # else: unembed_indices is empty list, skip unembedding
+
+    return z_out, decoded, aux_loss
+
+
+def run_model_forward(components, blocks: List[ContextBlock], incremental: bool = False):
+    """
+    Unified forward pass for ZC model.
+
+    Args:
+        components: (model, span_embedder, span_unembedder, page_table)
+        blocks: List of ContextBlocks
+        incremental: If True, use cached embeddings where valid (for sampling)
+                    If False, always embed fresh (for training)
+
+    Returns:
+        decoded: Unembedded outputs per span
+        aux_loss: MoE auxiliary loss
+    """
+    model, span_embedder, span_unembedder, page_table = components
+    device = model.text_embed.weight.device
+    dtype = model.text_embed.weight.dtype
+
+    # Embedding phase
+    if incremental:
+        z_flat, span_objects, _, num_recomputed = span_embedder.embed_incremental(blocks)
+    else:
+        z_flat, span_objects, _ = span_embedder.embed(blocks)
+
+    # Topology
+    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
+
+    # Forward + unembed all
+    _, decoded, aux_loss = run_forward_from_embeddings(
+        model, z_flat, topo_embeds, span_objects, page_table,
+        unembed_fn=span_unembedder.decode,
+        unembed_indices=None  # Unembed all
+    )
+
     return decoded, aux_loss
+
+
+def run_model_forward_sampling(
+    components,
+    blocks: List[ContextBlock],
+    unembed_indices: Optional[List[int]] = None
+):
+    """
+    Optimized forward pass for sampling.
+
+    Uses incremental embedding and selective unembedding.
+
+    Args:
+        components: (model, span_embedder, span_unembedder, page_table)
+        blocks: List of ContextBlocks (with cached embeddings)
+        unembed_indices: Which spans need unembedding (typically just active latents)
+                        None = all, [] = none (just want z_out)
+
+    Returns:
+        z_out: Transformer output [L_total, D]
+        decoded: Unembedded outputs (only for specified indices)
+        aux_loss: MoE auxiliary loss
+        num_recomputed: How many blocks were re-embedded (for diagnostics)
+    """
+    model, span_embedder, span_unembedder, page_table = components
+    device = model.text_embed.weight.device
+    dtype = model.text_embed.weight.dtype
+
+    # Incremental embedding - reuse cached where valid
+    z_flat, span_objects, _, num_recomputed = span_embedder.embed_incremental(blocks)
+
+    # Topology (TODO: also cache this)
+    topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
+
+    # Forward with selective unembedding
+    z_out, decoded, aux_loss = run_forward_from_embeddings(
+        model, z_flat, topo_embeds, span_objects, page_table,
+        unembed_fn=span_unembedder.decode,
+        unembed_indices=unembed_indices
+    )
+
+    return z_out, decoded, aux_loss, num_recomputed
 
 
 def predict_velocity_from_blocks(components, blocks: List[ContextBlock], mode='naive'):
@@ -629,27 +748,36 @@ def run_model_forward_kvc(
     """
     KVC-aware forward pass supporting true concatenative AR.
 
+    Uses incremental embedding to avoid re-embedding unchanged blocks.
+
     Args:
         components_kvc: Tuple of (model_kvc, span_embedder, span_unembedder, page_table, kvt_manager)
-        blocks: List of ContextBlocks (full context)
+        blocks: List of ContextBlocks (full context, with embedding caches)
         session_state: KVCSessionState tracking cache state
         mode: 'prefill' (first call), 'update' (inner loop), or 'extend' (outer AR loop)
 
     Returns:
         decoded: List of decoded outputs per span
         aux_loss: Auxiliary loss from MoE routing
+        num_recomputed: Number of blocks that were re-embedded (for diagnostics)
 
     The key insight:
     - prefill: Process ALL tokens, cache ALL K/V
     - update: Process ACTIVE tokens only, update their K/V in cache, attend to FULL cache
     - extend: Process NEW tokens only, extend cache, attend to FULL cache
+
+    Embedding optimization:
+    - Uses embed_incremental() - only re-embeds blocks whose content/logsnr changed
+    - ContextBlocks cache their embeddings between calls
+    - In 'update' mode, typically only the active latent needs re-embedding
     """
     model, span_embedder, span_unembedder, page_table, kvt_manager = components_kvc
     device = model.text_embed.weight.device
     dtype = model.text_embed.weight.dtype
 
-    # 1. Embed ALL blocks to get full context info
-    z_flat, span_objects, content_hashes = span_embedder.embed(blocks)
+    # 1. Incremental embedding - reuse cached embeddings where valid
+    # This is THE key optimization - avoid re-embedding unchanged blocks
+    z_flat, span_objects, content_hashes, num_recomputed = span_embedder.embed_incremental(blocks)
     L_total = z_flat.shape[0]
 
     # 2. Topology for full context
@@ -757,6 +885,6 @@ def run_model_forward_kvc(
     # 3. Decode outputs
     decoded = span_unembedder.decode(z_out.squeeze(0), span_objects)
 
-    return decoded, aux_loss
+    return decoded, aux_loss, num_recomputed
 
 

@@ -275,6 +275,7 @@ class ConcatARResult:
     vram_peak_mb: float
     avg_ms_per_forward: float
     tokens_computed_total: int  # For efficiency calculation
+    blocks_reembedded: int = 0  # How many blocks were actually re-embedded (KVC diagnostic)
 
 
 def benchmark_concat_ar_zc(
@@ -536,6 +537,7 @@ def benchmark_concat_ar_kvc(
 
     total_forwards = 0
     tokens_computed = 0  # Track how many tokens we actually computed (vs cached)
+    total_blocks_reembedded = 0  # Track embedding cache efficiency
 
     # Create session state for tracking cache
     session = KVCSessionState(kvt_manager, req_id=warmup_runs)
@@ -564,28 +566,32 @@ def benchmark_concat_ar_kvc(
                 logsnr_schedule[step].item(),
                 device=device, dtype=dtype
             )
+            # Invalidate embedding cache after logsnr change
+            blocks[-1].invalidate_embedding()
 
             if lat_idx == 0 and step == 0:
                 # First call ever: PREFILL mode
-                decoded, _ = run_model_forward_kvc(
+                decoded, _, num_recomputed = run_model_forward_kvc(
                     components_kvc, blocks, session, mode='prefill'
                 )
                 current_tokens = num_text + latent_tokens_per_span
                 tokens_computed += current_tokens
             else:
                 # Subsequent calls: UPDATE mode (only active latent)
-                decoded, _ = run_model_forward_kvc(
+                decoded, _, num_recomputed = run_model_forward_kvc(
                     components_kvc, blocks, session, mode='update'
                 )
                 # Only the active latent tokens are recomputed
                 tokens_computed += latent_tokens_per_span
 
             total_forwards += 1
+            total_blocks_reembedded += num_recomputed
 
-            # Euler step
+            # Euler step (updates content, which will invalidate embedding)
             if decoded and 'image_vpreds' in decoded[-1]:
                 v_pred = decoded[-1]['image_vpreds']
                 blocks[-1].content = blocks[-1].content + 0.1 * v_pred
+                blocks[-1].invalidate_embedding()  # Content changed
 
     torch.cuda.synchronize()
     total_time = (time.perf_counter() - start_time) * 1000
@@ -607,7 +613,8 @@ def benchmark_concat_ar_kvc(
         prefix_tokens=num_text,
         vram_peak_mb=mem['max_allocated'],
         avg_ms_per_forward=total_time / total_forwards,
-        tokens_computed_total=tokens_computed
+        tokens_computed_total=tokens_computed,
+        blocks_reembedded=total_blocks_reembedded
     )
 
 
@@ -639,9 +646,18 @@ def print_concat_ar_results(zc: ConcatARResult, kvc: ConcatARResult):
           f"{kvc.tokens_computed_total:<20} "
           f"{(1 - kvc.tokens_computed_total/zc.tokens_computed_total)*100:.1f}% saved")
 
+    if hasattr(kvc, 'blocks_reembedded') and kvc.blocks_reembedded > 0:
+        total_possible = kvc.total_forward_passes * (1 + kvc.num_outer_steps)  # text + latents per step
+        print(f"{'Blocks re-embedded':<35} {'-':<20} "
+              f"{kvc.blocks_reembedded:<20} "
+              f"({100*kvc.blocks_reembedded/max(total_possible, 1):.1f}% of naive)")
+
     print("=" * 90)
     print(f"\nKVC Efficiency: Computed {kvc.tokens_computed_total} tokens vs "
           f"ZC's {zc.tokens_computed_total} ({100*kvc.tokens_computed_total/zc.tokens_computed_total:.1f}%)")
+    if hasattr(kvc, 'blocks_reembedded') and kvc.blocks_reembedded > 0:
+        print(f"  Embedding cache: Only {kvc.blocks_reembedded} block re-embeddings "
+              f"(text prefix cached across all steps)")
     print("  - Prefix tokens cached and reused across all forward passes")
     print("  - Only active latent recomputed during inner diffusion loop")
 

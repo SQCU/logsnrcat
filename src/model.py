@@ -592,10 +592,17 @@ class ContextBlock:
     """
     Canonical atomic unit of the dataset.
     Holds raw data and its topological metadata.
- 
+
     shape_meta: For latents, this is (H, W) - the spatial dimensions of content.
                 For text, this is (seq_len,) - the token count.
                 Must broadcast correctly with content for logsnr map operations.
+
+    Embedding Cache:
+        cached_embedding: Pre-computed embedding for this block
+        embedding_content_hash: Hash of content when embedding was computed
+
+    The cache is valid when embedding_content_hash matches current content hash.
+    This enables incremental embedding - only re-embed blocks whose content changed.
     """
     content: Union[torch.Tensor, str] # [C, H, W] for latent or [L] for text tokens
     type: str = 'latent'
@@ -606,7 +613,10 @@ class ContextBlock:
     group_id: int = 0
     id: str = ""
     source: str = "unknown"
- 
+    # Embedding cache
+    cached_embedding: Optional[torch.Tensor] = field(default=None, repr=False)
+    embedding_content_hash: Optional[int] = None
+
     def __post_init__(self):
         # Derive shape_meta from content if not explicitly set
         # This is a fallback - prefer explicit setting in iterators
@@ -620,6 +630,16 @@ class ContextBlock:
             elif self.type == 'text':
                 # shape_meta = (seq_len,) for text tokens
                 self.shape_meta = (self.content.shape[0],)
+
+    def invalidate_embedding(self):
+        """Mark embedding as stale. Call after modifying content."""
+        self.cached_embedding = None
+        self.embedding_content_hash = None
+
+    def has_valid_embedding(self, current_hash: int) -> bool:
+        """Check if cached embedding matches current content."""
+        return (self.cached_embedding is not None and
+                self.embedding_content_hash == current_hash)
 
 @dataclass
 class Span:
@@ -637,53 +657,126 @@ class SpanEmbedder:
     def __init__(self, text_embedder, patch_embedder):
         self.text_emb = text_embedder
         self.patch_emb = patch_embedder
-        
+
+    def _embed_single_block(self, block: ContextBlock) -> Tuple[torch.Tensor, Tuple[int, ...], Optional[Tuple[int, ...]], dict]:
+        """Embed a single block, returning (embedding, shape, original_shape, hash_info)."""
+        original_shape = None
+
+        if block.type == 'text':
+            tokens = block.content
+            if isinstance(tokens, str):
+                raise ValueError("SpanEmbedder expects tokenized text tensors, not strings.")
+            emb = self.text_emb(tokens)
+            actual_shape = (tokens.shape[0],)
+            hash_info = {'type': 'text', 'shape': actual_shape, 'data': tokens.cpu().tolist()}
+
+        elif block.type == 'latent':
+            img = block.content
+            logsnr = block.logsnr
+            original_shape = img.shape[-2:]
+            emb, grid_shape = self.patch_emb(img, logsnr)
+            actual_shape = grid_shape
+            hash_info = {'type': 'latent', 'shape': grid_shape, 'id': block.id}
+
+        else:
+            raise ValueError(f"Unknown block type: {block.type}")
+
+        return emb, actual_shape, original_shape, hash_info
+
     def embed(self, context_blocks: List[ContextBlock]) -> Tuple[torch.Tensor, List[Span], List[int]]:
+        """
+        Original embed - always computes fresh embeddings.
+        Use for training where we need gradients through embedding.
+        """
         all_embeds = []
         span_objects = []
         cursor = 0
-        
         hash_spans = []
 
         for block in context_blocks:
-            original_shape = None
-            
-            if block.type == 'text':
-                tokens = block.content
-                if isinstance(tokens, str): raise ValueError("SpanEmbedder expects tokenized text tensors, not strings.")
-                
-                emb = self.text_emb(tokens)
-                span_len = tokens.shape[0]
-                actual_shape = (span_len,)
-                hash_spans.append({'type': 'text', 'shape': actual_shape, 'data': tokens.cpu().tolist()})
-                
-            elif block.type == 'latent':
-                img = block.content
-                logsnr = block.logsnr
-                
-                # CAPTURE ORIGINAL SHAPE
-                original_shape = img.shape[-2:]
-                
-                # Direct 3D Tensor processing
-                emb, grid_shape = self.patch_emb(img, logsnr)
-                span_len = emb.shape[0]
-                actual_shape = grid_shape
-                hash_spans.append({'type': 'latent', 'shape': grid_shape, 'id': block.id})
-            
+            emb, actual_shape, original_shape, hash_info = self._embed_single_block(block)
+            hash_spans.append(hash_info)
+
             all_embeds.append(emb)
             span_objects.append(Span(
                 type=block.type,
                 start_idx=cursor,
-                end_idx=cursor + span_len,
+                end_idx=cursor + emb.shape[0],
                 shape=actual_shape,
                 causal=block.causal,
                 doc_id=block.group_id,
-                original_shape=original_shape # PERSIST IT
+                original_shape=original_shape
             ))
-            cursor += span_len
-            
+            cursor += emb.shape[0]
+
         content_hashes = generate_content_hash_stream(hash_spans)
         return torch.cat(all_embeds, dim=0), span_objects, content_hashes
+
+    def embed_incremental(self, context_blocks: List[ContextBlock]) -> Tuple[torch.Tensor, List[Span], List[int], int]:
+        """
+        Incremental embed - reuses cached embeddings when valid.
+        Use for inference/sampling where we want to avoid redundant computation.
+
+        Returns:
+            z_flat: Concatenated embeddings [L_total, D]
+            span_objects: List of Span metadata
+            content_hashes: Per-token content hashes
+            num_recomputed: How many blocks were actually re-embedded (for diagnostics)
+        """
+        all_embeds = []
+        span_objects = []
+        cursor = 0
+        hash_spans = []
+        num_recomputed = 0
+
+        for block in context_blocks:
+            # Build hash info to check validity
+            if block.type == 'text':
+                hash_info = {'type': 'text', 'shape': (block.content.shape[0],),
+                             'data': block.content.cpu().tolist()}
+            else:
+                grid_h = (block.content.shape[-2] + 1) // 2  # Approximate grid shape
+                grid_w = (block.content.shape[-1] + 1) // 2
+                hash_info = {'type': 'latent', 'shape': (grid_h, grid_w), 'id': block.id}
+
+            # Compute current content hash for this block
+            current_hash = generate_content_hash_stream([hash_info])[0] if hash_info['type'] == 'text' else hash(block.id + str(hash_info['shape']))
+
+            # Check if cached embedding is valid
+            if block.has_valid_embedding(current_hash):
+                # Reuse cached embedding
+                emb = block.cached_embedding
+                if block.type == 'text':
+                    actual_shape = (emb.shape[0],)
+                    original_shape = None
+                else:
+                    # For latents, we need to recover shape from cached data
+                    actual_shape = hash_info['shape']
+                    original_shape = block.content.shape[-2:]
+            else:
+                # Compute fresh embedding
+                emb, actual_shape, original_shape, hash_info = self._embed_single_block(block)
+
+                # Cache the embedding
+                block.cached_embedding = emb.detach()  # Detach to avoid holding graph
+                block.embedding_content_hash = current_hash
+                num_recomputed += 1
+
+            hash_spans.append(hash_info)
+            all_embeds.append(emb)
+            span_objects.append(Span(
+                type=block.type,
+                start_idx=cursor,
+                end_idx=cursor + emb.shape[0],
+                shape=actual_shape,
+                causal=block.causal,
+                doc_id=block.group_id,
+                original_shape=original_shape
+            ))
+            cursor += emb.shape[0]
+
+        content_hashes = generate_content_hash_stream(hash_spans)
+        return torch.cat(all_embeds, dim=0), span_objects, content_hashes, num_recomputed
 
 class SpanUnembedder:
     def __init__(self, text_head, patch_unembedder):
