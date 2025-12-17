@@ -258,37 +258,48 @@ class BenchmarkResult:
     num_tokens: int
 
 
+# =============================================================================
+# Concatenative AR Benchmarks (True Multi-Span Growing Context)
+# =============================================================================
+
 @dataclass
-class TrajectoryResult:
-    """Results for multi-step diffusion trajectory benchmarks."""
+class ConcatARResult:
+    """Results for concatenative autoregressive benchmarks."""
     name: str
     total_latency_ms: float
-    per_step_latency_ms: float
-    num_steps: int
-    num_tokens: int
-    prefix_tokens: int
+    num_outer_steps: int        # Number of latents generated
+    num_inner_steps: int        # Diffusion steps per latent
+    total_forward_passes: int   # outer * inner
+    final_context_tokens: int   # Text + all latents
+    prefix_tokens: int          # Text only
     vram_peak_mb: float
-    cache_efficiency: float  # ratio of cached vs recomputed tokens
+    avg_ms_per_forward: float
+    tokens_computed_total: int  # For efficiency calculation
 
 
-# =============================================================================
-# Diffusion Trajectory Benchmarks (Session-Style)
-# =============================================================================
-
-def benchmark_diffusion_trajectory_zc(
+def benchmark_concat_ar_zc(
     cfg: Dict,
     device: torch.device,
     dtype: torch.dtype,
     num_text: int,
     latent_res: int,
-    num_steps: int = 5,
+    num_latents: int = 3,       # Outer AR steps (number of latents to generate)
+    steps_per_latent: int = 5,  # Inner diffusion steps per latent
     warmup_runs: int = 1
-) -> TrajectoryResult:
+) -> ConcatARResult:
     """
-    Simulates a realistic diffusion sampling trajectory with ZC.
+    Concatenative AR benchmark with ZC (baseline).
 
-    Each step recomputes the entire forward pass (prefix + latent).
-    This is the baseline for comparison with KVC.
+    Pattern:
+        for each new latent:  # OUTER LOOP - context GROWS
+            append noisy latent to context
+            for each diffusion step:  # INNER LOOP - refine
+                forward(full_context)  # ZC recomputes everything
+
+    This is the CORRECT test for KV caching benefit:
+    - Context grows: [text] -> [text, lat1] -> [text, lat1, lat2] -> ...
+    - ZC must recompute ALL tokens every time
+    - KVC should cache prefix and only compute new/active tokens
     """
     from src.model import coolerLDTformerZC
 
@@ -316,19 +327,19 @@ def benchmark_diffusion_trajectory_zc(
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
 
     block_size = cfg['page_table']['block_size']
-    latent_tokens = (latent_res // cfg['model']['patch_embedder']['stride'])**2
-    num_tokens = num_text + latent_tokens
-    num_blocks = (num_tokens + block_size - 1) // block_size
+    latent_tokens_per_span = (latent_res // cfg['model']['patch_embedder']['stride'])**2
+    max_tokens = num_text + num_latents * latent_tokens_per_span
+    max_blocks = (max_tokens + block_size - 1) // block_size
 
     page_table = PageTable(
-        num_blocks=max(num_blocks * 2, 8),
+        num_blocks=max(max_blocks * 2, 16),
         block_size=block_size,
         max_batch_size=cfg['page_table']['max_batch_size'],
-        max_logical_blocks=max(num_blocks * 2, 8),
+        max_logical_blocks=max(max_blocks * 2, 16),
         device=device
     )
 
-    # Create context: text prefix + single latent
+    # Start with text prefix only
     text_tokens = torch.randint(0, 1000, (num_text,), device=device)
     text_block = ContextBlock(
         content=text_tokens,
@@ -338,49 +349,66 @@ def benchmark_diffusion_trajectory_zc(
         group_id=0,
         id="text_prefix"
     )
+    blocks = [text_block]
 
-    # Initial noisy latent
-    latent_content = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
-    logsnr = torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype)  # Start noisy
-
-    latent_block = ContextBlock(
-        content=latent_content,
-        type='latent',
-        causal=False,
+    # Warmup with a single latent
+    warmup_latent = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+    warmup_block = ContextBlock(
+        content=warmup_latent, type='latent', causal=False,
         shape_meta=(latent_res, latent_res),
-        logsnr=logsnr,
-        group_id=0,
-        id="diffusion_target"
+        logsnr=torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype),
+        group_id=0, id="warmup"
     )
-
-    # Warmup
-    blocks = [text_block, latent_block]
     for _ in range(warmup_runs):
-        run_zc_forward(model, span_emb, span_unemb, page_table, blocks, with_grad=False)
+        run_zc_forward(model, span_emb, span_unemb, page_table,
+                       [text_block, warmup_block], with_grad=False)
 
-    # Reset and measure trajectory
+    # Reset and measure
     reset_memory_stats()
     torch.cuda.synchronize()
-
-    # Simulate diffusion trajectory: num_steps forward passes
-    # Each step: model predicts v, we update latent, logsnr changes
-    logsnr_schedule = torch.linspace(-4.0, 6.0, num_steps + 1, device=device, dtype=dtype)
-
     start_time = time.perf_counter()
 
-    for step in range(num_steps):
-        # Update logsnr for this step
-        current_logsnr = logsnr_schedule[step].item()
-        latent_block.logsnr = torch.full((1, latent_res, latent_res), current_logsnr, device=device, dtype=dtype)
+    total_forwards = 0
+    tokens_computed = 0
 
-        # Forward pass (ZC recomputes everything)
-        z_out, decoded, _ = run_zc_forward(model, span_emb, span_unemb, page_table, blocks, with_grad=False)
+    # === OUTER LOOP: Generate num_latents sequentially ===
+    for lat_idx in range(num_latents):
+        # Create new noisy latent and APPEND to context (context GROWS)
+        new_latent = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+        new_block = ContextBlock(
+            content=new_latent,
+            type='latent',
+            causal=False,
+            shape_meta=(latent_res, latent_res),
+            logsnr=torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype),
+            group_id=lat_idx + 1,
+            id=f"latent_{lat_idx}"
+        )
+        blocks.append(new_block)
 
-        # Simulate state update (in real sampling, this would be euler step)
-        if 'image_vpreds' in decoded[1]:
-            v_pred = decoded[1]['image_vpreds']
-            # Simplified euler step: z_next = z_curr + dt * v_pred
-            latent_block.content = latent_block.content + 0.1 * v_pred
+        # === INNER LOOP: Diffusion refinement ===
+        logsnr_schedule = torch.linspace(-4.0, 6.0, steps_per_latent + 1, device=device, dtype=dtype)
+
+        for step in range(steps_per_latent):
+            # Update logsnr for current latent
+            current_logsnr = logsnr_schedule[step].item()
+            blocks[-1].logsnr = torch.full(
+                (1, latent_res, latent_res), current_logsnr, device=device, dtype=dtype
+            )
+
+            # ZC forward: recomputes ENTIRE context every time
+            current_token_count = num_text + (lat_idx + 1) * latent_tokens_per_span
+            z_out, decoded, _ = run_zc_forward(
+                model, span_emb, span_unemb, page_table, blocks, with_grad=False
+            )
+
+            total_forwards += 1
+            tokens_computed += current_token_count
+
+            # Euler step (simplified)
+            if 'image_vpreds' in decoded[-1]:
+                v_pred = decoded[-1]['image_vpreds']
+                blocks[-1].content = blocks[-1].content + 0.1 * v_pred
 
     torch.cuda.synchronize()
     total_time = (time.perf_counter() - start_time) * 1000
@@ -391,41 +419,47 @@ def benchmark_diffusion_trajectory_zc(
     del model, span_emb, span_unemb, page_table
     torch.cuda.empty_cache()
 
-    return TrajectoryResult(
-        name="ZC Trajectory",
+    return ConcatARResult(
+        name="ZC Concat-AR",
         total_latency_ms=total_time,
-        per_step_latency_ms=total_time / num_steps,
-        num_steps=num_steps,
-        num_tokens=num_tokens,
+        num_outer_steps=num_latents,
+        num_inner_steps=steps_per_latent,
+        total_forward_passes=total_forwards,
+        final_context_tokens=max_tokens,
         prefix_tokens=num_text,
         vram_peak_mb=mem['max_allocated'],
-        cache_efficiency=0.0  # ZC has no caching benefit
+        avg_ms_per_forward=total_time / total_forwards,
+        tokens_computed_total=tokens_computed
     )
 
 
-def benchmark_diffusion_trajectory_kvc(
+def benchmark_concat_ar_kvc(
     cfg: Dict,
     device: torch.device,
     dtype: torch.dtype,
     num_text: int,
     latent_res: int,
-    num_steps: int = 5,
+    num_latents: int = 3,
+    steps_per_latent: int = 5,
     warmup_runs: int = 1
-) -> TrajectoryResult:
+) -> ConcatARResult:
     """
-    Simulates a realistic diffusion sampling trajectory with KVC.
+    Concatenative AR benchmark with KVC (prefix caching).
 
-    Key optimization: Text prefix is cached, only the latent portion
-    is recomputed at each step (with updated K/V for changed content).
+    Key optimization:
+    - OUTER LOOP: When appending new latent, prefix K/V is cached
+    - INNER LOOP: Update mode - only recompute active latent's K/V
     """
-    # Calculate token counts for allocation
+    from src.utils import KVCSessionState, run_model_forward_kvc
+
     block_size = cfg['page_table']['block_size']
-    latent_tokens = (latent_res // cfg['model']['patch_embedder']['stride'])**2
-    num_tokens = num_text + latent_tokens
-    needed_blocks = (num_tokens + block_size - 1) // block_size
-    max_blocks = max(needed_blocks * 2, 8)
+    latent_tokens_per_span = (latent_res // cfg['model']['patch_embedder']['stride'])**2
+    max_tokens = num_text + num_latents * latent_tokens_per_span
+    max_blocks = (max_tokens + block_size - 1) // block_size
+    alloc_blocks = max(max_blocks * 2, 16)
 
-    print(f"    KVC trajectory: {num_tokens} tokens, {needed_blocks} blocks needed")
+    print(f"    KVC concat-AR: {num_latents} latents x {steps_per_latent} steps, "
+          f"max {max_tokens} tokens")
 
     # Build model
     model = coolerLDTformerKVC(
@@ -451,15 +485,15 @@ def benchmark_diffusion_trajectory_kvc(
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
 
     page_table = PageTable(
-        num_blocks=max_blocks,
+        num_blocks=alloc_blocks,
         block_size=block_size,
         max_batch_size=cfg['page_table']['max_batch_size'],
-        max_logical_blocks=max_blocks,
+        max_logical_blocks=alloc_blocks,
         device=device
     )
 
     kvt_manager = KVTManager(
-        max_blocks=max_blocks,
+        max_blocks=alloc_blocks,
         block_size=block_size,
         kv_dim=cfg['model']['dim'],
         layers=cfg['model']['depth'],
@@ -469,7 +503,9 @@ def benchmark_diffusion_trajectory_kvc(
         dtype=dtype
     )
 
-    # Create context
+    components_kvc = (model, span_emb, span_unemb, page_table, kvt_manager)
+
+    # Start with text prefix
     text_tokens = torch.randint(0, 1000, (num_text,), device=device)
     text_block = ContextBlock(
         content=text_tokens,
@@ -479,103 +515,135 @@ def benchmark_diffusion_trajectory_kvc(
         group_id=0,
         id="text_prefix"
     )
-
-    latent_content = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
-    logsnr = torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype)
-
-    latent_block = ContextBlock(
-        content=latent_content,
-        type='latent',
-        causal=False,
-        shape_meta=(latent_res, latent_res),
-        logsnr=logsnr,
-        group_id=0,
-        id="diffusion_target"
-    )
-
-    blocks = [text_block, latent_block]
+    blocks = [text_block]
 
     # Warmup
+    warmup_latent = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+    warmup_block = ContextBlock(
+        content=warmup_latent, type='latent', causal=False,
+        shape_meta=(latent_res, latent_res),
+        logsnr=torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype),
+        group_id=0, id="warmup"
+    )
     for i in range(warmup_runs):
-        run_kvc_forward(model, span_emb, span_unemb, kvt_manager, page_table, blocks, req_id=i)
+        run_kvc_forward(model, span_emb, span_unemb, kvt_manager, page_table,
+                        [text_block, warmup_block], req_id=i)
 
-    # Reset and measure trajectory
+    # Reset and measure
     reset_memory_stats()
     torch.cuda.synchronize()
-
-    logsnr_schedule = torch.linspace(-4.0, 6.0, num_steps + 1, device=device, dtype=dtype)
-
     start_time = time.perf_counter()
 
-    for step in range(num_steps):
-        req_id = warmup_runs + step
+    total_forwards = 0
+    tokens_computed = 0  # Track how many tokens we actually computed (vs cached)
 
-        # Update logsnr
-        current_logsnr = logsnr_schedule[step].item()
-        latent_block.logsnr = torch.full((1, latent_res, latent_res), current_logsnr, device=device, dtype=dtype)
+    # Create session state for tracking cache
+    session = KVCSessionState(kvt_manager, req_id=warmup_runs)
 
-        # Forward pass with KVC
-        # Note: Current implementation re-allocates each time due to content hash change
-        # TODO: Optimize to only update changed blocks (latent) when prefix hasn't changed
-        z_out, decoded, _ = run_kvc_forward(
-            model, span_emb, span_unemb, kvt_manager, page_table, blocks, req_id=req_id
+    # === OUTER LOOP: Generate latents with growing context ===
+    for lat_idx in range(num_latents):
+        # Create new noisy latent
+        new_latent = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+        new_block = ContextBlock(
+            content=new_latent,
+            type='latent',
+            causal=False,
+            shape_meta=(latent_res, latent_res),
+            logsnr=torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype),
+            group_id=lat_idx + 1,
+            id=f"latent_{lat_idx}"
         )
+        blocks.append(new_block)
 
-        # Simulate state update
-        if 'image_vpreds' in decoded[1]:
-            v_pred = decoded[1]['image_vpreds']
-            latent_block.content = latent_block.content + 0.1 * v_pred
+        # === INNER LOOP: Diffusion refinement ===
+        logsnr_schedule = torch.linspace(-4.0, 6.0, steps_per_latent + 1, device=device, dtype=dtype)
+
+        for step in range(steps_per_latent):
+            blocks[-1].logsnr = torch.full(
+                (1, latent_res, latent_res),
+                logsnr_schedule[step].item(),
+                device=device, dtype=dtype
+            )
+
+            if lat_idx == 0 and step == 0:
+                # First call ever: PREFILL mode
+                decoded, _ = run_model_forward_kvc(
+                    components_kvc, blocks, session, mode='prefill'
+                )
+                current_tokens = num_text + latent_tokens_per_span
+                tokens_computed += current_tokens
+            else:
+                # Subsequent calls: UPDATE mode (only active latent)
+                decoded, _ = run_model_forward_kvc(
+                    components_kvc, blocks, session, mode='update'
+                )
+                # Only the active latent tokens are recomputed
+                tokens_computed += latent_tokens_per_span
+
+            total_forwards += 1
+
+            # Euler step
+            if decoded and 'image_vpreds' in decoded[-1]:
+                v_pred = decoded[-1]['image_vpreds']
+                blocks[-1].content = blocks[-1].content + 0.1 * v_pred
 
     torch.cuda.synchronize()
     total_time = (time.perf_counter() - start_time) * 1000
 
     mem = get_gpu_memory_mb()
 
-    # Calculate cache efficiency: how much of the context was prefix (cacheable)
-    cache_efficiency = num_text / num_tokens
-
     # Cleanup
+    session.cleanup()
     del model, span_emb, span_unemb, page_table, kvt_manager
     torch.cuda.empty_cache()
 
-    return TrajectoryResult(
-        name="KVC Trajectory",
+    return ConcatARResult(
+        name="KVC Concat-AR",
         total_latency_ms=total_time,
-        per_step_latency_ms=total_time / num_steps,
-        num_steps=num_steps,
-        num_tokens=num_tokens,
+        num_outer_steps=num_latents,
+        num_inner_steps=steps_per_latent,
+        total_forward_passes=total_forwards,
+        final_context_tokens=max_tokens,
         prefix_tokens=num_text,
         vram_peak_mb=mem['max_allocated'],
-        cache_efficiency=cache_efficiency
+        avg_ms_per_forward=total_time / total_forwards,
+        tokens_computed_total=tokens_computed
     )
 
 
-def print_trajectory_results(zc_result: TrajectoryResult, kvc_result: TrajectoryResult):
-    """Print trajectory benchmark comparison."""
-    print("\n" + "=" * 80)
-    print("DIFFUSION TRAJECTORY BENCHMARK (Realistic Multi-Step Sampling)")
-    print("=" * 80)
-    print(f"Configuration: {zc_result.num_steps} diffusion steps, "
-          f"{zc_result.prefix_tokens} text tokens, "
-          f"{zc_result.num_tokens - zc_result.prefix_tokens} latent tokens")
-    print("-" * 80)
-    print(f"{'Metric':<30} {'ZC':<20} {'KVC':<20} {'Speedup':<15}")
-    print("-" * 80)
-    print(f"{'Total latency (ms)':<30} {zc_result.total_latency_ms:<20.2f} "
-          f"{kvc_result.total_latency_ms:<20.2f} "
-          f"{zc_result.total_latency_ms/kvc_result.total_latency_ms:.2f}x")
-    print(f"{'Per-step latency (ms)':<30} {zc_result.per_step_latency_ms:<20.2f} "
-          f"{kvc_result.per_step_latency_ms:<20.2f} "
-          f"{zc_result.per_step_latency_ms/kvc_result.per_step_latency_ms:.2f}x")
-    print(f"{'Peak VRAM (MB)':<30} {zc_result.vram_peak_mb:<20.1f} "
-          f"{kvc_result.vram_peak_mb:<20.1f} "
-          f"{(1 - kvc_result.vram_peak_mb/zc_result.vram_peak_mb)*100:.1f}% reduction")
-    print(f"{'Prefix cache ratio':<30} {'N/A':<20} {kvc_result.cache_efficiency*100:.1f}%")
-    print("=" * 80)
-    print("\nNote: Current KVC implementation re-hashes entire context each step.")
-    print("      Optimal implementation would only update changed latent blocks,")
-    print("      giving ~{:.0f}x additional speedup for prefix-heavy contexts.".format(
-        1 / (1 - kvc_result.cache_efficiency) if kvc_result.cache_efficiency < 1 else 1))
+def print_concat_ar_results(zc: ConcatARResult, kvc: ConcatARResult):
+    """Print concatenative AR benchmark comparison."""
+    print("\n" + "=" * 90)
+    print("CONCATENATIVE AUTOREGRESSION BENCHMARK (True Growing Context)")
+    print("=" * 90)
+    print(f"Pattern: [text] -> [text, lat1] -> [text, lat1, lat2] -> ...")
+    print(f"Config: {zc.num_outer_steps} latents × {zc.num_inner_steps} diffusion steps "
+          f"= {zc.total_forward_passes} forward passes")
+    print(f"Context: {zc.prefix_tokens} text + up to {zc.final_context_tokens - zc.prefix_tokens} latent tokens")
+    print("-" * 90)
+    print(f"{'Metric':<35} {'ZC':<20} {'KVC':<20} {'Improvement':<15}")
+    print("-" * 90)
+
+    speedup = zc.total_latency_ms / kvc.total_latency_ms if kvc.total_latency_ms > 0 else 0
+    print(f"{'Total latency (ms)':<35} {zc.total_latency_ms:<20.2f} "
+          f"{kvc.total_latency_ms:<20.2f} {speedup:.2f}x")
+
+    print(f"{'Avg ms/forward':<35} {zc.avg_ms_per_forward:<20.2f} "
+          f"{kvc.avg_ms_per_forward:<20.2f} {zc.avg_ms_per_forward/kvc.avg_ms_per_forward:.2f}x")
+
+    print(f"{'Peak VRAM (MB)':<35} {zc.vram_peak_mb:<20.1f} "
+          f"{kvc.vram_peak_mb:<20.1f} "
+          f"{(1 - kvc.vram_peak_mb/zc.vram_peak_mb)*100:.1f}%")
+
+    print(f"{'Tokens computed':<35} {zc.tokens_computed_total:<20} "
+          f"{kvc.tokens_computed_total:<20} "
+          f"{(1 - kvc.tokens_computed_total/zc.tokens_computed_total)*100:.1f}% saved")
+
+    print("=" * 90)
+    print(f"\nKVC Efficiency: Computed {kvc.tokens_computed_total} tokens vs "
+          f"ZC's {zc.tokens_computed_total} ({100*kvc.tokens_computed_total/zc.tokens_computed_total:.1f}%)")
+    print("  - Prefix tokens cached and reused across all forward passes")
+    print("  - Only active latent recomputed during inner diffusion loop")
 
 
 def benchmark_zc(
@@ -887,9 +955,11 @@ def main():
     parser.add_argument("--output-dir", default="./benchmark_results", help="Output directory")
     parser.add_argument("--plot-only", action="store_true", help="Only plot from existing results.json")
     parser.add_argument("--diffusion-steps", type=int, default=5,
-                        help="Number of diffusion steps for trajectory benchmark (realistic: 5-10)")
+                        help="Number of diffusion steps per latent (realistic: 5-10)")
+    parser.add_argument("--ar-latents", type=int, default=3,
+                        help="Number of latents in concatenative AR test (context grows)")
     parser.add_argument("--skip-trajectory", action="store_true",
-                        help="Skip the multi-step trajectory benchmark")
+                        help="Skip the concatenative AR benchmark")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -976,43 +1046,48 @@ def main():
     print_results_table(results)
 
     # =========================================================================
-    # Trajectory Benchmark (Realistic Multi-Step Diffusion)
+    # Concatenative AR Benchmark (True Growing Context)
     # =========================================================================
     if not args.skip_trajectory:
         print("\n" + "=" * 60)
-        print(f"TRAJECTORY BENCHMARK ({args.diffusion_steps}-step diffusion)")
+        print(f"CONCATENATIVE AR BENCHMARK")
+        print(f"  {args.ar_latents} latents × {args.diffusion_steps} steps/latent")
         print("=" * 60)
 
-        print(f"\n[4/5] Benchmarking ZC trajectory ({args.diffusion_steps} steps)...")
+        print(f"\n[4/5] Benchmarking ZC concat-AR...")
         try:
-            zc_traj = benchmark_diffusion_trajectory_zc(
+            zc_ar = benchmark_concat_ar_zc(
                 cfg, device, dtype, args.num_text, args.latent_res,
-                num_steps=args.diffusion_steps
+                num_latents=args.ar_latents,
+                steps_per_latent=args.diffusion_steps
             )
-            print(f"  -> {zc_traj.total_latency_ms:.2f}ms total, "
-                  f"{zc_traj.per_step_latency_ms:.2f}ms/step")
+            print(f"  -> {zc_ar.total_latency_ms:.2f}ms total, "
+                  f"{zc_ar.avg_ms_per_forward:.2f}ms avg/forward, "
+                  f"{zc_ar.tokens_computed_total} tokens computed")
         except Exception as e:
             print(f"  -> FAILED: {e}")
             import traceback
             traceback.print_exc()
-            zc_traj = None
+            zc_ar = None
 
-        print(f"\n[5/5] Benchmarking KVC trajectory ({args.diffusion_steps} steps)...")
+        print(f"\n[5/5] Benchmarking KVC concat-AR...")
         try:
-            kvc_traj = benchmark_diffusion_trajectory_kvc(
+            kvc_ar = benchmark_concat_ar_kvc(
                 cfg, device, dtype, args.num_text, args.latent_res,
-                num_steps=args.diffusion_steps
+                num_latents=args.ar_latents,
+                steps_per_latent=args.diffusion_steps
             )
-            print(f"  -> {kvc_traj.total_latency_ms:.2f}ms total, "
-                  f"{kvc_traj.per_step_latency_ms:.2f}ms/step")
+            print(f"  -> {kvc_ar.total_latency_ms:.2f}ms total, "
+                  f"{kvc_ar.avg_ms_per_forward:.2f}ms avg/forward, "
+                  f"{kvc_ar.tokens_computed_total} tokens computed")
         except Exception as e:
             print(f"  -> FAILED: {e}")
             import traceback
             traceback.print_exc()
-            kvc_traj = None
+            kvc_ar = None
 
-        if zc_traj and kvc_traj:
-            print_trajectory_results(zc_traj, kvc_traj)
+        if zc_ar and kvc_ar:
+            print_concat_ar_results(zc_ar, kvc_ar)
 
     print(f"\n✓ Benchmark complete. Artifacts in {output_dir}/")
 

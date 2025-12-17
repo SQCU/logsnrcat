@@ -520,6 +520,243 @@ def predict_velocity_from_blocks(components, blocks: List[ContextBlock], mode='n
             # Just append None or dummy
             v_final_list.append(None)
             pred_logsnr_list.append(None)
-        
+
     return v_final_list, pred_logsnr_list, aux_loss
+
+
+# =============================================================================
+# KVC-Aware Forward Pass (Concatenative AR with Cache Hits)
+# =============================================================================
+
+class KVCSessionState:
+    """
+    Tracks the state of a KVC inference session.
+
+    This enables true concatenative AR with prefix caching:
+    - Prefill: First call processes all tokens, caches all K/V
+    - Update: Inner diffusion loop updates active span's K/V in place
+    - Extend: Outer AR loop appends new spans, reuses prefix cache
+    """
+    def __init__(self, kvt_manager: 'KVTManager', req_id: int):
+        self.kvt_manager = kvt_manager
+        self.req_id = req_id
+        self.cached_prefix_len = 0  # How many tokens are stably cached
+        self.total_len = 0          # Total sequence length
+        self.active_span_start = 0  # Start of the active (mutable) span
+        self.active_span_len = 0    # Length of the active span
+        self.is_initialized = False
+
+    def prefill(self, content_hashes: List[int], topo_data: torch.Tensor,
+                active_start: int = 0, active_len: int = None):
+        """
+        Initial prefill: cache entire context.
+
+        Args:
+            content_hashes: Hashes for all tokens
+            topo_data: [L_total, Topo_Dim] topology
+            active_start: Where the active (mutable) span starts
+            active_len: Length of active span (defaults to rest of sequence)
+        """
+        self.kvt_manager.allocate_and_write_sequence(
+            self.req_id, content_hashes, topo_data
+        )
+        self.total_len = len(content_hashes)
+        self.active_span_start = active_start
+        self.active_span_len = active_len if active_len else (self.total_len - active_start)
+        self.cached_prefix_len = active_start  # Everything before active span is stable
+        self.is_initialized = True
+
+    def extend(self, new_content_hashes: List[int], new_topo_data: torch.Tensor,
+               new_active_len: int = None):
+        """
+        Extend context with new span (concatenative AR step).
+        The previous active span becomes part of the cached prefix.
+
+        Args:
+            new_content_hashes: Hashes for NEW tokens only
+            new_topo_data: [L_new, Topo_Dim] topology for new tokens
+            new_active_len: Length of new active span (defaults to all new tokens)
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Cannot extend before prefill")
+
+        # Previous active span is now part of stable prefix
+        self.cached_prefix_len = self.total_len
+
+        # Extend the sequence
+        self.kvt_manager.extend_sequence(
+            self.req_id, new_content_hashes, new_topo_data
+        )
+
+        old_total = self.total_len
+        self.total_len = old_total + len(new_content_hashes)
+        self.active_span_start = old_total
+        self.active_span_len = new_active_len if new_active_len else len(new_content_hashes)
+
+    def get_slot_mapping_for_active(self) -> torch.Tensor:
+        """
+        Returns slot mapping for only the active span.
+        Used when updating K/V for just the active (mutable) tokens.
+        """
+        block_table = self.kvt_manager.req_tables[self.req_id]
+        block_size = self.kvt_manager.block_size
+        device = self.kvt_manager.device
+
+        slots = []
+        for token_idx in range(self.active_span_start,
+                               self.active_span_start + self.active_span_len):
+            block_idx = token_idx // block_size
+            offset = token_idx % block_size
+            physical_block = block_table[block_idx]
+            physical_slot = physical_block * block_size + offset
+            slots.append(physical_slot)
+
+        return torch.tensor(slots, dtype=torch.long, device=device)
+
+    def cleanup(self):
+        """Free the request from KVT manager."""
+        if self.is_initialized:
+            self.kvt_manager.free_request(self.req_id)
+            self.is_initialized = False
+
+
+def run_model_forward_kvc(
+    components_kvc,
+    blocks: List['ContextBlock'],
+    session_state: KVCSessionState,
+    mode: str = 'prefill'
+):
+    """
+    KVC-aware forward pass supporting true concatenative AR.
+
+    Args:
+        components_kvc: Tuple of (model_kvc, span_embedder, span_unembedder, page_table, kvt_manager)
+        blocks: List of ContextBlocks (full context)
+        session_state: KVCSessionState tracking cache state
+        mode: 'prefill' (first call), 'update' (inner loop), or 'extend' (outer AR loop)
+
+    Returns:
+        decoded: List of decoded outputs per span
+        aux_loss: Auxiliary loss from MoE routing
+
+    The key insight:
+    - prefill: Process ALL tokens, cache ALL K/V
+    - update: Process ACTIVE tokens only, update their K/V in cache, attend to FULL cache
+    - extend: Process NEW tokens only, extend cache, attend to FULL cache
+    """
+    model, span_embedder, span_unembedder, page_table, kvt_manager = components_kvc
+    device = model.text_embed.weight.device
+    dtype = model.text_embed.weight.dtype
+
+    # 1. Embed ALL blocks to get full context info
+    z_flat, span_objects, content_hashes = span_embedder.embed(blocks)
+    L_total = z_flat.shape[0]
+
+    # 2. Topology for full context
+    topo_embeds_full, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
+
+    if mode == 'prefill':
+        # === PREFILL MODE ===
+        # Process all tokens, cache all K/V
+
+        # Find where the active span starts (last span)
+        active_start = span_objects[-1].start_idx if span_objects else 0
+        active_len = L_total - active_start
+
+        # Initialize cache with full context
+        session_state.prefill(content_hashes, topo_embeds_full, active_start, active_len)
+
+        # Get paging info for full context
+        flat_page_table, inverse_page_table = kvt_manager.get_flat_page_mapping([session_state.req_id])
+        block_tables = [kvt_manager.req_tables[session_state.req_id]]
+        seq_lengths = [kvt_manager.req_lengths[session_state.req_id]]
+        slot_mapping = kvt_manager.get_slot_mapping(block_tables, seq_lengths)
+
+        # Build masks (Q=full, K=full for prefill)
+        topo_heap = kvt_manager.get_topo_view()
+        block_masks = build_dual_masks(
+            span_objects, topo_embeds_full, topo_heap,
+            page_table, flat_page_table, inverse_page_table,
+            window_size=model.window_size
+        )
+
+        # Forward pass with all tokens
+        rope_scale = max(1.0, L_total / 64.0)
+        k_caches = [kvt_manager.get_flat_kv_view(i)[0] for i in range(len(model.layers))]
+        v_caches = [kvt_manager.get_flat_kv_view(i)[1] for i in range(len(model.layers))]
+
+        z_out, aux_loss = model(
+            z_flat.unsqueeze(0),
+            topo_embeds_full.unsqueeze(0),
+            k_caches, v_caches,
+            slot_mapping,
+            block_masks,
+            scale=rope_scale
+        )
+
+    elif mode == 'update':
+        # === UPDATE MODE ===
+        # Process only active span tokens, update their K/V, attend to full cache
+
+        if not session_state.is_initialized:
+            raise RuntimeError("Cannot update before prefill")
+
+        # Extract only active tokens
+        active_start = session_state.active_span_start
+        active_end = active_start + session_state.active_span_len
+        z_active = z_flat[active_start:active_end]
+        topo_active = topo_embeds_full[active_start:active_end]
+
+        # Slot mapping for active tokens only
+        slot_mapping = session_state.get_slot_mapping_for_active()
+
+        # Get paging info for full context (for K/V retrieval)
+        flat_page_table, inverse_page_table = kvt_manager.get_flat_page_mapping([session_state.req_id])
+        topo_heap = kvt_manager.get_topo_view()
+
+        # Build masks: Q=active tokens, K=full heap
+        # This requires spans for active tokens but heap for full context
+        active_spans = [s for s in span_objects if s.end_idx > active_start]
+        # Adjust span indices to be relative to active window
+        adjusted_spans = []
+        for s in active_spans:
+            new_s = copy.copy(s)
+            new_s.start_idx = max(0, s.start_idx - active_start)
+            new_s.end_idx = min(session_state.active_span_len, s.end_idx - active_start)
+            if new_s.end_idx > new_s.start_idx:
+                adjusted_spans.append(new_s)
+
+        block_masks = build_dual_masks(
+            adjusted_spans, topo_active, topo_heap,
+            page_table, flat_page_table, inverse_page_table,
+            window_size=model.window_size
+        )
+
+        # Forward with active tokens only
+        L_active = z_active.shape[0]
+        rope_scale = max(1.0, session_state.total_len / 64.0)
+        k_caches = [kvt_manager.get_flat_kv_view(i)[0] for i in range(len(model.layers))]
+        v_caches = [kvt_manager.get_flat_kv_view(i)[1] for i in range(len(model.layers))]
+
+        z_out_active, aux_loss = model(
+            z_active.unsqueeze(0),
+            topo_active.unsqueeze(0),
+            k_caches, v_caches,
+            slot_mapping,
+            block_masks,
+            scale=rope_scale
+        )
+
+        # Reconstruct full output (prefix is zeros, only active is valid)
+        z_out = torch.zeros((1, L_total, z_flat.shape[-1]), device=device, dtype=dtype)
+        z_out[0, active_start:active_end] = z_out_active.squeeze(0)
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Expected 'prefill' or 'update'")
+
+    # 3. Decode outputs
+    decoded = span_unembedder.decode(z_out.squeeze(0), span_objects)
+
+    return decoded, aux_loss
+
 
