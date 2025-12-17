@@ -176,7 +176,7 @@ angle_range_deg = 15.0
 
 # Frame 3: Target (64px, Full Noise Range, Aggressive Topology)
 [[dataset_mix.video_causal_zoom.params.sequence_structure]]
-relative_res = 0.5
+relative_res = 1.0
 noise_mode = "split"
 [dataset_mix.video_causal_zoom.params.sequence_structure.noise_params]
 min_snr = -5.0

@@ -360,8 +360,14 @@ def plot_causal_sweep(sequences_gt, sequences_pred, snr_values, output_path):
             
             # 2. Plot Image
             ax_img = axes[row_img, t]
-            img_np = pred_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
-            ax_img.imshow(img_np)
+            # Handle dimensionality (Skip 1D Text blocks)
+            img_np = None
+            if pred_tensor.ndim == 3:
+                img_np = pred_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
+                ax_img.imshow(img_np)
+            else:
+                ax_img.text(0.5, 0.5, "Text/Meta", ha='center', va='center')
+                
             ax_img.axis('off')
             
             # Labels
@@ -378,12 +384,16 @@ def plot_causal_sweep(sequences_gt, sequences_pred, snr_values, output_path):
             ax_err = axes[row_err, t]
             
             # Calculate MSE Map
-            gt_np = gt_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
-            diff = (img_np - gt_np) ** 2
-            mse_map = diff.mean(axis=2) # Average over channels
-            
-            # Use fixed scale to make noise visible vs clean
-            im_err = ax_err.imshow(mse_map, cmap='inferno', vmin=0, vmax=0.1)
+            if img_np is not None and gt_tensor.ndim == 3:
+                gt_np = gt_tensor.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
+                diff = (img_np - gt_np) ** 2
+                mse_map = diff.mean(axis=2) # Average over channels
+                
+                # Use fixed scale to make noise visible vs clean
+                im_err = ax_err.imshow(mse_map, cmap='inferno', vmin=0, vmax=0.1)
+            else:
+                ax_err.text(0.5, 0.5, "N/A", ha='center', va='center')
+                
             ax_err.axis('off')
             
     plt.tight_layout()

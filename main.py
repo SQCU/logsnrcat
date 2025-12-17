@@ -148,51 +148,54 @@ def main():
     print("\nPlotting Metrics...")
     plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg['training']['mode']}")
     
-    
+
     # --- Sampling & Evaluation ---
     if cfg['logging']['sample_after_training']:
         print("Sampling...")
         samp_cfg = cfg['sampling']
-        
-        # 1. Dataset Reconstruction (Latent Refinement)
-        for res in samp_cfg['resolutions']:
-            s_dict = samp_cfg.copy()
-            s_dict['mode'] = cfg['training']['mode']
-            s_dict['res'] = res
-            sampler.sample_viz_dset(components, val_iterator, s_dict, logger)
-            
-        # 2. Causal Sweep (Video Gen) - Now with Resolution Sweep
-        if samp_cfg.get('enable_sweep', False):
-            print("Running Causal Sweep...")
+
+        use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
+        # FIX: Use new torch.amp API
+        scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
+        with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+            # 1. Dataset Reconstruction (Latent Refinement)
             for res in samp_cfg['resolutions']:
                 s_dict = samp_cfg.copy()
                 s_dict['mode'] = cfg['training']['mode']
-                s_dict['res'] = res # Config injection for iterator
-                sampler.sample_viz_causal_sweep(components, val_iterator, s_dict, logger)
-            
-        # 3. Custom Queries (Text / Mixed)
-        # 3. Custom Queries (Text / Mixed)
-        if samp_cfg.get('queries'):
-            print(f"Running {len(samp_cfg['queries'])} custom eval sessions...")
-            
-            # Seed Context
-            seed_batch = val_iterator.generate_batch_list(batch_size=4, resolution=32)
-            seed_ctx = sampler.MultiTurnContext(seed_batch)
-            
-            # Execute
-            results = sampler.execute_multiturn_session(components, seed_ctx, samp_cfg['queries'])
-            
-            # 4. Text Decoding & Logging
-            print("\n--- Eval Session Outputs ---")
-            for i, b in enumerate(results):
-                if b.type == 'text':
-                    try:
-                        text = tokenizer.decode(b.content)
-                        log_msg = f"Block {i} (Text): {text[:200]}... (Len: {len(b.content)})"
-                        print(log_msg)
-                        logger.log_text("eval_outputs.txt", log_msg)
-                    except Exception as e:
-                        print(f"Failed to decode text block {i}: {e}")
+                s_dict['res'] = res
+                sampler.sample_viz_dset(components, val_iterator, s_dict, logger)
+                
+            # 2. Causal Sweep (Video Gen) - Now with Resolution Sweep
+            if samp_cfg.get('enable_sweep', False):
+                print("Running Causal Sweep...")
+                for res in samp_cfg['resolutions']:
+                    s_dict = samp_cfg.copy()
+                    s_dict['mode'] = cfg['training']['mode']
+                    s_dict['res'] = res # Config injection for iterator
+                    sampler.sample_viz_causal_sweep(components, val_iterator, s_dict, logger)
+                
+            # 3. Custom Queries (Text / Mixed)
+            # 3. Custom Queries (Text / Mixed)
+            if samp_cfg.get('queries'):
+                print(f"Running {len(samp_cfg['queries'])} custom eval sessions...")
+                with torch.no_grad():
+                    # Seed Context
+                    seed_batch = val_iterator.generate_batch_list(batch_size=4, resolution=32)
+                    seed_ctx = sampler.MultiTurnContext(seed_batch)
+                
+                    # Execute
+                    results = sampler.execute_multiturn_session(components, seed_ctx, samp_cfg['queries'])
+                    # 4. Text Decoding & Logging
+                    print("\n--- Eval Session Outputs ---")
+                    for i, b in enumerate(results):
+                        if b.type == 'text':
+                            try:
+                                text = tokenizer.decode(b.content)
+                                log_msg = f"Block {i} (Text): {text[:200]}... (Len: {len(b.content)})"
+                                print(log_msg)
+                                logger.log_text("eval_outputs.txt", log_msg)
+                            except Exception as e:
+                                print(f"Failed to decode text block {i}: {e}")
 
     print(f"\nDone! Results in {logger.run_dir}")
 

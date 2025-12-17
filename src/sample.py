@@ -277,7 +277,7 @@ def taufield_spatial_sampling(
             context.update_metadata(tgt_idx, l_curr)
             
         # B. Observation (Model Forward)
-        current_blocks = context.get_blocks()
+        current_blocks = context.get_spans()
         decoded_outputs, _ = run_model_forward(components, current_blocks)
         
         # C. Integration (Step)
@@ -452,10 +452,24 @@ def execute_multiturn_session(
                 x0 = torch.zeros(shape, device=device)
             elif source_type == 'copy_from':
                 src_idx = query.get('append_index', -1)
-                # Resolve negative index
-                # negative indexes are legible in python lists btw
-                #if src_idx < 0: src_idx += len(current_spans)
-                x0 = current_spans[src_idx].content.clone()
+                # Resolve index to absolute
+                if src_idx < 0: search_idx = len(current_spans) + src_idx
+                else: search_idx = src_idx
+                
+                # Heuristic: Find nearest latent block backwards from search_idx
+                # This prevents copying text blocks (LongTensor) which crash randn_like
+                x0 = None
+                for i in range(search_idx, -1, -1):
+                    if current_spans[i].type == 'latent':
+                        x0 = current_spans[i].content.clone()
+                        break
+                
+                if x0 is None:
+                    # Fallback if no latent found: use configured shape or error
+                    if 'shape' in span_cfg:
+                        x0 = torch.zeros(tuple(span_cfg['shape']), device=device)
+                    else:
+                        raise ValueError(f"append_source='copy_from' at idx {src_idx} failed: No preceding latent block found and no explicit shape in config.")
             else:
                 raise ValueError(f"Unknown append_source: {source_type}")
 
@@ -480,7 +494,7 @@ def execute_multiturn_session(
             span_cfg = query['new_span_config']
             init_content = span_cfg['initial_content']
             if not isinstance(init_content, torch.Tensor):
-                init_content = torch.tensor(init_content, dtype=torch.long, device=device)
+                init_content = torch.tensor(init_content, dtype=init_content, device=device)
             else:
                 init_content = init_content.to(device)
             
@@ -518,8 +532,7 @@ def execute_multiturn_session(
             
     return input_ctx.get_spans()
 
-
-
+@torch.no_grad()
 def sample_viz_dset(components, iterator, config_dict, logger):
     """
     Visualization Wrapper: Inplace Refinement of Dataset Samples.
@@ -555,8 +568,9 @@ def sample_viz_dset(components, iterator, config_dict, logger):
             device = b.content.device
             
             # Map construction
-            start_map = torch.full((1, *b.shape_meta), start_snr, device=device)
-            end_map = torch.full((1, *b.shape_meta), target_snr, device=device)
+            H, W = b.content.shape[-2:]
+            start_map = torch.full((1, H, W), start_snr, device=device)
+            end_map = torch.full((1, H, W), target_snr, device=device)
             
             # Explicit Noise Injection
             alpha, sigma = logsnr_to_alpha_sigma(start_map)
@@ -605,7 +619,7 @@ def sample_viz_dset(components, iterator, config_dict, logger):
     from .plotting import plot_dset_reconstruction
     plot_dset_reconstruction(plot_data, logger, name=f"stratified_{res}", show_map=True)
 
-
+@torch.no_grad()
 def sample_viz_causal_sweep(components, iterator, config, logger):
     """
     Demonstrates Autoregressive Latent Generation (Append Logic).
@@ -678,7 +692,8 @@ def sample_viz_causal_sweep(components, iterator, config, logger):
         for b in ctx.blocks:
             if b.type == 'latent':
                 # Map for this block
-                b_map = torch.full((1, *b.shape_meta), current_snr, device=device)
+                H, W = b.content.shape[-2:]
+                b_map = torch.full((1, H, W), current_snr, device=device)
                 alpha, sigma = logsnr_to_alpha_sigma(b_map)
                 z_noisy = b.content * alpha + torch.randn_like(b.content) * sigma
                 b.content = z_noisy
