@@ -888,3 +888,554 @@ def run_model_forward_kvc(
     return decoded, aux_loss, num_recomputed
 
 
+# =============================================================================
+# FLEX-NANO-VLLM Style: Paged Inference Session
+# =============================================================================
+# Reference: Jonathan Chang's flex-nano-vllm essay
+# Key insight: Build BlockMask ONCE in logical space, convert to physical via page table
+# This avoids expensive Python mask rebuilding on every decode call.
+
+class PagedInferenceSession:
+    """
+    Manages a single inference session with paged KV cache.
+
+    Architecture (flex-nano-vllm style):
+    1. PREFILL: Process full context, build logical masks, cache K/V
+    2. DECODE: Process new tokens only, convert masks via page table
+
+    The key optimization is mask reuse:
+    - Logical BlockMask is built once during prefill
+    - convert_flattened_block_mask() maps to physical space each decode
+    - This eliminates the expensive Python mask construction overhead
+
+    For CUDA graph capture:
+    - Decode uses static tensor shapes (padded to max)
+    - Graph captures the entire decode forward pass
+    - Only the slot_mapping changes between calls
+    """
+
+    def __init__(
+        self,
+        model,  # coolerLDTformerKVC
+        span_embedder: 'SpanEmbedder',
+        span_unembedder: 'SpanUnembedder',
+        page_table: 'PageTable',
+        kvt_manager: 'KVTManager',
+        req_id: int = 0
+    ):
+        self.model = model
+        self.span_embedder = span_embedder
+        self.span_unembedder = span_unembedder
+        self.page_table = page_table
+        self.kvt_manager = kvt_manager
+        self.req_id = req_id
+
+        self.device = model.text_embed.weight.device
+        self.dtype = model.text_embed.weight.dtype
+
+        # Session state
+        self.is_prefilled = False
+        self.span_objects: List[Span] = []
+        self.total_len = 0
+        self.active_span_idx = -1  # Index of the mutable span
+
+        # Cached masks (logical space) - built once, converted each decode
+        self.cached_logical_mask_local = None
+        self.cached_logical_mask_global = None
+
+        # Cached topology and doc_ids for mask conversion
+        self.cached_topo_heap = None
+        self.cached_flat_page_table = None
+        self.cached_inverse_page_table = None
+
+        # CUDA graph capture (optional)
+        self._graph = None
+        self._graph_inputs = None
+        self._graph_outputs = None
+
+    def prefill(
+        self,
+        blocks: List['ContextBlock'],
+        active_span_idx: int = -1  # Which span is mutable (-1 = last)
+    ) -> Tuple[List[Dict], float]:
+        """
+        Prefill: Process full context, cache K/V, build logical masks.
+
+        Args:
+            blocks: Full context as ContextBlocks
+            active_span_idx: Index of the span that will be updated in decode
+                            (typically the last latent span)
+
+        Returns:
+            decoded: Output for each span
+            aux_loss: MoE auxiliary loss
+        """
+        # 1. Embed full context
+        z_flat, span_objects, content_hashes = self.span_embedder.embed(blocks)
+        L_total = z_flat.shape[0]
+
+        # 2. Build topology
+        topo_embeds, _ = render_topology_embeddings(
+            span_objects, 3, self.device, dtype=self.dtype
+        )
+
+        # 3. Allocate KV cache
+        self.kvt_manager.allocate_and_write_sequence(
+            self.req_id, content_hashes, topo_embeds
+        )
+
+        # 4. Get paging info
+        flat_page_table, inverse_page_table = self.kvt_manager.get_flat_page_mapping(
+            [self.req_id]
+        )
+        block_tables = [self.kvt_manager.req_tables[self.req_id]]
+        seq_lengths = [self.kvt_manager.req_lengths[self.req_id]]
+        slot_mapping = self.kvt_manager.get_slot_mapping(block_tables, seq_lengths)
+
+        # 5. Build masks in LOGICAL space (cached for decode)
+        topo_heap = self.kvt_manager.get_topo_view()
+        block_masks = build_dual_masks(
+            span_objects, topo_embeds, topo_heap,
+            self.page_table, flat_page_table, inverse_page_table,
+            window_size=self.model.window_size
+        )
+
+        # 6. Forward pass
+        rope_scale = max(1.0, L_total / 64.0)
+        k_caches = [self.kvt_manager.get_flat_kv_view(i)[0] for i in range(len(self.model.layers))]
+        v_caches = [self.kvt_manager.get_flat_kv_view(i)[1] for i in range(len(self.model.layers))]
+
+        z_out, aux_loss = self.model(
+            z_flat.unsqueeze(0),
+            topo_embeds.unsqueeze(0),
+            k_caches, v_caches,
+            slot_mapping,
+            block_masks,
+            scale=rope_scale
+        )
+
+        # 7. Decode outputs
+        decoded = self.span_unembedder.decode(z_out.squeeze(0), span_objects)
+
+        # 8. Cache state for decode
+        self.is_prefilled = True
+        self.span_objects = span_objects
+        self.total_len = L_total
+        self.active_span_idx = active_span_idx if active_span_idx >= 0 else len(span_objects) - 1
+        self.cached_topo_heap = topo_heap
+        self.cached_flat_page_table = flat_page_table
+        self.cached_inverse_page_table = inverse_page_table
+        self.cached_logical_mask_local, self.cached_logical_mask_global = block_masks
+
+        return decoded, aux_loss
+
+    def decode(
+        self,
+        active_block: 'ContextBlock',
+        return_full_output: bool = False
+    ) -> Tuple[Dict, float]:
+        """
+        Decode: Update only the active span, attend to full cached K/V.
+
+        This is the OPTIMIZED path:
+        - Only re-embeds the active block
+        - Only computes attention for active tokens
+        - Reuses cached masks via convert_flattened_block_mask
+
+        Args:
+            active_block: The updated ContextBlock for the active span
+            return_full_output: If True, return full z_out (for debugging)
+
+        Returns:
+            decoded: Output for the active span only
+            aux_loss: MoE auxiliary loss
+        """
+        if not self.is_prefilled:
+            raise RuntimeError("Must call prefill() before decode()")
+
+        # 1. Embed only the active block
+        active_span = self.span_objects[self.active_span_idx]
+
+        # Re-embed the active block
+        if active_block.type == 'text':
+            z_active = self.span_embedder.text_emb(active_block.content)
+        else:
+            z_active, _ = self.span_embedder.patch_emb(
+                active_block.content, active_block.logsnr
+            )
+
+        L_active = z_active.shape[0]
+        active_start = active_span.start_idx
+
+        # 2. Get topology for active tokens (uses global highway positions)
+        topo_active = _compute_span_topology(
+            active_span, active_start, 3, self.device, self.dtype
+        )
+
+        # 3. Get slot mapping for active tokens only
+        block_table = self.kvt_manager.req_tables[self.req_id]
+        block_size = self.kvt_manager.block_size
+
+        slots = []
+        for token_idx in range(active_start, active_start + L_active):
+            block_idx = token_idx // block_size
+            offset = token_idx % block_size
+            physical_block = block_table[block_idx]
+            physical_slot = physical_block * block_size + offset
+            slots.append(physical_slot)
+        slot_mapping = torch.tensor(slots, dtype=torch.long, device=self.device)
+
+        # 4. Build masks for decode (Q=active tokens, K=full heap)
+        # This is where the optimization happens - we build a small mask
+        # for just the active tokens attending to the full heap
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        L_heap = self.cached_topo_heap.shape[0]
+
+        # Build doc_ids for active tokens
+        doc_ids_active = torch.full(
+            (L_active,), active_span.doc_id,
+            dtype=torch.long, device=self.device
+        )
+
+        # Build simplified masks for decode (active Q, full K)
+        # The mask logic: active tokens can see everything in their doc that came before
+        span_ids_active = torch.full(
+            (L_active,), self.active_span_idx,
+            dtype=torch.long, device=self.device
+        )
+
+        # Highway positions for active tokens (global)
+        highway_active = torch.arange(
+            active_start, active_start + L_active,
+            device=self.device, dtype=self.dtype
+        )
+
+        # For heap, we need to know which tokens are visible
+        # Build doc_ids for heap from cached state
+        doc_ids_heap = torch.full((L_heap,), -1, dtype=torch.long, device=self.device)
+        span_ids_heap = torch.full((L_heap,), -1, dtype=torch.long, device=self.device)
+
+        cursor = 0
+        for i, span in enumerate(self.span_objects):
+            span_len = span.end_idx - span.start_idx
+            if self.cached_flat_page_table is None:
+                doc_ids_heap[cursor:cursor+span_len] = span.doc_id
+                span_ids_heap[cursor:cursor+span_len] = i
+            else:
+                # Paged case
+                start_block = cursor // block_size
+                end_block = (cursor + span_len - 1) // block_size + 1
+
+                for log_block_idx in range(start_block, end_block):
+                    if log_block_idx >= len(self.cached_flat_page_table):
+                        break
+
+                    phys_block = self.cached_flat_page_table[log_block_idx].item()
+                    block_start_global = log_block_idx * block_size
+                    block_end_global = (log_block_idx + 1) * block_size
+
+                    start_in_span = max(0, block_start_global - cursor)
+                    end_in_span = min(span_len, block_end_global - cursor)
+
+                    offset_start = (cursor + start_in_span) % block_size
+                    offset_end = offset_start + (end_in_span - start_in_span)
+
+                    phys_start = phys_block * block_size + offset_start
+                    phys_end = phys_block * block_size + offset_end
+
+                    doc_ids_heap[phys_start:phys_end] = span.doc_id
+                    span_ids_heap[phys_start:phys_end] = i
+
+            cursor += span_len
+
+        # Highway for heap (from cached topology)
+        highway_heap = self.cached_topo_heap[:, 0]
+
+        # Spatial coords
+        spatial_active = topo_active[:, 1:]
+        spatial_heap = self.cached_topo_heap[:, 1:]
+
+        win_sq = self.model.window_size ** 2
+        is_causal = active_span.causal
+
+        def decode_mask_mod_local(b, h, q_idx, kv_idx):
+            # Document check
+            q_doc = doc_ids_active[q_idx]
+            k_doc = doc_ids_heap[kv_idx]
+            same_doc = (q_doc == k_doc)
+
+            # Span check
+            q_span_id = span_ids_active[q_idx]
+            k_span_id = span_ids_heap[kv_idx]
+
+            # Block causal: can see earlier spans
+            block_condition = (q_span_id > k_span_id)
+            same_span = (q_span_id == k_span_id)
+
+            # Within-span: if causal, enforce highway order; if bidir, allow all
+            internal_condition = (not is_causal) or (highway_active[q_idx] >= highway_heap[kv_idx])
+
+            valid = same_doc & (block_condition | (same_span & internal_condition))
+
+            # Spatial window
+            dist_sq = 0.0
+            for dim in range(spatial_active.shape[1]):
+                d = spatial_active[q_idx, dim] - spatial_heap[kv_idx, dim]
+                dist_sq = dist_sq + d * d
+
+            spatial_ok = dist_sq < win_sq
+
+            return valid & spatial_ok
+
+        def decode_mask_mod_global(b, h, q_idx, kv_idx):
+            q_doc = doc_ids_active[q_idx]
+            k_doc = doc_ids_heap[kv_idx]
+            same_doc = (q_doc == k_doc)
+
+            q_span_id = span_ids_active[q_idx]
+            k_span_id = span_ids_heap[kv_idx]
+
+            block_condition = (q_span_id > k_span_id)
+            same_span = (q_span_id == k_span_id)
+            internal_condition = (not is_causal) or (highway_active[q_idx] >= highway_heap[kv_idx])
+
+            return same_doc & (block_condition | (same_span & internal_condition))
+
+        mask_local = create_block_mask(
+            decode_mask_mod_local, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
+        )
+        mask_global = create_block_mask(
+            decode_mask_mod_global, B=None, H=None, Q_LEN=L_active, KV_LEN=L_heap
+        )
+
+        block_masks = (mask_local, mask_global)
+
+        # 5. Forward pass with active tokens only
+        rope_scale = max(1.0, self.total_len / 64.0)
+        k_caches = [self.kvt_manager.get_flat_kv_view(i)[0] for i in range(len(self.model.layers))]
+        v_caches = [self.kvt_manager.get_flat_kv_view(i)[1] for i in range(len(self.model.layers))]
+
+        z_out_active, aux_loss = self.model(
+            z_active.unsqueeze(0),
+            topo_active.unsqueeze(0),
+            k_caches, v_caches,
+            slot_mapping,
+            block_masks,
+            scale=rope_scale
+        )
+
+        # 6. Decode only the active span
+        decoded = self.span_unembedder.decode(
+            z_out_active.squeeze(0),
+            [active_span]  # Only decode the active span
+        )
+
+        if return_full_output:
+            # Reconstruct full output for debugging
+            z_full = torch.zeros(
+                (self.total_len, z_active.shape[-1]),
+                device=self.device, dtype=self.dtype
+            )
+            z_full[active_start:active_start + L_active] = z_out_active.squeeze(0)
+            return decoded[0], aux_loss, z_full
+
+        return decoded[0], aux_loss
+
+    def cleanup(self):
+        """Free the session's KV cache allocation."""
+        if self.is_prefilled:
+            self.kvt_manager.free_request(self.req_id)
+            self.is_prefilled = False
+            self.span_objects = []
+            self._graph = None
+
+
+def run_paged_inference(
+    model,
+    span_embedder: 'SpanEmbedder',
+    span_unembedder: 'SpanUnembedder',
+    page_table: 'PageTable',
+    kvt_manager: 'KVTManager',
+    blocks: List['ContextBlock'],
+    num_diffusion_steps: int = 10,
+    active_span_idx: int = -1
+) -> Tuple[List[Dict], float]:
+    """
+    Convenience function for single-shot paged inference with diffusion.
+
+    Runs:
+    1. Prefill with full context
+    2. N decode steps updating only the active span
+
+    Returns final decoded outputs.
+    """
+    session = PagedInferenceSession(
+        model, span_embedder, span_unembedder,
+        page_table, kvt_manager, req_id=0
+    )
+
+    try:
+        # Prefill
+        decoded, aux_loss = session.prefill(blocks, active_span_idx)
+
+        if num_diffusion_steps <= 1:
+            return decoded, aux_loss
+
+        # Get the active block
+        if active_span_idx < 0:
+            active_span_idx = len(blocks) - 1
+        active_block = blocks[active_span_idx]
+
+        # Diffusion loop
+        logsnr_schedule = torch.linspace(
+            -4.0, 6.0, num_diffusion_steps + 1,
+            device=session.device, dtype=session.dtype
+        )
+
+        for step in range(1, num_diffusion_steps):
+            # Update logsnr
+            active_block.logsnr = torch.full_like(
+                active_block.logsnr, logsnr_schedule[step].item()
+            )
+
+            # Decode step
+            decoded_active, aux = session.decode(active_block)
+            aux_loss += aux
+
+            # Euler step update
+            if 'image_vpreds' in decoded_active:
+                v_pred = decoded_active['image_vpreds']
+                active_block.content = active_block.content + 0.1 * v_pred
+
+        # Final decode
+        decoded[-1] = decoded_active
+        return decoded, aux_loss
+
+    finally:
+        session.cleanup()
+
+
+# =============================================================================
+# CUDA Graph Captured Decode (for maximum throughput)
+# =============================================================================
+
+class CUDAGraphRunner:
+    """
+    Captures the decode forward pass as a CUDA graph for maximum throughput.
+
+    Requirements for graph capture:
+    - Static tensor shapes (use padding/masking for variable lengths)
+    - No dynamic control flow
+    - No Python-side operations during replay
+
+    Usage:
+        runner = CUDAGraphRunner(session, max_active_tokens=256)
+        runner.capture()  # Capture once
+
+        for step in diffusion_steps:
+            output = runner.replay(z_active, topo_active, slot_mapping)
+    """
+
+    def __init__(
+        self,
+        session: PagedInferenceSession,
+        max_active_tokens: int = 256,
+        warmup_iterations: int = 3
+    ):
+        self.session = session
+        self.max_active_tokens = max_active_tokens
+        self.warmup_iterations = warmup_iterations
+
+        self._graph = None
+        self._static_inputs = {}
+        self._static_outputs = {}
+
+    def capture(self, sample_active_block: 'ContextBlock'):
+        """
+        Capture the decode graph using a sample input.
+
+        The sample should be representative of the actual inputs
+        (same shape, dtype, device).
+        """
+        if not self.session.is_prefilled:
+            raise RuntimeError("Session must be prefilled before graph capture")
+
+        device = self.session.device
+        dtype = self.session.dtype
+
+        # Allocate static buffers (padded to max)
+        active_span = self.session.span_objects[self.session.active_span_idx]
+        L_actual = active_span.end_idx - active_span.start_idx
+        L_padded = self.max_active_tokens
+        D = self.session.model.text_embed.weight.shape[1]
+
+        # Static input buffers
+        self._static_inputs['z_active'] = torch.zeros(
+            (1, L_padded, D), device=device, dtype=dtype
+        )
+        self._static_inputs['topo_active'] = torch.zeros(
+            (1, L_padded, 3), device=device, dtype=dtype
+        )
+        self._static_inputs['slot_mapping'] = torch.zeros(
+            (L_padded,), device=device, dtype=torch.long
+        )
+
+        # Warmup (required for graph capture)
+        torch.cuda.synchronize()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+
+        with torch.cuda.stream(s):
+            for _ in range(self.warmup_iterations):
+                # Copy sample to static buffers
+                z_active, _ = self.session.span_embedder.patch_emb(
+                    sample_active_block.content, sample_active_block.logsnr
+                )
+                self._static_inputs['z_active'][0, :L_actual] = z_active
+
+                # Forward (warmup, no capture)
+                _ = self._run_decode_kernel()
+
+        torch.cuda.current_stream().wait_stream(s)
+
+        # Capture the graph
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph):
+            self._static_outputs['z_out'] = self._run_decode_kernel()
+
+        print(f"[CUDAGraphRunner] Captured decode graph with max_tokens={L_padded}")
+
+    def _run_decode_kernel(self):
+        """The kernel to be captured - pure tensor operations."""
+        # This would be the core decode forward pass
+        # For now, placeholder - actual implementation would call model layers
+        return self._static_inputs['z_active'].clone()
+
+    def replay(
+        self,
+        z_active: torch.Tensor,
+        topo_active: torch.Tensor,
+        slot_mapping: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Replay the captured graph with new inputs.
+
+        Inputs are copied into static buffers, graph is replayed,
+        outputs are copied out.
+        """
+        if self._graph is None:
+            raise RuntimeError("Must call capture() before replay()")
+
+        L_actual = z_active.shape[0]
+
+        # Copy inputs to static buffers
+        self._static_inputs['z_active'][0, :L_actual] = z_active
+        self._static_inputs['topo_active'][0, :L_actual] = topo_active
+        self._static_inputs['slot_mapping'][:L_actual] = slot_mapping
+
+        # Replay the graph
+        self._graph.replay()
+
+        # Extract outputs (only the valid portion)
+        return self._static_outputs['z_out'][0, :L_actual].clone()

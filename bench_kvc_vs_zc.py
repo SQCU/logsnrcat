@@ -39,6 +39,28 @@ from src.model import (
     ContextBlock, Span,
     render_topology_embeddings, build_dual_masks, update_kv_cache
 )
+
+
+def compile_transformer_layers(model, mode='default'):
+    """
+    Compile ONLY the transformer layers, not embedding/unembedding.
+
+    Why selective compilation:
+    - Embedding: Dynamic shapes (variable span counts, gather ops)
+    - Transformer layers: Uniform access patterns, static shapes once embedded
+    - Unembedding: Selective gather/scatter for specific spans
+
+    The transformer stack is the compute-heavy part and benefits most from
+    fusion. Embedding/unembedding are memory-bound with dynamic control flow.
+
+    See PyTorch blog on static shapes for CUDA graphs:
+    "Instead of using the dynamic-shape tensors... we used static shape tensors
+    where a mask is used to indicate which elements are valid."
+    """
+    for i, layer in enumerate(model.layers):
+        model.layers[i] = torch.compile(layer, mode=mode, dynamic=False)
+    return model
+
 from src.utils import KVTManager, logsnr_to_alpha_sigma
 
 
@@ -327,9 +349,9 @@ def benchmark_concat_ar_zc(
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
 
-    # Compile model for fused flex_attention kernels
+    # Compile ONLY the transformer layers, not embedding/unembedding
     if use_compile:
-        model = torch.compile(model, dynamic=True)
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -492,7 +514,7 @@ def benchmark_concat_ar_kvc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, dynamic=True)
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -682,7 +704,7 @@ def benchmark_concat_ar_zc_batched(
     ).to(device=device, dtype=dtype)
 
     if use_compile:
-        model = torch.compile(model, dynamic=True)
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -885,7 +907,7 @@ def benchmark_concat_ar_kvc_batched(
     ).to(device=device, dtype=dtype)
 
     if use_compile:
-        model = torch.compile(model, dynamic=True)
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1059,6 +1081,197 @@ def benchmark_concat_ar_kvc_batched(
     )
 
 
+# =============================================================================
+# NEW: PagedInferenceSession Benchmark (flex-nano-vllm style)
+# =============================================================================
+
+def benchmark_paged_session(
+    cfg: Dict,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_text: int,
+    latent_res: int,
+    num_latents: int = 3,
+    steps_per_latent: int = 5,
+    warmup_runs: int = 1,
+    use_compile: bool = True
+) -> ConcatARResult:
+    """
+    Benchmark using PagedInferenceSession (flex-nano-vllm style).
+
+    Key difference from run_model_forward_kvc:
+    - Proper prefill/decode separation
+    - Decode only processes active span tokens
+    - Designed for CUDA graph capture (static shapes)
+    """
+    from src.utils import PagedInferenceSession
+
+    block_size = cfg['page_table']['block_size']
+    latent_tokens_per_span = (latent_res // cfg['model']['patch_embedder']['stride'])**2
+    max_tokens = num_text + num_latents * latent_tokens_per_span
+    max_blocks = (max_tokens + block_size - 1) // block_size
+    alloc_blocks = max(max_blocks * 2, 16)
+
+    print(f"    Paged Session: {num_latents} latents x {steps_per_latent} steps, "
+          f"max {max_tokens} tokens")
+
+    # Build model
+    model = coolerLDTformerKVC(
+        dim=cfg['model']['dim'],
+        depth=cfg['model']['depth'],
+        num_heads=cfg['model']['num_heads'],
+        topo_dim=cfg['model']['topo_dim'],
+        mlp_depth=cfg['model']['mlp_depth'],
+        vocab_size=cfg['model']['vocab_size'],
+        global_layer_interval=cfg['model']['global_layer_interval'],
+        num_experts=cfg['model']['num_experts'],
+        num_active=cfg['model']['num_active'],
+        rope_base=cfg['model']['rope_base'],
+        mlp_ratio=cfg['model']['mlp_ratio'],
+        jitter_noise=0.0,
+        context_size=cfg['model']['patch_embedder']['context_size'],
+        stride=cfg['model']['patch_embedder']['stride'],
+        fourier_dim=cfg['model']['patch_embedder']['fourier_dim'],
+        window_size=cfg['model']['window_size']
+    ).to(device=device, dtype=dtype)
+
+    if use_compile:
+        compile_transformer_layers(model)
+
+    span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
+    span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
+
+    page_table = PageTable(
+        num_blocks=alloc_blocks,
+        block_size=block_size,
+        max_batch_size=cfg['page_table']['max_batch_size'],
+        max_logical_blocks=alloc_blocks,
+        device=device
+    )
+
+    kvt_manager = KVTManager(
+        max_blocks=alloc_blocks,
+        block_size=block_size,
+        kv_dim=cfg['model']['dim'],
+        layers=cfg['model']['depth'],
+        heads=cfg['model']['num_heads'],
+        topo_dim=cfg['model']['topo_dim'],
+        device=device,
+        dtype=dtype
+    )
+
+    # Start with text prefix
+    text_tokens = torch.randint(0, 1000, (num_text,), device=device)
+    text_block = ContextBlock(
+        content=text_tokens,
+        type='text',
+        causal=True,
+        shape_meta=(num_text,),
+        group_id=0,
+        id="text_prefix"
+    )
+
+    # Warmup
+    warmup_latent = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+    warmup_block = ContextBlock(
+        content=warmup_latent, type='latent', causal=False,
+        shape_meta=(latent_res, latent_res),
+        logsnr=torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype),
+        group_id=1, id="warmup"
+    )
+    warmup_blocks = [text_block, warmup_block]
+
+    for i in range(warmup_runs):
+        session = PagedInferenceSession(
+            model, span_emb, span_unemb, page_table, kvt_manager, req_id=i
+        )
+        session.prefill(warmup_blocks)
+        session.decode(warmup_block)
+        session.cleanup()
+
+    # Reset and measure
+    reset_memory_stats()
+    torch.cuda.synchronize()
+    start_time = time.perf_counter()
+
+    total_forwards = 0
+    tokens_computed = 0
+
+    # === Main benchmark loop ===
+    blocks = [text_block]
+
+    for lat_idx in range(num_latents):
+        # Create new noisy latent
+        new_latent = torch.randn(3, latent_res, latent_res, device=device, dtype=dtype)
+        new_block = ContextBlock(
+            content=new_latent,
+            type='latent',
+            causal=False,
+            shape_meta=(latent_res, latent_res),
+            logsnr=torch.full((1, latent_res, latent_res), -4.0, device=device, dtype=dtype),
+            group_id=lat_idx + 1,
+            id=f"latent_{lat_idx}"
+        )
+        blocks.append(new_block)
+
+        # Create session for this latent generation
+        session = PagedInferenceSession(
+            model, span_emb, span_unemb, page_table, kvt_manager,
+            req_id=warmup_runs + lat_idx
+        )
+
+        # Prefill (first step)
+        logsnr_schedule = torch.linspace(-4.0, 6.0, steps_per_latent + 1, device=device, dtype=dtype)
+        decoded, _ = session.prefill(blocks, active_span_idx=-1)
+
+        total_forwards += 1
+        tokens_computed += num_text + (lat_idx + 1) * latent_tokens_per_span
+
+        # Diffusion steps (decode only)
+        for step in range(1, steps_per_latent):
+            # Update logsnr
+            blocks[-1].logsnr = torch.full(
+                (1, latent_res, latent_res),
+                logsnr_schedule[step].item(),
+                device=device, dtype=dtype
+            )
+
+            # Decode step - ONLY processes active latent tokens
+            decoded_active, _ = session.decode(blocks[-1])
+            total_forwards += 1
+            tokens_computed += latent_tokens_per_span  # Only active tokens
+
+            # Euler step
+            if 'image_vpreds' in decoded_active:
+                v_pred = decoded_active['image_vpreds']
+                blocks[-1].content = blocks[-1].content + 0.1 * v_pred
+
+        session.cleanup()
+
+    torch.cuda.synchronize()
+    total_time = (time.perf_counter() - start_time) * 1000
+
+    mem = get_gpu_memory_mb()
+
+    # Cleanup
+    del model, span_emb, span_unemb, page_table, kvt_manager
+    torch.cuda.empty_cache()
+
+    return ConcatARResult(
+        name="Paged Session",
+        total_latency_ms=total_time,
+        num_outer_steps=num_latents,
+        num_inner_steps=steps_per_latent,
+        total_forward_passes=total_forwards,
+        final_context_tokens=max_tokens,
+        prefix_tokens=num_text,
+        vram_peak_mb=mem['max_allocated'],
+        avg_ms_per_forward=total_time / total_forwards,
+        tokens_computed_total=tokens_computed,
+        blocks_reembedded=0  # Not tracked in this implementation
+    )
+
+
 def print_concat_ar_results(zc: ConcatARResult, kvc: ConcatARResult):
     """Print concatenative AR benchmark comparison."""
     batch_str = f" (bs={zc.batch_size})" if zc.batch_size > 1 else ""
@@ -1146,9 +1359,9 @@ def benchmark_zc(
         window_size=cfg['model']['window_size']
     ).to(device=device, dtype=dtype)
 
-    # Compile model for fused flex_attention kernels
-    if use_compile:  # Don't compile training mode
-        model = torch.compile(model, dynamic=True)
+    # Compile ONLY transformer layers (not embedding/unembedding which have dynamic shapes)
+    if use_compile and not with_grad:  # Don't compile training mode
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1259,7 +1472,7 @@ def benchmark_kvc(
 
     # Compile model for fused flex_attention kernels
     if use_compile:
-        model = torch.compile(model, dynamic=True)
+        compile_transformer_layers(model)
 
     span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
     span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
@@ -1579,6 +1792,45 @@ def main():
 
         if zc_ar and kvc_ar:
             print_concat_ar_results(zc_ar, kvc_ar)
+
+        # === PAGED SESSION BENCHMARK (flex-nano-vllm style) ===
+        print(f"\n[+] Benchmarking Paged Session (flex-nano-vllm style){compile_str}...")
+        try:
+            paged_ar = benchmark_paged_session(
+                cfg, device, dtype, args.num_text, args.latent_res,
+                num_latents=args.ar_latents,
+                steps_per_latent=args.diffusion_steps,
+                use_compile=use_compile
+            )
+            print(f"  -> {paged_ar.total_latency_ms:.2f}ms total, "
+                  f"{paged_ar.avg_ms_per_forward:.2f}ms avg/forward, "
+                  f"{paged_ar.tokens_computed_total} tokens computed")
+
+            # Compare with ZC and KVC
+            if zc_ar and kvc_ar:
+                print("\n" + "-" * 70)
+                print("PAGED SESSION COMPARISON (flex-nano-vllm style):")
+                print("-" * 70)
+                print(f"{'Method':<25} {'Latency (ms)':<15} {'ms/forward':<15} {'Speedup':<10}")
+                print("-" * 70)
+                print(f"{'ZC Concat-AR':<25} {zc_ar.total_latency_ms:<15.2f} "
+                      f"{zc_ar.avg_ms_per_forward:<15.2f} {'1.00x':<10}")
+                print(f"{'KVC Concat-AR':<25} {kvc_ar.total_latency_ms:<15.2f} "
+                      f"{kvc_ar.avg_ms_per_forward:<15.2f} "
+                      f"{zc_ar.total_latency_ms/kvc_ar.total_latency_ms:.2f}x")
+                print(f"{'Paged Session':<25} {paged_ar.total_latency_ms:<15.2f} "
+                      f"{paged_ar.avg_ms_per_forward:<15.2f} "
+                      f"{zc_ar.total_latency_ms/paged_ar.total_latency_ms:.2f}x")
+                print("-" * 70)
+                print(f"Tokens computed: ZC={zc_ar.tokens_computed_total}, "
+                      f"KVC={kvc_ar.tokens_computed_total}, "
+                      f"Paged={paged_ar.tokens_computed_total}")
+
+        except Exception as e:
+            print(f"  -> FAILED: {e}")
+            import traceback
+            traceback.print_exc()
+            paged_ar = None
 
         # === BATCHED BENCHMARK (if batch_size > 1) ===
         if args.batch_size > 1:
