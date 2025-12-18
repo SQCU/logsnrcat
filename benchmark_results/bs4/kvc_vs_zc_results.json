@@ -1,0 +1,39 @@
+{
+  "config": {
+    "num_text": 64,
+    "num_latents": 4,
+    "latent_res": 16,
+    "dtype": "bf16",
+    "model_dim": 256,
+    "model_depth": 8
+  },
+  "results": [
+    {
+      "name": "ZC (grad)",
+      "vram_allocated_mb": 268.1552734375,
+      "vram_peak_mb": 443.51416015625,
+      "latency_ms": 552.1046399953775,
+      "throughput_tokens_per_sec": 231.84010915226446,
+      "output_norm": 181.0,
+      "num_tokens": 128
+    },
+    {
+      "name": "ZC (no_grad)",
+      "vram_allocated_mb": 268.1396484375,
+      "vram_peak_mb": 305.40087890625,
+      "latency_ms": 66.13095999928191,
+      "throughput_tokens_per_sec": 1935.5533323785094,
+      "output_norm": 181.0,
+      "num_tokens": 128
+    },
+    {
+      "name": "KVC (paged)",
+      "vram_allocated_mb": 275.1533203125,
+      "vram_peak_mb": 312.4296875,
+      "latency_ms": 72.45549999643117,
+      "throughput_tokens_per_sec": 1766.6015693260651,
+      "output_norm": 181.0,
+      "num_tokens": 128
+    }
+  ]
+}
