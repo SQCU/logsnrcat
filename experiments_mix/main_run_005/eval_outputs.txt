@@ -1,0 +1,15 @@
+Block 0 (Text): {"angle":1.159,"c1":[0.112,0.868,0.194],"c2":[0.097,0.311,0.92],"tiles":6.76,"type":"checkerboard"}... (Len: 62)
+{"angle":1.159,"c1":[0.112,0.868,0.194],"c2":[0.097,0.311,0.92],"tiles":6.76,"type":"checkerboard"}
+
+Block 2 (Text): {"angle":0.927,"c1":[0.034,0.331,0.64],"c2":[0.6,0.291,0.209],"tiles":5.13,"type":"checkerboard"}... (Len: 60)
+{"angle":0.927,"c1":[0.034,0.331,0.64],"c2":[0.6,0.291,0.209],"tiles":5.13,"type":"checkerboard"}
+
+Block 4 (Text): {"angle":0.763,"c1":[0.346,0.287,0.799],"c2":[0.982,0.276,0.893],"tiles":2.98,"type":"checkerboard"}... (Len: 63)
+{"angle":0.763,"c1":[0.346,0.287,0.799],"c2":[0.982,0.276,0.893],"tiles":2.98,"type":"checkerboard"}
+
+Block 6 (Text): {"angle":1.534,"c1":[0.386,0.069,0.899],"c2":[0.753,0.177,0.216],"tiles":6.86,"type":"checkerboard"}... (Len: 63)
+{"angle":1.534,"c1":[0.386,0.069,0.899],"c2":[0.753,0.177,0.216],"tiles":6.86,"type":"checkerboard"}
+
+Block 8 (Text): !checker007222196649,60139477466],"tiles":3.7.216.98.8,"type":"checkerboard"}..0..2.3],"type.0.6],"":"checker":"checker":"checkerboard"}":21,"type"}":.,01,0.8,"type":"checkerboard"}2,"rtype":"checker,... (Len: 129)
+!checker007222196649,60139477466],"tiles":3.7.216.98.8,"type":"checkerboard"}..0..2.3],"type.0.6],"":"checker":"checker":"checkerboard"}":21,"type"}":.,01,0.8,"type":"checkerboard"}2,"rtype":"checker,""}board"}":0.6],""}":2,"typeboardtype":"checker837],"_pitch":2.98],"cam_yaw":
+

@@ -134,6 +134,13 @@ class BucketingConfig(BaseModel):
     image_buckets: List[ResolutionBucketConfig] = Field(default_factory=list)
     video_buckets: List[VideoBucketConfig] = Field(default_factory=list)
 
+class OnlineVarianceCorrectionConfig(BaseModel):
+    enabled: bool = False
+    num_buckets: int = 20
+    snr_min: float = -4.0
+    snr_max: float = 6.0
+    ema_decay: float = 0.99
+    warmup_steps: int = 100  # Steps before correction kicks in
 
 class TrainingConfig(BaseModel):
     ae_steps: int = 500
@@ -149,9 +156,8 @@ class TrainingConfig(BaseModel):
         
     # NEW: Register Bucketing Config
     bucketing: BucketingConfig = Field(default_factory=BucketingConfig)
-
     precision: str = "fp32"  # <--- ENABLE THIS # Options: "fp32", "bf16", "fp16"
-
+    online_variance_correction: OnlineVarianceCorrectionConfig = Field(default_factory=OnlineVarianceCorrectionConfig)
 
 class SamplingConfig(BaseModel):
     num_samples: int = 8
@@ -178,7 +184,6 @@ class LoggingConfig(BaseModel):
     output_dir: Path = Path("./experiments_mix")
     log_interval: int = 100
     sample_after_training: bool = True
-
 
 # =============================================================================
 # Root Config

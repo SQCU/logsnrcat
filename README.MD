@@ -37,6 +37,10 @@ This project uses `uv` for fast and reliable dependency management.
 
     validate package structure
 
+    `python -m main configs/multisnr_default.toml`
+
+    default run
+
 5. **why low resolution checkerboards?**
 
     technically speaking this project is testing 2 hard things:
@@ -57,6 +61,10 @@ This project uses `uv` for fast and reliable dependency management.
     even the weird torch kernel compilation interceptor server-client pair. i dont recommend using it (easy 2 comment out) but i don't recommend *not* using it either.
 
     * actually maybe the vllm at home stuff doesn't work
+
+    * you might need over 80gb of vram and context lengths over ~16,000 before kv cache overhead yields performance uplift over merely flattening batches, block masking them, and skipping gradients for eval / inference...
+
+    * mixed text-latent spans work and a lot of related abstractions are now basically grid searchable...
 
 7. **why am i reading notes about 'vllm at home'**
 

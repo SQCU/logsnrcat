@@ -18,6 +18,149 @@ from .utils import run_model_forward, predict_velocity_from_blocks
 from .sample import euler_forward_step, euler_reverse_step
 from .config import sanitize_config
 
+# src/train.py - Add near top
+
+class OnlineVarianceTracker:
+    """
+    Tracks per-logsnr-bucket variance online using Welford's algorithm.
+    Uses these statistics to normalize gradients in real-time.
+    """
+    def __init__(
+        self, 
+        num_buckets: int = 20,
+        snr_min: float = -4.0,
+        snr_max: float = 6.0,
+        ema_decay: float = 0.99,
+        warmup_steps: int = 100,
+        device: torch.device = None,
+        **kwargs  # Absorbs 'enabled' and any future config fields
+    ):
+        self.num_buckets = num_buckets
+        self.snr_min = snr_min
+        self.snr_max = snr_max
+        self.ema_decay = ema_decay
+        self.warmup_steps = warmup_steps
+        self.device = device or torch.device('cuda')
+        
+        # Bucket edges
+        self.bucket_edges = torch.linspace(snr_min, snr_max, num_buckets + 1, device=self.device)
+        self.bucket_centers = (self.bucket_edges[:-1] + self.bucket_edges[1:]) / 2
+        
+        # Running stats (EMA)
+        self.running_mean = torch.ones(num_buckets, device=self.device)
+        self.running_var = torch.ones(num_buckets, device=self.device)
+        self.counts = torch.zeros(num_buckets, device=self.device)
+        self.step = 0
+        
+    def get_bucket_indices(self, logsnr_map: torch.Tensor) -> torch.Tensor:
+        """Maps logsnr values to bucket indices [0, num_buckets-1]"""
+        # Clamp to range
+        clamped = logsnr_map.clamp(self.snr_min, self.snr_max - 1e-6)
+        # Normalize to [0, num_buckets)
+        normalized = (clamped - self.snr_min) / (self.snr_max - self.snr_min)
+        indices = (normalized * self.num_buckets).long().clamp(0, self.num_buckets - 1)
+        return indices
+    
+    @torch.no_grad()
+    def update(self, logsnr_map: torch.Tensor, sq_err: torch.Tensor):
+        self.step += 1
+        
+        # sq_err is [*, C, H, W], logsnr_map is [*, 1, H, W]
+        # Reduce sq_err channels to match logsnr_map's singleton channel
+        if sq_err.shape[1] != logsnr_map.shape[1]:
+            sq_err = sq_err.mean(dim=1, keepdim=True)
+        
+        # Broadcast logsnr to match sq_err if needed, then flatten both
+        logsnr_broadcast = logsnr_map.expand_as(sq_err)
+        
+        logsnr_flat = logsnr_broadcast.reshape(-1)
+        err_flat = sq_err.reshape(-1)
+        
+        bucket_idx = self.get_bucket_indices(logsnr_flat)
+        # Update each bucket
+        for b in range(self.num_buckets):
+            mask = (bucket_idx == b)
+            if mask.sum() == 0:
+                continue
+                
+            bucket_err = err_flat[mask]
+            batch_mean = bucket_err.mean()
+            batch_var = bucket_err.var() if mask.sum() > 1 else self.running_var[b]
+            
+            # EMA update
+            self.running_mean[b] = self.ema_decay * self.running_mean[b] + (1 - self.ema_decay) * batch_mean
+            self.running_var[b] = self.ema_decay * self.running_var[b] + (1 - self.ema_decay) * batch_var
+            self.counts[b] += mask.sum()
+    
+    def get_weight_map(self, logsnr_map: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
+        if self.step < self.warmup_steps:
+            return torch.ones(target_shape, device=logsnr_map.device, dtype=logsnr_map.dtype)
+        
+        logsnr_flat = logsnr_map.reshape(-1)
+        bucket_idx = self.get_bucket_indices(logsnr_flat)
+        pixel_var = self.running_var[bucket_idx]
+        
+        weights_flat = 1.0 / (pixel_var.sqrt() + 1e-6)
+        weights_flat = weights_flat / (weights_flat.mean() + 1e-8)
+        
+        # Reshape to logsnr shape, then broadcast to target
+        weights = weights_flat.reshape(logsnr_map.shape)
+        return weights.expand(target_shape)
+    
+    def get_stats_dict(self) -> dict:
+        """Returns current statistics for logging."""
+        return {
+            'bucket_centers': self.bucket_centers.cpu().tolist(),
+            'bucket_means': self.running_mean.cpu().tolist(),
+            'bucket_vars': self.running_var.cpu().tolist(),
+            'bucket_counts': self.counts.cpu().tolist(),
+            'step': self.step,
+            'warmup_complete': self.step >= self.warmup_steps
+        }
+
+def compute_online_weighted_mse(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    logsnr_map: torch.Tensor,
+    tracker: OnlineVarianceTracker,
+    update_stats: bool = True
+) -> tuple[torch.Tensor, dict]:
+    """
+    Computes MSE with online variance-based weighting.
+    
+    The tracker learns the variance structure of THIS run and uses
+    it to normalize gradients in real-time.
+    """
+    # 1. Pre-reduction squared error
+    sq_err = (pred - target) ** 2
+    
+    # 2. Update tracker with unweighted error (before any correction)
+    if update_stats:
+        tracker.update(logsnr_map, sq_err)
+    
+    # 3. Get correction weights from current running estimates
+    weights = tracker.get_weight_map(logsnr_map, sq_err.shape)
+    
+    # 4. Apply correction
+    weighted_sq_err = sq_err * weights
+    
+    # 5. Stats for logging
+    with torch.no_grad():
+        stats = {
+            'loss_unweighted': sq_err.mean().item(),
+            'loss_weighted': weighted_sq_err.mean().item(),
+            'weight_mean': weights.mean().item(),
+            'weight_min': weights.min().item(),
+            'weight_max': weights.max().item(),
+            'correction_ratio': weighted_sq_err.mean().item() / (sq_err.mean().item() + 1e-8),
+            **{f'var_bucket_{i}': v for i, v in enumerate(tracker.running_var.cpu().tolist())}
+        }
+    
+    # 6. Final reduction
+    loss = weighted_sq_err.mean()
+    
+    return loss, stats
+
 def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
     """
     Scans config to find the maximum resolution required for video caching.
@@ -95,6 +238,8 @@ def train_autoembed(components, config, iterator, logger=None):
     
     print(f"\n--- Training: Auto-Encoder ({mode.upper()}) ---")
     model = components[0]
+    # this is bad. why are we doing this? oh yes, we are doing this because this is an immature single-device training script.
+    device = config['device']
     # 3. Build Manager
     # We explicitly look up the stride from the model instance, or the config dict
     model_stride = model.patch_embedder.stride
@@ -206,6 +351,13 @@ def train_denoise(components, config, iterator, logger=None):
 
     print(f"\n--- Training: Denoiser ({mode.upper()}) ---")
     model = components[0]
+    device = config['device']
+    var_cfg = config['training']['online_variance_correction']
+    if var_cfg['enabled']:
+        variance_tracker = OnlineVarianceTracker(device=device, **var_cfg)
+    else:
+        variance_tracker = None
+
     # 3. Build Manager
     # We explicitly look up the stride from the model instance, or the config dict
     model_stride = model.patch_embedder.stride
@@ -295,22 +447,42 @@ def train_denoise(components, config, iterator, logger=None):
                         latent_cursor += 1
                         
                         # Velocity MSE
-                        sq_err_v = F.mse_loss(v_pred, target_v, reduction="none")
-                        loss_v_accum += sq_err_v.mean()
+                        # Inside the latent block processing:
+                        if variance_tracker is not None:
+                            loss_v, loss_stats = compute_online_weighted_mse(
+                                v_pred, target_v, target_l, variance_tracker
+                            )
+                            loss_v_accum += loss_v
+                            # Stats
+                            step_stats.append({
+                                'step': i,
+                                'source': getattr(block, 'source', 'unknown'),
+                                'type': 'latent',
+                                'loss': loss_stats['loss_unweighted'],
+                                'loss_weighted': loss_stats['loss_weighted'],
+                                'loss_var': loss_stats.get('weight_max', 0) - loss_stats.get('weight_min', 0),
+                                'logsnr': target_l.mean().detach().item(),
+                                'resolution': block.content.shape[-1] * block.content.shape[-2],
+                                'weight_mean': loss_stats['weight_mean'],
+                                'correction_ratio': loss_stats['correction_ratio']
+                            })
+                        else:
+                            sq_err_v = F.mse_loss(v_pred, target_v, reduction="none")
+                            loss_v_accum += sq_err_v.mean()
+                            # Stats
+                            step_stats.append({
+                                'step': i,
+                                'source': getattr(block, 'source', 'unknown'),
+                                'type': 'latent',
+                                'loss': sq_err_v.mean().detach().item(),
+                                'loss_var': sq_err_v.var().detach().item(),
+                                'logsnr': target_l.mean().detach().item(),
+                                'resolution': block.content.shape[-1] * block.content.shape[-2]
+                            })
                         
                         # Lambda L1
                         loss_lam_accum += F.l1_loss(pred_l, target_l)
-                        
-                        # Stats
-                        step_stats.append({
-                            'step': i,
-                            'source': getattr(block, 'source', 'unknown'),
-                            'type': 'latent',
-                            'loss': sq_err_v.mean().detach().item(),
-                            'loss_var': sq_err_v.var().detach().item(),
-                            'logsnr': target_l.mean().detach().item(),
-                            'resolution': block.content.shape[-1] * block.content.shape[-2]
-                        })
+                        # end of step paperwork
                         valid_latent_samples += 1
                 
                 # --- B. Text Autoregressive Loss ---

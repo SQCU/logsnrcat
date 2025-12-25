@@ -563,7 +563,7 @@ def sample_viz_dset(components, iterator, config_dict, logger):
             
             # Map construction
             H, W = b.content.shape[-2:]
-            start_map = torch.full((1, H, W), start_snr, device=device)
+            start_map = b.logsnr    #if this doesn't have a logsnr value just crash the entire run lol.
             end_map = torch.full((1, H, W), target_snr, device=device)
             
             # Explicit Noise Injection

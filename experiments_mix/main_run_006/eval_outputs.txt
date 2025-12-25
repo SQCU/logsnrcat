@@ -1,0 +1,15 @@
+Block 0 (Text): {"angle":4.404,"c1":[0.444,0.295,0.854],"c2":[0.593,0.962,0.204],"tiles":4.68,"type":"checkerboard"}... (Len: 63)
+{"angle":4.404,"c1":[0.444,0.295,0.854],"c2":[0.593,0.962,0.204],"tiles":4.68,"type":"checkerboard"}
+
+Block 2 (Text): {"angle":5.242,"c1":[0.117,0.237,0.076],"c2":[0.786,0.358,0.314],"tiles":6.24,"type":"checkerboard"}... (Len: 63)
+{"angle":5.242,"c1":[0.117,0.237,0.076],"c2":[0.786,0.358,0.314],"tiles":6.24,"type":"checkerboard"}
+
+Block 4 (Text): {"angle":2.142,"c1":[0.302,0.408,0.446],"c2":[0.518,0.809,0.909],"tiles":7.2,"type":"checkerboard"}... (Len: 62)
+{"angle":2.142,"c1":[0.302,0.408,0.446],"c2":[0.518,0.809,0.909],"tiles":7.2,"type":"checkerboard"}
+
+Block 6 (Text): {"angle":0.39,"c1":[0.312,0.754,0.693],"c2":[0.399,0.495,0.262],"tiles":6.48,"type":"checkerboard"}... (Len: 62)
+{"angle":0.39,"c1":[0.312,0.754,0.693],"c2":[0.399,0.495,0.262],"tiles":6.48,"type":"checkerboard"}
+
+Block 8 (Text): !00"}_disttype_pitch2_yawctor.2224"}_pitch1"}":52.07211":0113],"487,"type":"checkerboard"}checkerboard"}24.645521998":347,"typeus103443825,""}_minor":.2,"camtorustorus71,"stripe_freq":212._major861.1"... (Len: 129)
+!00"}_disttype_pitch2_yawctor.2224"}_pitch1"}":52.07211":0113],"487,"type":"checkerboard"}checkerboard"}24.645521998":347,"typeus103443825,""}_minor":.2,"camtorustorus71,"stripe_freq":212._major861.1":2,"type":"_freq_minorus"}tor421_minor828,"typecam"}_pitch_minorcam"}us
+

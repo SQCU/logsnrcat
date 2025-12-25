@@ -92,6 +92,7 @@ def main():
     cfg['dtype'] = dtype
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
+    cfg['device'] = device
     
     # 3. Print Config Summary (Using Dict Access)
     print("=" * 60)

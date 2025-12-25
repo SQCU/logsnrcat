@@ -24,8 +24,8 @@ stride = 4
 mlp_depth = 2
 
 [training]
-ae_steps = 50
-steps = 300
+ae_steps = 300
+steps = 1000
 lambda_coeff = 0.2
 mode = "naive"
 batch_size = 8
@@ -34,12 +34,20 @@ compile_dynamic = true
 schedule_bounds = [5.0, -4.0]       #this dictates what the 'x_0' lsnr is, vs what the 'z_T' lsnr is. controls some eval samplers too.
 precision = "bf16"  # <--- ENABLE THIS
 
+[training.online_variance_correction]
+enabled = true  # flip to true for ablation
+num_buckets = 20
+snr_min = -5.0   # match your dataset noise_params range
+snr_max = -4.0
+ema_decay = 0.99
+warmup_steps = 100
+
 [training.bucketing]
 enabled = true
 # These two define the "Computational Budget" per step.
 # Cost = (base_resolution / stride)^2 * base_batch_size
 base_resolution = 32
-base_batch_size = 128 #128 if using base_res 16
+base_batch_size = 64 #128 if using base_res 16
 caching_resolution = 128
 
 # --- Bucket 1: Low Res (32x32) ---
