@@ -557,8 +557,12 @@ def sample_viz_dset(components, iterator, config_dict, logger):
     noisy_inputs_vis = []
     
     latent_idx = 0
+    # Store initial logsnr maps for visualization (BEFORE mutation)
+    initial_lsnr_maps = []
+
     for i, b in enumerate(ctx.blocks):
         if b.type == 'latent':
+            initial_lsnr_maps.append(b.logsnr.clone())  # <-- Capture BEFORE overwriting
             device = b.content.device
             
             # Map construction
@@ -607,7 +611,7 @@ def sample_viz_dset(components, iterator, config_dict, logger):
         "x0": x0_gt,
         "noisy_input": noisy_inputs_vis,
         "reconstruction": recon,
-        "logsnr_map": maps
+        "logsnr_map": initial_lsnr_maps  # <-- Use the captured initial maps
     }
     
     from .plotting import plot_dset_reconstruction
