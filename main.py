@@ -48,15 +48,51 @@ def build_components(cfg, device):
     dtype_str = cfg['training']['precision']
     dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
     dtype = cfg['dtype']
-    
+
     model = build_model(cfg, device).to(dtype=dtype)
     if cfg['training']['compile']:
         model = torch.compile(model, dynamic=cfg['training']['compile_dynamic'])
-    
-    # Helpers share the model instance
-    span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
-    span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
-    
+
+    # Check if sparse AE is enabled
+    sparse_ae_cfg = cfg['training']['sparse_ae']
+    if sparse_ae_cfg['enabled']:
+        from kmaze_ae.model_sparse_dim import (
+            SparsePerDimFSQAutoencoder,
+            SparseAEPatchEmbedder,
+            SparseAEPatchUnembedder
+        )
+
+        # Build sparse AE with config
+        sparse_ae = SparsePerDimFSQAutoencoder(
+            n_levels=sparse_ae_cfg['n_levels'],
+            patch_size=sparse_ae_cfg['patch_size'],
+            image_size=256,  # Will be dynamic per batch
+            hidden_dim=sparse_ae_cfg['hidden_dim'],
+            code_dim=sparse_ae_cfg['code_dim'],
+            k_per_patch=sparse_ae_cfg['k_per_patch'],
+            residual_scale=sparse_ae_cfg['residual_scale'],
+            fourier_dim=sparse_ae_cfg['fourier_dim']
+        ).to(device, dtype=dtype)
+
+        if cfg['training']['compile']:
+            sparse_ae = torch.compile(sparse_ae, dynamic=cfg['training']['compile_dynamic'])
+
+        # Create interface wrappers
+        ae_embedder = SparseAEPatchEmbedder(sparse_ae, embed_dim=cfg['model']['dim'])
+        ae_unembedder = SparseAEPatchUnembedder(sparse_ae, ae_embedder)
+
+        # Use sparse AE wrappers instead of model's patch embedder/unembedder
+        span_emb = SpanEmbedder(model.text_embed, ae_embedder)
+        span_unemb = SpanUnembedder(model.text_head, ae_unembedder)
+
+        print(f"[SparseAE] Enabled: {sparse_ae_cfg['n_levels']} levels, "
+              f"code_dim={sparse_ae_cfg['code_dim']}, k={sparse_ae_cfg['k_per_patch']}")
+    else:
+        # Standard embedder/unembedder from model
+        span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
+        span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
+        sparse_ae = None
+
     # Page Table
     pt_cfg = cfg['page_table']
     page_table = PageTable(
@@ -66,6 +102,10 @@ def build_components(cfg, device):
         max_logical_blocks=pt_cfg['max_logical_blocks'],
         device=device
     )
+
+    # Return extended tuple when sparse AE is enabled
+    if sparse_ae is not None:
+        return (model, span_emb, span_unemb, page_table, sparse_ae)
     return (model, span_emb, span_unemb, page_table)
 
 
@@ -146,7 +186,7 @@ def main():
                 sampler.sample_viz_dset(components, val_iterator, s_dict, logger)
                 
             # 2. Causal Sweep (Video Gen) - Now with Resolution Sweep
-            if samp_cfg.get('enable_sweep', False):
+            if samp_cfg['enable_sweep']:
                 print("Running Causal Sweep...")
                 for res in samp_cfg['resolutions']:
                     s_dict = samp_cfg.copy()
@@ -155,7 +195,7 @@ def main():
                     sampler.sample_viz_causal_sweep(components, val_iterator, s_dict, logger)
                     
                 # 3. Custom Queries (Text / Mixed)
-            if samp_cfg.get('queries'):
+            if samp_cfg['queries']:
                 print(f"Running {len(samp_cfg['queries'])} custom eval sessions...")
     
                 # Seed Context: Use FIRST split explicitly (avoids mixed resolution/type issues)

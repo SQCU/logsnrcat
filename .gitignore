@@ -7,3 +7,5 @@ __pycache__
 configs/alt
 
 experiments_alt
+
+kmaze_ae

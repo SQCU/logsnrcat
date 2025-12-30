@@ -75,12 +75,12 @@ class VideoParams(BaseModel):
 
 
 class DatasetSplit(BaseModel):
-    type: Literal["checkerboard", "torus", "video"]
+    type: Literal["checkerboard", "torus", "video", "fractal"]
     ratio: float = 1.0
     noise_mode: Literal["uniform", "split"] = "uniform"
     noise_params: NoiseParams = Field(default_factory=NoiseParams)
-    
-    # FIX: Enforce non-nullable dictionary. 
+
+    # FIX: Enforce non-nullable dictionary.
     # Missing TOML key -> {} instead of None.
     params: Dict[str, Any] = Field(default_factory=dict)
     
@@ -142,6 +142,31 @@ class OnlineVarianceCorrectionConfig(BaseModel):
     ema_decay: float = 0.99
     warmup_steps: int = 100  # Steps before correction kicks in
 
+
+class SparseAEConfig(BaseModel):
+    """Configuration for kmaze_ae sparse hierarchical autoencoder."""
+    enabled: bool = False
+    n_levels: int = 6
+    patch_size: int = 16
+    hidden_dim: int = 256
+    code_dim: int = 128
+    k_per_patch: int = 4  # Sparsity control: keep k of code_dim dims
+    residual_scale: float = 2.0
+    fourier_dim: int = 16
+    ae_loss_weight: float = 0.1
+    logsnr_loss_weight: float = 0.1
+
+
+class FractalParams(BaseModel):
+    """Parameters for procedural fractal generation."""
+    seed: int = 42
+    fractal_types: List[str] = Field(default_factory=lambda: ["mandelbrot", "julia", "burning_ship"])
+    color_palette: str = "random"  # "random", "fire", "ice", "earth"
+    max_iterations: int = 256
+    zoom_range: Tuple[float, float] = (0.5, 4.0)
+    resolution: Optional[int] = None
+    text_position: str = "none"
+
 class TrainingConfig(BaseModel):
     ae_steps: int = 500
     steps: int = 500
@@ -153,11 +178,12 @@ class TrainingConfig(BaseModel):
     schedule_bounds: Tuple[float, float] = (5.0, -4.0)
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     ae_optimizer: AEOptimizerConfig = Field(default_factory=AEOptimizerConfig)
-        
+
     # NEW: Register Bucketing Config
     bucketing: BucketingConfig = Field(default_factory=BucketingConfig)
     precision: str = "fp32"  # <--- ENABLE THIS # Options: "fp32", "bf16", "fp16"
     online_variance_correction: OnlineVarianceCorrectionConfig = Field(default_factory=OnlineVarianceCorrectionConfig)
+    sparse_ae: SparseAEConfig = Field(default_factory=SparseAEConfig)
 
 class SamplingConfig(BaseModel):
     num_samples: int = 8

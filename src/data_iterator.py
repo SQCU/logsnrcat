@@ -20,12 +20,12 @@ class FunctionalIterator:
         self.gen_func = generator_func
         self.render_func = renderer_func
         self.config = config
-        self.seed = config.get('seed', 42)
-        self.resolution_override = config.get('resolution', None)
-        
+        self.seed = config['seed']
+        self.resolution_override = config['resolution']
+
         # Yassification: Configurable Text Position
         # options: "prefix", "suffix", "none", "random"
-        self.text_pos = config.get('text_position', 'prefix')
+        self.text_pos = config['text_position']
 
     def generate_batch_list(self, batch_size: int, resolution: int = 32, **kwargs) -> List[ContextBlock]:
         start_group_id = kwargs.get('start_group_id', 0)
@@ -82,11 +82,11 @@ class CompositeIterator:
             # Support both object and dict config due to loading nuances
             if hasattr(split_cfg, 'model_dump'):
                 split_cfg = split_cfg.model_dump()
-            
-            sType = split_cfg.get('type')
-            params = split_cfg.get('params', {})
-            ratio = split_cfg.get('ratio', 1.0)
-            
+
+            sType = split_cfg['type']
+            params = split_cfg['params']
+            ratio = split_cfg['ratio']
+
             iterator = None
             if sType == 'checkerboard':
                 iterator = FunctionalIterator(device, generate_checkerboard_query, render_checkerboard, params)
@@ -96,11 +96,14 @@ class CompositeIterator:
                 # Video needs the complex logic from old data.py, presumably imported or re-implemented.
                 # For this functional refactor, we focus on the generative ones.
                 # Assuming VideoFolderIterator exists in .data (legacy) or ported here.
-                # We will skip implementation for brevity unless requested, 
+                # We will skip implementation for brevity unless requested,
                 # but the Composite structure supports it.
                 from .data import VideoFolderIterator
                 iterator = VideoFolderIterator(params['path'], device=device, caching_resolution=kwargs['caching_resolution'])
-            
+            elif sType == 'fractal':
+                from .fractal import FractalIterator
+                iterator = FractalIterator(device, params)
+
             if iterator:
                 self.splits.append({
                     'name': name,
@@ -108,8 +111,8 @@ class CompositeIterator:
                     'ratio': ratio,
                     'type': sType,          # <--- Stored for dispatch
                     'params': params,       # <--- Stored for config lookup
-                    'noise_mode': split_cfg.get('noise_mode', 'uniform'),
-                    'noise_params': split_cfg.get('noise_params', {})
+                    'noise_mode': split_cfg['noise_mode'],
+                    'noise_params': split_cfg['noise_params']
                 })
         
         
@@ -143,7 +146,7 @@ class CompositeIterator:
                     overridden = []
                     for frame in seq_conf:
                         f = frame.copy()
-                        rel = f.get('relative_res', 1.0)
+                        rel = f['relative_res']
                         f['res'] = int(res_target * rel)
                         # Ensure even
                         if f['res'] % 2 != 0: f['res'] += 1

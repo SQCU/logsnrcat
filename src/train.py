@@ -167,27 +167,27 @@ def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
     Considers both explicit bucket definitions and sequence relative scaling.
     """
     max_res = 32 # Floor
-    
+
     # 1. Check Buckets (if enabled)
-    bucketing = config['training'].get('bucketing', {'enabled': False})
-    if bucketing.get('enabled', False):
-        buckets = bucketing.get('image_buckets', [])
+    bucketing = config['training']['bucketing']
+    if bucketing['enabled']:
+        buckets = bucketing['image_buckets']
         if buckets:
             max_bucket_res = max(b['resolution'] for b in buckets)
         else:
             max_bucket_res = 32
     else:
         max_bucket_res = 0 # Not driving resolution
-        
+
     # 2. Check Sequence Structures
     # We need to find the max 'res' (absolute) OR max 'relative_res'
-    dataset_mix = config.get('dataset_mix', {})
-    
+    dataset_mix = config['dataset_mix']
+
     max_seq_res_abs = 0
     max_seq_rel = 1.0
-    
+
     for split_name, split_cfg in dataset_mix.items():
-        if split_cfg.get('type') == 'video':
+        if split_cfg['type'] == 'video':
             params = split_cfg['params']
             seq_struct = params['sequence_structure']
             for frame in seq_struct:
@@ -195,9 +195,9 @@ def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
                 max_seq_res_abs = max(max_seq_res_abs, frame['res'])
                 # Track relative max
                 max_seq_rel = max(max_seq_rel, frame['relative_res'])
-    
+
     # 3. Compute Global Max
-    if bucketing.get('enabled', False):
+    if bucketing['enabled']:
         # If bucketing, the demand is Bucket * Relative
         # We assume the worst case: Biggest Bucket * Biggest Relative Factor
         res_from_buckets = int(max_bucket_res * max_seq_rel)
@@ -206,10 +206,10 @@ def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
     else:
         # If no bucketing, we rely on the absolute definitions
         max_res = max(max_res, max_seq_res_abs)
-        
+
     # Alignment (Optional, but safe)
     if max_res % 2 != 0: max_res += 1
-    
+
     return max_res
 
 # ==============================================================================
