@@ -177,8 +177,17 @@ def main():
 
         use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
         # FIX: Use new torch.amp API
-        scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
+        scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
         with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+            # 0. AE vs Diffusion Diagnostic (NEW)
+            # Helps identify whether issues stem from AE compression or diffusion
+            print("Running AE vs Diffusion Diagnostic...")
+            for res in samp_cfg['resolutions'][:2]:  # Run for first 2 resolutions
+                s_dict = samp_cfg.copy()
+                s_dict['mode'] = cfg['training']['mode']
+                s_dict['res'] = res
+                sampler.diagnostic_ae_vs_diffusion(components, val_iterator, s_dict, logger)
+
             # 1. Dataset Reconstruction (Latent Refinement)
             for res in samp_cfg['resolutions']:
                 s_dict = samp_cfg.copy()

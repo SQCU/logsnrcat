@@ -468,3 +468,100 @@ def plot_causal_sweep_v2(results: list, output_path, split_name: str):
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"    Saved: {output_path}")
+
+
+def plot_ae_diagnostic(diagnostics: list, logger, name: str = "ae_diagnostic"):
+    """
+    Visualizes AE vs Diffusion reconstruction comparison.
+
+    Layout per sample:
+        Row: [Ground Truth] [AE Recon] [Noisy Input] [Diffusion Recon] [Error Maps]
+
+    Args:
+        diagnostics: List of dicts from diagnostic_ae_vs_diffusion, each containing:
+            - 'x0_clean': Ground truth tensor [C,H,W]
+            - 'ae_recon': AE reconstruction [C,H,W] or None
+            - 'diff_recon': Diffusion reconstruction [C,H,W]
+            - 'z_noisy': Noisy input [C,H,W]
+            - 'ae_mse': float
+            - 'diff_mse': float
+            - 'split': str, data source name
+        logger: ExperimentLogger
+        name: Output filename
+    """
+    if not diagnostics:
+        return
+
+    n = len(diagnostics)
+    n_cols = 6  # GT, AE, Noisy, Diff, AE Error, Diff Error
+
+    fig, axes = plt.subplots(n, n_cols, figsize=(2.5 * n_cols, 2.5 * n))
+    if n == 1:
+        axes = axes.reshape(1, -1)
+
+    fig.suptitle("AE vs Diffusion Diagnostic", fontsize=12)
+
+    def to_img(t):
+        if t is None:
+            return np.zeros((32, 32, 3))
+        return t.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+
+    for i, d in enumerate(diagnostics):
+        gt_np = to_img(d['x0_clean'])
+        ae_np = to_img(d['ae_recon'])
+        noisy_np = to_img(d['z_noisy'])
+        diff_np = to_img(d['diff_recon'])
+
+        # Column 0: Ground Truth
+        axes[i, 0].imshow(gt_np)
+        axes[i, 0].axis('off')
+        if i == 0:
+            axes[i, 0].set_title("GT", fontsize=9)
+
+        # Column 1: AE Reconstruction
+        axes[i, 1].imshow(ae_np)
+        axes[i, 1].axis('off')
+        if i == 0:
+            axes[i, 1].set_title("AE Recon", fontsize=9)
+
+        # Column 2: Noisy Input
+        axes[i, 2].imshow(noisy_np)
+        axes[i, 2].axis('off')
+        if i == 0:
+            axes[i, 2].set_title("Noisy", fontsize=9)
+
+        # Column 3: Diffusion Reconstruction
+        axes[i, 3].imshow(diff_np)
+        axes[i, 3].axis('off')
+        if i == 0:
+            axes[i, 3].set_title("Diff Recon", fontsize=9)
+
+        # Column 4: AE Error Map
+        if d['ae_recon'] is not None:
+            ae_err = ((ae_np - gt_np) ** 2).mean(axis=2)
+            axes[i, 4].imshow(ae_err, cmap='inferno', vmin=0, vmax=0.1)
+        else:
+            axes[i, 4].imshow(np.zeros_like(gt_np[:, :, 0]), cmap='inferno', vmin=0, vmax=0.1)
+        axes[i, 4].axis('off')
+        if i == 0:
+            axes[i, 4].set_title("AE Err", fontsize=9)
+
+        # Column 5: Diffusion Error Map
+        diff_err = ((diff_np - gt_np) ** 2).mean(axis=2)
+        axes[i, 5].imshow(diff_err, cmap='inferno', vmin=0, vmax=0.1)
+        axes[i, 5].axis('off')
+        if i == 0:
+            axes[i, 5].set_title("Diff Err", fontsize=9)
+
+        # Row label with MSE values
+        import math
+        ae_mse_str = f"{d['ae_mse']:.4f}" if not math.isnan(d['ae_mse']) else "N/A"
+        label = f"{d['split']}\nAE:{ae_mse_str}\nDiff:{d['diff_mse']:.4f}"
+        axes[i, 0].text(
+            -0.15, 0.5, label,
+            transform=axes[i, 0].transAxes,
+            va='center', ha='right', fontsize=7
+        )
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)

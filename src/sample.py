@@ -527,16 +527,195 @@ def execute_multiturn_session(
     return input_ctx.get_spans()
 
 @torch.no_grad()
+def diagnostic_ae_vs_diffusion(components, iterator, config_dict, logger):
+    """
+    Diagnostic: Separates AE reconstruction quality from diffusion quality.
+
+    Produces:
+    1. AE-only reconstruction (encode then decode, no diffusion)
+    2. Full pipeline reconstruction (with diffusion steps)
+    3. Comparison metrics (MSE, PSNR) for both
+
+    This helps identify whether training issues stem from AE compression loss
+    or from the diffusion model's denoising capability.
+    """
+    from .plotting import plot_ae_diagnostic
+    import math
+
+    res = config_dict.get('res', 64)
+    n_samples = config_dict.get('num_samples', 8)
+    steps = config_dict.get('steps', 25)
+    target_snr = config_dict.get('target_logsnr', 10.0)
+
+    # Get samples from each split for stratified diagnostics
+    split_names = iterator.get_split_names()
+    n_per_split = max(1, n_samples // max(1, len(split_names)))
+
+    all_diagnostics = []
+
+    for split_name in split_names:
+        try:
+            blocks = iterator.generate_from_split(split_name, count=n_per_split, resolution=res)
+        except Exception as e:
+            print(f"    Diagnostic skip {split_name}: {e}")
+            continue
+
+        latent_blocks = [b for b in blocks if b.type == 'latent']
+        if not latent_blocks:
+            continue
+
+        for b in latent_blocks:
+            x0_clean = b.content.clone()
+            logsnr_map = b.logsnr.clone() if b.logsnr is not None else torch.zeros(1, *x0_clean.shape[-2:], device=x0_clean.device)
+            device = x0_clean.device
+
+            # === 1. AE-only reconstruction ===
+            # Get the sparse AE from components (via span_emb -> ae_embedder -> ae)
+            span_emb = components[1]
+            span_unemb = components[2]
+
+            ae_recon = None
+            ae_mse = float('nan')
+
+            # Check if we're using sparse AE wrappers
+            if hasattr(span_emb, 'patch_embedder') and hasattr(span_emb.patch_embedder, 'ae'):
+                ae = span_emb.patch_embedder.ae
+
+                # Direct AE forward pass (bypass diffusion)
+                ae_out = ae(x0_clean.unsqueeze(0), logsnr_map.unsqueeze(0))
+                ae_recon = ae_out['recon'].squeeze(0)
+                ae_mse = F.mse_loss(ae_recon, x0_clean).item()
+                ae_sparsity = ae_out['sparsity'].item() if isinstance(ae_out['sparsity'], torch.Tensor) else ae_out['sparsity']
+            elif hasattr(span_emb, 'patch_embedder'):
+                # Standard patch embedder - test roundtrip
+                z_emb, shape = span_emb.patch_embedder(x0_clean, logsnr_map)
+                if hasattr(span_unemb, 'patch_unembedder'):
+                    ae_recon_full = span_unemb.patch_unembedder(z_emb, shape)
+                    ae_recon = ae_recon_full[:3]  # RGB channels only
+                    ae_mse = F.mse_loss(ae_recon, x0_clean).item()
+                ae_sparsity = 0.0  # Not sparse
+
+            # === 2. Full pipeline reconstruction (with diffusion) ===
+            # Noise the input
+            start_snr = -4.0
+            H, W = x0_clean.shape[-2:]
+            start_map = torch.full((1, H, W), start_snr, device=device)
+            end_map = torch.full((1, H, W), target_snr, device=device)
+
+            alpha, sigma = logsnr_to_alpha_sigma(start_map)
+            z_noisy = x0_clean * alpha + torch.randn_like(x0_clean) * sigma
+
+            # Create context and run diffusion
+            noisy_block = ContextBlock(
+                content=z_noisy,
+                type='latent',
+                causal=True,
+                shape_meta=x0_clean.shape,
+                logsnr=start_map,
+                group_id=0,
+                id='diag_diff'
+            )
+            ctx = MultiTurnContext([noisy_block])
+            targets = [{'idx': 0, 'start_map': start_map, 'end_map': end_map}]
+
+            taufield_spatial_sampling(
+                components, ctx, targets,
+                {'steps': steps, 'mode': config_dict.get('mode', 'naive')}
+            )
+
+            diff_recon = ctx.blocks[0].content
+            diff_mse = F.mse_loss(diff_recon, x0_clean).item()
+
+            # === 3. Compute comparative metrics ===
+            def mse_to_psnr(mse, max_val=1.0):
+                if mse <= 0:
+                    return float('inf')
+                return 10 * math.log10((max_val ** 2) / mse)
+
+            ae_psnr = mse_to_psnr(ae_mse) if not math.isnan(ae_mse) else float('nan')
+            diff_psnr = mse_to_psnr(diff_mse)
+
+            diagnostic = {
+                'split': split_name,
+                'resolution': res,
+                'x0_clean': x0_clean.cpu(),
+                'ae_recon': ae_recon.cpu() if ae_recon is not None else None,
+                'diff_recon': diff_recon.cpu(),
+                'z_noisy': z_noisy.cpu(),
+                'ae_mse': ae_mse,
+                'diff_mse': diff_mse,
+                'ae_psnr': ae_psnr,
+                'diff_psnr': diff_psnr,
+                'ae_sparsity': ae_sparsity if 'ae_sparsity' in dir() else 0.0,
+                'input_snr': start_snr,
+                'target_snr': target_snr,
+            }
+            all_diagnostics.append(diagnostic)
+
+    # === 4. Log summary statistics ===
+    if all_diagnostics:
+        ae_mses = [d['ae_mse'] for d in all_diagnostics if not math.isnan(d['ae_mse'])]
+        diff_mses = [d['diff_mse'] for d in all_diagnostics]
+
+        summary = {
+            'n_samples': len(all_diagnostics),
+            'ae_mse_mean': sum(ae_mses) / len(ae_mses) if ae_mses else float('nan'),
+            'ae_mse_std': (sum((m - sum(ae_mses)/len(ae_mses))**2 for m in ae_mses) / len(ae_mses)) ** 0.5 if len(ae_mses) > 1 else 0,
+            'diff_mse_mean': sum(diff_mses) / len(diff_mses),
+            'diff_mse_std': (sum((m - sum(diff_mses)/len(diff_mses))**2 for m in diff_mses) / len(diff_mses)) ** 0.5 if len(diff_mses) > 1 else 0,
+            'ae_better_count': sum(1 for d in all_diagnostics if d['ae_mse'] < d['diff_mse'] and not math.isnan(d['ae_mse'])),
+        }
+
+        # Log text summary
+        log_msg = f"""
+=== AE vs Diffusion Diagnostic @ {res}px ===
+Samples: {summary['n_samples']}
+AE Reconstruction:
+  MSE: {summary['ae_mse_mean']:.6f} ± {summary['ae_mse_std']:.6f}
+Diffusion Reconstruction:
+  MSE: {summary['diff_mse_mean']:.6f} ± {summary['diff_mse_std']:.6f}
+AE better than Diffusion: {summary['ae_better_count']}/{summary['n_samples']}
+
+Interpretation:
+  - If AE MSE >> Diff MSE: AE is bottleneck (increase capacity/decrease sparsity)
+  - If AE MSE << Diff MSE: Diffusion is bottleneck (train longer/tune schedule)
+  - If AE MSE ~ Diff MSE: Balanced pipeline
+"""
+        print(log_msg)
+        logger.log_text("ae_vs_diff_diagnostic.txt", log_msg)
+
+        # Plot visual comparison
+        try:
+            plot_ae_diagnostic(all_diagnostics[:8], logger, f"ae_diagnostic_{res}")
+        except Exception as e:
+            print(f"    Diagnostic plot failed: {e}")
+
+    return all_diagnostics
+
+
+@torch.no_grad()
 def sample_viz_dset(components, iterator, config_dict, logger):
     """
     Visualization Wrapper: Inplace Refinement of Dataset Samples.
     Plots: [GT (Clean), Noisy Input, Reconstruction, LogSNR Map]
+
+    Now samples from EACH split to ensure stratified evaluation across all data types.
     """
-    n = config_dict.get('num_samples', 4)
+    n_per_split = max(1, config_dict.get('num_samples', 4) // max(1, len(iterator.get_split_names())))
     res = config_dict.get('res', 32)
-    
-    # 1. Fetch Clean Data (Ground Truth)
-    clean_blocks = iterator.generate_batch_list(n, resolution=res)
+
+    # 1. Fetch Clean Data from EACH split (stratified sampling)
+    clean_blocks = []
+    split_names = iterator.get_split_names()
+
+    for split_name in split_names:
+        try:
+            split_blocks = iterator.generate_from_split(split_name, count=n_per_split, resolution=res)
+            clean_blocks.extend(split_blocks)
+        except Exception as e:
+            print(f"    Skipping split {split_name} for dset viz: {e}")
+            continue
+
     if not clean_blocks: return
 
     # 2. Prepare Session Context

@@ -2,7 +2,7 @@
 # Use this for training the kmaze_ae jointly with the transformer
 
 [model]
-dim = 256
+dim = 512
 depth = 8
 num_heads = 8
 topo_dim = 3
@@ -29,7 +29,7 @@ enabled = true
 n_kv_heads = 2         # 8 query heads / 2 kv heads = 4x sharing
 
 [training]
-ae_steps = 500
+ae_steps = 1000
 steps = 2000
 lambda_coeff = 0.2
 mode = "naive"

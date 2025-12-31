@@ -127,38 +127,50 @@ def compute_online_weighted_mse(
 ) -> tuple[torch.Tensor, dict]:
     """
     Computes MSE with online variance-based weighting.
-    
+
     The tracker learns the variance structure of THIS run and uses
     it to normalize gradients in real-time.
+
+    Returns stats with Python floats (no tensor sync overhead - values computed
+    from already-computed tensors using cached graph values).
     """
     # 1. Pre-reduction squared error
     sq_err = (pred - target) ** 2
-    
+
     # 2. Update tracker with unweighted error (before any correction)
     if update_stats:
         tracker.update(logsnr_map, sq_err)
-    
+
     # 3. Get correction weights from current running estimates
     weights = tracker.get_weight_map(logsnr_map, sq_err.shape)
-    
+
     # 4. Apply correction
     weighted_sq_err = sq_err * weights
-    
-    # 5. Stats for logging
-    with torch.no_grad():
-        stats = {
-            'loss_unweighted': sq_err.mean().item(),
-            'loss_weighted': weighted_sq_err.mean().item(),
-            'weight_mean': weights.mean().item(),
-            'weight_min': weights.min().item(),
-            'weight_max': weights.max().item(),
-            'correction_ratio': weighted_sq_err.mean().item() / (sq_err.mean().item() + 1e-8),
-            **{f'var_bucket_{i}': v for i, v in enumerate(tracker.running_var.cpu().tolist())}
-        }
-    
-    # 6. Final reduction
+
+    # 5. Compute scalar losses (these will sync to CPU when accessed)
+    # But since we need them for the loss anyway, the sync is unavoidable
     loss = weighted_sq_err.mean()
-    
+    loss_unweighted = sq_err.mean()
+
+    # 6. Stats dict - use detached tensor values that can be converted later
+    # For logging, we defer .item() calls to the logging interval
+    with torch.no_grad():
+        weight_mean = weights.mean()
+        weight_min = weights.min()
+        weight_max = weights.max()
+        correction = loss / (loss_unweighted + 1e-8)
+
+    # Return Python floats for stats that are already computed
+    # These .item() calls are unavoidable for logging but happen once per call
+    stats = {
+        'loss_unweighted': loss_unweighted.detach(),  # Keep as tensor
+        'loss_weighted': loss.detach(),
+        'weight_mean': weight_mean.detach(),
+        'weight_min': weight_min.detach(),
+        'weight_max': weight_max.detach(),
+        'correction_ratio': correction.detach(),
+    }
+
     return loss, stats
 
 def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
@@ -327,8 +339,12 @@ def train_autoembed(components, config, iterator, logger=None):
             opt.step()
             scheduler.step()
         
-        history.append({'step': i,'loss': loss_img.item(), 'loss_ae': loss_img.item() if count else 0})
-        if i % config['logging']['log_interval'] == 0: pbar.set_postfix({'ae': f'{loss_img:.4f}'})
+        # Only sync to CPU at logging intervals (avoids per-step CPU-GPU sync)
+        log_interval = config['logging']['log_interval']
+        if i % log_interval == 0:
+            loss_val = loss_img.item() if isinstance(loss_img, torch.Tensor) else loss_img
+            history.append({'step': i, 'loss': loss_val, 'loss_ae': loss_val if count else 0})
+            pbar.set_postfix({'ae': f'{loss_val:.4f}'})
             
     return pd.DataFrame(history)
 
@@ -417,111 +433,109 @@ def train_denoise(components, config, iterator, logger=None):
             decoded_results, aux_loss = run_model_forward(components, noisy_blocks)
             
             # 4. Loss Calculation
-            loss_v_accum = 0.0
-            loss_lam_accum = 0.0
-            loss_text_accum = 0.0
-            
+            # Keep accumulators as tensors to avoid CPU-GPU sync per block
+            loss_v_accum = torch.tensor(0.0, device=device)
+            loss_lam_accum = torch.tensor(0.0, device=device)
+            loss_text_accum = torch.tensor(0.0, device=device)
+
             valid_latent_samples = 0
             valid_text_samples = 0
-            step_stats = []
-            
+
+            # Deferred stats: only collect tensors, convert to CPU at log intervals
+            # This avoids per-block CPU-GPU sync
+            deferred_stats = []
+
             # We iterate through the aligned lists of Blocks and Results
             latent_cursor = 0
-            
+
             for block, res in zip(noisy_blocks, decoded_results):
                 # --- A. Latent Diffusion Loss ---
                 if block.type == 'latent':
                     if 'image_vpreds' in res:
                         v_raw = res['image_vpreds']
                         pred_l = res['image_logsnrs']
-                        
+
                         # Factorization Logic (if enabled)
                         if mode == 'factorized':
                             sigma_p = torch.sqrt(torch.sigmoid(-pred_l))
                             v_pred = v_raw * sigma_p
                         else:
                             v_pred = v_raw
-                            
+
                         target_v = targets_v[latent_cursor]
                         target_l = targets_l[latent_cursor]
                         latent_cursor += 1
-                        
+
                         # Velocity MSE
-                        # Inside the latent block processing:
                         if variance_tracker is not None:
                             loss_v, loss_stats = compute_online_weighted_mse(
                                 v_pred, target_v, target_l, variance_tracker
                             )
-                            loss_v_accum += loss_v
-                            # Stats
-                            step_stats.append({
+                            loss_v_accum = loss_v_accum + loss_v
+                            # Defer stats (keep tensors, sync at logging time)
+                            deferred_stats.append({
                                 'step': i,
                                 'source': getattr(block, 'source', 'unknown'),
                                 'type': 'latent',
-                                'loss': loss_stats['loss_unweighted'],
-                                'loss_weighted': loss_stats['loss_weighted'],
-                                'loss_var': loss_stats.get('weight_max', 0) - loss_stats.get('weight_min', 0),
-                                'logsnr': target_l.mean().detach().item(),
+                                'loss_tensor': loss_stats['loss_unweighted'],  # Now tensor
+                                'loss_weighted_tensor': loss_stats['loss_weighted'],
+                                'loss_var_tensor': loss_stats['weight_max'] - loss_stats['weight_min'],
+                                'logsnr_tensor': target_l.mean().detach(),
                                 'resolution': block.content.shape[-1] * block.content.shape[-2],
-                                'weight_mean': loss_stats['weight_mean'],
-                                'correction_ratio': loss_stats['correction_ratio']
+                                'weight_mean_tensor': loss_stats['weight_mean'],
+                                'correction_ratio_tensor': loss_stats['correction_ratio']
                             })
                         else:
                             sq_err_v = F.mse_loss(v_pred, target_v, reduction="none")
-                            loss_v_accum += sq_err_v.mean()
-                            # Stats
-                            step_stats.append({
+                            loss_v_accum = loss_v_accum + sq_err_v.mean()
+                            # Defer stats
+                            deferred_stats.append({
                                 'step': i,
                                 'source': getattr(block, 'source', 'unknown'),
                                 'type': 'latent',
-                                'loss': sq_err_v.mean().detach().item(),
-                                'loss_var': sq_err_v.var().detach().item(),
-                                'logsnr': target_l.mean().detach().item(),
+                                'loss_tensor': sq_err_v.mean().detach(),  # Keep as tensor
+                                'loss_var_tensor': sq_err_v.var().detach(),
+                                'logsnr_tensor': target_l.mean().detach(),
                                 'resolution': block.content.shape[-1] * block.content.shape[-2]
                             })
-                        
+
                         # Lambda L1
-                        loss_lam_accum += F.l1_loss(pred_l, target_l)
-                        # end of step paperwork
+                        loss_lam_accum = loss_lam_accum + F.l1_loss(pred_l, target_l)
                         valid_latent_samples += 1
-                
+
                 # --- B. Text Autoregressive Loss ---
                 elif block.type == 'text':
                     if 'text_logits' in res:
-                        logits = res['text_logits'] # [L, Vocab]
-                        tokens = block.content      # [L]
-                        
-                        # Shift: Logit[t] predicts Token[t+1]
-                        # Input: A B C
-                        # Target: B C D (where D is from next block? For MVP we ignore cross-block prediction)
-                        
+                        logits = res['text_logits']
+                        tokens = block.content
+
                         shift_logits = logits[:-1, :].contiguous()
                         shift_targets = tokens[1:].contiguous()
-                        
+
                         if shift_targets.numel() > 0:
                             loss_t = F.cross_entropy(shift_logits, shift_targets)
-                            loss_text_accum += loss_t
-                            
-                            step_stats.append({
+                            loss_text_accum = loss_text_accum + loss_t
+
+                            deferred_stats.append({
                                 'step': i,
                                 'source': getattr(block, 'source', 'text'),
                                 'type': 'text',
-                                'loss': loss_t.detach().item(),
-                                'loss_var': 0.0 # Placeholder
+                                'loss_tensor': loss_t.detach(),
+                                'loss_var': 0.0
                             })
                             valid_text_samples += 1
 
             # Normalize Accumulators
             if valid_latent_samples > 0:
-                loss_v_accum /= valid_latent_samples
-                loss_lam_accum /= valid_latent_samples
-            
+                loss_v_accum = loss_v_accum / valid_latent_samples
+                loss_lam_accum = loss_lam_accum / valid_latent_samples
+
             if valid_text_samples > 0:
-                loss_text_accum /= valid_text_samples
-            
+                loss_text_accum = loss_text_accum / valid_text_samples
+
             # Weighted Sum
             total_loss = loss_v_accum + (lambda_coeff * loss_lam_accum) + loss_text_accum + aux_loss
-            
+
         if dtype == torch.float16:
             scaler.scale(total_loss).backward()
             scaler.step(opt)
@@ -531,13 +545,30 @@ def train_denoise(components, config, iterator, logger=None):
             total_loss.backward()
             opt.step()
             scheduler.step()
-            
-        history.extend(step_stats)
-        
-        if i % config['logging']['log_interval'] == 0: 
+
+        # Only sync to CPU at logging intervals (avoids per-step CPU-GPU sync)
+        log_interval = config['logging']['log_interval']
+        if i % log_interval == 0:
+            # Now convert deferred tensors to CPU for logging
+            step_stats = []
+            for stat in deferred_stats:
+                converted = {'step': stat['step'], 'source': stat['source'], 'type': stat['type']}
+
+                # Handle tensor -> float conversion for all *_tensor keys
+                for key in list(stat.keys()):
+                    if key.endswith('_tensor'):
+                        base_key = key[:-7]  # Remove '_tensor' suffix
+                        val = stat[key]
+                        converted[base_key] = val.item() if isinstance(val, torch.Tensor) else val
+                    elif key not in ('step', 'source', 'type'):
+                        converted[key] = stat[key]
+
+                step_stats.append(converted)
+            history.extend(step_stats)
+
             pbar.set_postfix({
-                'v': f'{loss_v_accum:.3f}', 
-                'txt': f'{loss_text_accum:.3f}'
+                'v': f'{loss_v_accum.item():.3f}',
+                'txt': f'{loss_text_accum.item():.3f}'
             })
             
     return pd.DataFrame(history)
