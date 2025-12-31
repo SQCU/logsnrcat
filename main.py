@@ -63,6 +63,7 @@ def build_components(cfg, device):
         )
 
         # Build sparse AE with config
+        attn_cfg = sparse_ae_cfg['attention']
         sparse_ae = SparsePerDimFSQAutoencoder(
             n_levels=sparse_ae_cfg['n_levels'],
             patch_size=sparse_ae_cfg['patch_size'],
@@ -71,27 +72,29 @@ def build_components(cfg, device):
             code_dim=sparse_ae_cfg['code_dim'],
             k_per_patch=sparse_ae_cfg['k_per_patch'],
             residual_scale=sparse_ae_cfg['residual_scale'],
-            fourier_dim=sparse_ae_cfg['fourier_dim']
+            fourier_dim=sparse_ae_cfg['fourier_dim'],
+            n_layers=sparse_ae_cfg['n_layers'],
+            attn_config=attn_cfg
         ).to(device, dtype=dtype)
 
         if cfg['training']['compile']:
             sparse_ae = torch.compile(sparse_ae, dynamic=cfg['training']['compile_dynamic'])
 
-        # Create interface wrappers
-        ae_embedder = SparseAEPatchEmbedder(sparse_ae, embed_dim=cfg['model']['dim'])
-        ae_unembedder = SparseAEPatchUnembedder(sparse_ae, ae_embedder)
+        # Create interface wrappers (move to device/dtype)
+        ae_embedder = SparseAEPatchEmbedder(sparse_ae, embed_dim=cfg['model']['dim']).to(device, dtype=dtype)
+        ae_unembedder = SparseAEPatchUnembedder(sparse_ae, ae_embedder).to(device, dtype=dtype)
 
         # Use sparse AE wrappers instead of model's patch embedder/unembedder
         span_emb = SpanEmbedder(model.text_embed, ae_embedder)
         span_unemb = SpanUnembedder(model.text_head, ae_unembedder)
 
         print(f"[SparseAE] Enabled: {sparse_ae_cfg['n_levels']} levels, "
-              f"code_dim={sparse_ae_cfg['code_dim']}, k={sparse_ae_cfg['k_per_patch']}")
+              f"code_dim={sparse_ae_cfg['code_dim']}, k={sparse_ae_cfg['k_per_patch']}, "
+              f"attn={attn_cfg['mode']}")
     else:
         # Standard embedder/unembedder from model
         span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
         span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
-        sparse_ae = None
 
     # Page Table
     pt_cfg = cfg['page_table']
@@ -103,9 +106,7 @@ def build_components(cfg, device):
         device=device
     )
 
-    # Return extended tuple when sparse AE is enabled
-    if sparse_ae is not None:
-        return (model, span_emb, span_unemb, page_table, sparse_ae)
+    # Always return 4-tuple - sparse AE is integrated via span_emb/span_unemb
     return (model, span_emb, span_unemb, page_table)
 
 

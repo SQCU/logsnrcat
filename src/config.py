@@ -23,6 +23,12 @@ class PatchEmbedderConfig(BaseModel):
     mlp_depth: int = 1
 
 
+class GQAConfig(BaseModel):
+    """Grouped Query Attention configuration."""
+    enabled: bool = True  # If False, use standard MHA (n_kv_heads = n_query_heads)
+    n_kv_heads: Optional[int] = None  # If None, defaults to num_heads // 4
+
+
 class ModelConfig(BaseModel):
     dim: int = 256
     depth: int = 16
@@ -38,10 +44,20 @@ class ModelConfig(BaseModel):
     jitter_noise: float = 0.1
     window_size: float = 10.0
     patch_embedder: PatchEmbedderConfig = Field(default_factory=PatchEmbedderConfig)
-    
+    gqa: GQAConfig = Field(default_factory=GQAConfig)
+
     @property
     def head_dim(self) -> int:
         return self.dim // self.num_heads
+
+    @property
+    def effective_kv_heads(self) -> int:
+        """Get effective number of KV heads for GQA."""
+        if not self.gqa.enabled:
+            return self.num_heads
+        if self.gqa.n_kv_heads is not None:
+            return self.gqa.n_kv_heads
+        return max(1, self.num_heads // 4)
 
 
 # =============================================================================
@@ -143,6 +159,15 @@ class OnlineVarianceCorrectionConfig(BaseModel):
     warmup_steps: int = 100  # Steps before correction kicks in
 
 
+class AEAttentionConfig(BaseModel):
+    """Attention configuration for sparse AE transformer layers."""
+    mode: Literal["full", "sliding", "gemma"] = "gemma"  # gemma = 3 local + 1 global
+    window_size: int = 4  # For sliding window: attend to ±window_size patches
+    global_layer_interval: int = 4  # For gemma mode: every Nth layer is global
+    n_query_heads: int = 8
+    n_kv_heads: int = 2  # GQA ratio
+
+
 class SparseAEConfig(BaseModel):
     """Configuration for kmaze_ae sparse hierarchical autoencoder."""
     enabled: bool = False
@@ -155,6 +180,8 @@ class SparseAEConfig(BaseModel):
     fourier_dim: int = 16
     ae_loss_weight: float = 0.1
     logsnr_loss_weight: float = 0.1
+    n_layers: int = 4  # Transformer layers per encoder/decoder
+    attention: AEAttentionConfig = Field(default_factory=AEAttentionConfig)
 
 
 class FractalParams(BaseModel):

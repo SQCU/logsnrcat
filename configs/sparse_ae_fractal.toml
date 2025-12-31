@@ -23,6 +23,11 @@ context_size = 6
 stride = 4
 mlp_depth = 2
 
+# GQA configuration for main transformer
+[model.gqa]
+enabled = true
+n_kv_heads = 2         # 8 query heads / 2 kv heads = 4x sharing
+
 [training]
 ae_steps = 500
 steps = 2000
@@ -46,6 +51,15 @@ residual_scale = 2.0
 fourier_dim = 16
 ae_loss_weight = 0.1   # Weight for AE reconstruction loss
 logsnr_loss_weight = 0.1  # Weight for logsnr prediction loss
+n_layers = 4           # Transformer layers per encoder/decoder
+
+# Attention configuration for AE transformer layers
+[training.sparse_ae.attention]
+mode = "gemma"         # "full" | "sliding" | "gemma" (3 local + 1 global)
+window_size = 4        # For sliding/gemma: attend to ±window_size patches
+global_layer_interval = 4  # For gemma: every Nth layer is global
+n_query_heads = 8
+n_kv_heads = 2         # GQA ratio: 8/2 = 4x KV sharing
 
 [training.online_variance_correction]
 enabled = true
@@ -118,6 +132,7 @@ seed = 42
 fractal_types = ["mandelbrot", "julia", "burning_ship"]
 color_palette = "random"
 text_position = "none"
+resolution = 256
 [dataset_mix.fractal_main.noise_params]
 min_snr = -4.0
 max_snr = 5.0
@@ -131,6 +146,7 @@ seed = 123
 fractal_types = ["julia", "tricorn"]
 color_palette = "fire"
 text_position = "none"
+resolution = 256
 [dataset_mix.fractal_split.noise_params]
 min_snr = -5.0
 max_snr = 5.0
@@ -140,6 +156,10 @@ angle_range_deg = 45.0
 type = "checkerboard"
 ratio = 0.1
 noise_mode = "split"
+[dataset_mix.checker_baseline.params]
+seed = 456
+resolution = 64
+text_position = "none"
 [dataset_mix.checker_baseline.noise_params]
 min_snr = -4.0
 max_snr = 5.0
@@ -149,6 +169,10 @@ angle_range_deg = 30.0
 type = "torus"
 ratio = 0.1
 noise_mode = "split"
+[dataset_mix.torus_baseline.params]
+seed = 789
+resolution = 64
+text_position = "none"
 [dataset_mix.torus_baseline.noise_params]
 min_snr = -4.0
 max_snr = 5.0

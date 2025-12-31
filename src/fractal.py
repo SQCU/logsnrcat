@@ -249,6 +249,7 @@ class FractalIterator:
     """
     Iterator for procedural fractal images.
     Integrates with CompositeIterator via standard interface.
+    Uses async queue for non-blocking batch generation.
     """
 
     def __init__(self, device: torch.device, config: dict):
@@ -257,11 +258,23 @@ class FractalIterator:
         self.device = device
         self.config = config
         self.seed = config['seed']
-        self.generator = FractalGenerator(size=256, seed=self.seed)
         self.text_pos = config['text_position']
         self.fractal_types = config['fractal_types']
         self.palette = config['color_palette']
         self.ContextBlock = ContextBlock
+
+        # Use async queue with background workers for non-blocking generation
+        # Generate at max resolution, resize on GPU as needed
+        self.queue = FractalQueue(
+            size=256,  # Generate at 256, resize on demand
+            n_workers=4,
+            queue_size=64,
+            fractal_types=self.fractal_types,
+            palette=self.palette
+        )
+
+        # Fallback generator for small batches or when queue is empty
+        self.fallback_generator = FractalGenerator(size=256, seed=self.seed)
 
     def generate_batch_list(self, batch_size: int, resolution: int = 256,
                            **kwargs) -> list:
@@ -278,36 +291,74 @@ class FractalIterator:
         start_group_id = kwargs.get('start_group_id', 0)
         blocks = []
 
-        for i in range(batch_size):
-            curr_gid = start_group_id + i
+        # Try to get batch from async queue (non-blocking if queue has items)
+        try:
+            # Get batch from queue - this pulls pre-generated images
+            batch = []
+            for _ in range(batch_size):
+                # Use timeout to avoid infinite blocking
+                img_np = self.queue.queue.get(block=True, timeout=0.1)
+                batch.append(torch.from_numpy(img_np))
 
-            # Generate fractal at native resolution
-            img = self.generator.generate_random(
-                fractal_types=self.fractal_types,
-                palette=self.palette
-            )
+            # Stack and move to GPU as a batch (efficient)
+            imgs = torch.stack(batch).to(self.device)  # [B, C, H, W]
 
-            # Resize if needed
-            if resolution != self.generator.size:
-                img = F.interpolate(
-                    img.unsqueeze(0),
+            # Resize on GPU if needed (much faster than CPU resize)
+            if resolution != 256:
+                imgs = F.interpolate(
+                    imgs,
                     size=(resolution, resolution),
                     mode='bilinear',
                     align_corners=False
-                ).squeeze(0)
+                )
 
-            img = img.to(self.device)
+            for i in range(batch_size):
+                curr_gid = start_group_id + i
+                img_block = self.ContextBlock(
+                    content=imgs[i],
+                    type='latent',
+                    causal=False,
+                    shape_meta=(resolution, resolution),
+                    group_id=curr_gid,
+                    id=f"fractal_{curr_gid}",
+                    source="fractal"
+                )
+                blocks.append(img_block)
 
-            img_block = self.ContextBlock(
-                content=img,
-                type='latent',
-                causal=False,
-                shape_meta=(resolution, resolution),
-                group_id=curr_gid,
-                id=f"fractal_{curr_gid}",
-                source="fractal"
-            )
+        except Exception:
+            # Fallback to synchronous generation if queue is empty/slow
+            for i in range(batch_size):
+                curr_gid = start_group_id + i
 
-            blocks.append(img_block)
+                img = self.fallback_generator.generate_random(
+                    fractal_types=self.fractal_types,
+                    palette=self.palette
+                )
+
+                if resolution != self.fallback_generator.size:
+                    img = F.interpolate(
+                        img.unsqueeze(0),
+                        size=(resolution, resolution),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+
+                img = img.to(self.device)
+
+                img_block = self.ContextBlock(
+                    content=img,
+                    type='latent',
+                    causal=False,
+                    shape_meta=(resolution, resolution),
+                    group_id=curr_gid,
+                    id=f"fractal_{curr_gid}",
+                    source="fractal"
+                )
+                blocks.append(img_block)
 
         return blocks
+
+    def shutdown(self):
+        """Clean up worker processes."""
+        if hasattr(self, 'queue'):
+            self.queue.shutdown()

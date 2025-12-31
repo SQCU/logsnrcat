@@ -41,6 +41,10 @@ This project uses `uv` for fast and reliable dependency management.
 
     default run
 
+    `python main.py configs/sparse_ae_fractal.toml 2>&1 | tee sparse_ae_fractal.log`
+
+    ??? run
+
 5. **why low resolution checkerboards?**
 
     technically speaking this project is testing 2 hard things:
