@@ -251,29 +251,28 @@ def train_autoembed(components, config, iterator, logger=None):
         print("\n--- Skipping AE warmup (sparse_ae.enabled = false) ---")
         return pd.DataFrame()
 
-    # Get components - SpanEmbedder wraps patch_emb, SpanUnembedder wraps patch_unembed
-    _, span_emb, span_unemb, _ = components
-    patch_emb = span_emb.patch_emb  # The actual patch embedder (SparseAEPatchEmbedder)
-    patch_unemb = span_unemb.patch_unembed  # The actual patch unembedder
+    # Get model - sparse AE is now a submodule of the model
+    model = components[0]
 
-    # Get the sparse AE from the embedder wrapper
-    if not hasattr(patch_emb, 'ae'):
-        print("\n--- Skipping AE warmup (patch_emb has no .ae - check build_components) ---")
+    # Check if model has sparse AE
+    if not hasattr(model, 'sparse_ae') or model.sparse_ae is None:
+        print("\n--- Skipping AE warmup (model has no sparse_ae) ---")
         return pd.DataFrame()
 
-    sparse_ae = patch_emb.ae
+    sparse_ae = model.sparse_ae
+    patch_emb = model.patch_embedder  # SparseAEPatchEmbedder
+    patch_unemb = model.patch_unembedder  # SparseAEPatchUnembedder
 
     print(f"\n--- Training: Sparse AutoEncoder ---")
     print(f"    Levels: {sparse_ae.n_levels}, Code dim: {sparse_ae.code_dim}, "
           f"Sparsity k: {sparse_ae.k_per_patch}")
 
-    # Optimizer for AE parameters only (not full model)
-    # NOTE: patch_emb and patch_unemb both hold references to sparse_ae via self.ae
-    # so we must NOT add their .parameters() directly (would duplicate sparse_ae params)
-    # Instead: add sparse_ae params once, then only the wrapper-specific projection layers
+    # Optimizer for AE parameters only (not full transformer)
+    # sparse_ae, patch_emb, patch_unemb are all submodules of model
+    # We explicitly list the AE-related parameters to exclude transformer layers
     opt_cfg = config['training']['ae_optimizer']
     ae_params = list(sparse_ae.parameters())
-    # Add only the wrapper-specific projection layers (not self.ae which is shared)
+    # Add the wrapper-specific projection layers
     ae_params += list(patch_emb.code_proj.parameters())
     ae_params += list(patch_emb.logsnr_proj.parameters())
     ae_params += list(patch_unemb.code_unproj.parameters())
@@ -283,7 +282,6 @@ def train_autoembed(components, config, iterator, logger=None):
     scheduler = OneCycleLR(opt, max_lr=opt_cfg['max_lr'], total_steps=steps, pct_start=opt_cfg['pct_start'])
 
     # Build bucket manager
-    model = components[0]
     model_stride = model.patch_embedder.stride
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
     bucketing_enabled = config['training']['bucketing']['enabled']
@@ -428,11 +426,7 @@ def train_autoembed(components, config, iterator, logger=None):
         print("Collecting AE reconstruction samples...")
         recon_samples = {'x0': [], 'noisy_input': [], 'reconstruction': [], 'logsnr_map': [], 'source': []}
 
-        # Get the patch embedder/unembedder for direct AE encode/decode
-        # SpanEmbedder.patch_emb and SpanUnembedder.patch_unembed are the actual modules
-        patch_emb = span_emb.patch_emb  # SparseAEPatchEmbedder or ContextualPatchEmbedder
-        patch_unemb = span_unemb.patch_unembed  # SparseAEPatchUnembedder or ContextualPatchUnembedder
-
+        # patch_emb and patch_unemb already defined earlier in function
         # Sample from each split
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
             for res in [64, 128, 256]:
@@ -491,8 +485,7 @@ def train_denoise(components, config, iterator, logger=None):
     pct_start = opt_cfg['pct_start']
 
     print(f"\n--- Training: Denoiser ({mode.upper()}) ---")
-    model = components[0]
-    page_table = components[3]
+    model, _, _, page_table = components
     device = config['device']
     var_cfg = config['training']['online_variance_correction']
     if var_cfg['enabled']:
@@ -515,9 +508,10 @@ def train_denoise(components, config, iterator, logger=None):
     else:
         graph_runner = None
         warmup_steps_needed = 0
-    
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
-    fused=True)
+
+    # Model now owns all components including sparse AE (if enabled)
+    # So model.parameters() naturally includes everything needed for joint training
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, fused=True)
     scheduler = OneCycleLR(opt, max_lr=max_lr, total_steps=steps, pct_start=pct_start)
 
     history = []

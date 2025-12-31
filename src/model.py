@@ -369,16 +369,63 @@ class coolerLDTformerZC(nn.Module):
                  vocab_size=65536, global_layer_interval=4, num_experts=8, num_active=3,
                  rope_base: int = 500, mlp_ratio: float = 4.0, jitter_noise: float = 0.1,
                  context_size: int = 4, stride: int = 2, fourier_dim: int = 16,
-                 window_size: float = 10.0):
+                 window_size: float = 10.0, sparse_ae_config: dict = None):
         super().__init__()
 
         self.global_layer_interval = global_layer_interval
         self.window_size = window_size
         self.text_embed = nn.Embedding(vocab_size, dim)
-        self.patch_embedder = ContextualPatchEmbedder(
-            input_channels=3, embed_dim=dim, context_size=context_size,
-            stride=stride, fourier_dim=fourier_dim, mlp_depth=mlp_depth
-        )
+
+        # Build patch embedder/unembedder based on config
+        # When sparse_ae_config is provided, use SparseAE components
+        # Otherwise use standard ContextualPatchEmbedder/Unembedder
+        self.uses_sparse_ae = sparse_ae_config is not None and sparse_ae_config.get('enabled', False)
+
+        if self.uses_sparse_ae:
+            from kmaze_ae.model_sparse_dim import (
+                SparsePerDimFSQAutoencoder,
+                SparseAEPatchEmbedder,
+                SparseAEPatchUnembedder
+            )
+
+            attn_cfg = sparse_ae_config.get('attention', {
+                'mode': 'full', 'window_size': 4, 'global_layer_interval': 4,
+                'n_query_heads': 8, 'n_kv_heads': 2, 'n_global_tokens': 4
+            })
+
+            # Create sparse AE as a submodule - now part of model.parameters()
+            self.sparse_ae = SparsePerDimFSQAutoencoder(
+                n_levels=sparse_ae_config.get('n_levels', 6),
+                patch_size=sparse_ae_config.get('patch_size', 16),
+                image_size=256,  # Dynamic per batch
+                hidden_dim=sparse_ae_config.get('hidden_dim', 256),
+                code_dim=sparse_ae_config.get('code_dim', 128),
+                k_per_patch=sparse_ae_config.get('k_per_patch', 6),
+                residual_scale=sparse_ae_config.get('residual_scale', 2.0),
+                fourier_dim=sparse_ae_config.get('fourier_dim', 16),
+                n_layers=sparse_ae_config.get('n_layers', 4),
+                attn_config=attn_cfg
+            )
+
+            # Create embedder/unembedder wrappers (also submodules)
+            self.patch_embedder = SparseAEPatchEmbedder(self.sparse_ae, embed_dim=dim)
+            self.patch_unembedder = SparseAEPatchUnembedder(
+                self.sparse_ae, self.patch_embedder,
+                fourier_dim=sparse_ae_config.get('fourier_dim', 16)
+            )
+
+            print(f"[Model] Using SparseAE: {sparse_ae_config.get('n_levels', 6)} levels, "
+                  f"code_dim={sparse_ae_config.get('code_dim', 128)}, "
+                  f"k={sparse_ae_config.get('k_per_patch', 6)}")
+        else:
+            self.sparse_ae = None
+            self.patch_embedder = ContextualPatchEmbedder(
+                input_channels=3, embed_dim=dim, context_size=context_size,
+                stride=stride, fourier_dim=fourier_dim, mlp_depth=mlp_depth
+            )
+            self.patch_unembedder = ContextualPatchUnembedder(
+                output_channels=3, embed_dim=dim, patch_size=stride, mlp_depth=mlp_depth
+            )
 
         self.layers = nn.ModuleList([
             LDTformerBlockZC(dim, num_heads, topo_dim, mlp_ratio=mlp_ratio,
@@ -389,9 +436,6 @@ class coolerLDTformerZC(nn.Module):
         ])
 
         self.text_head = nn.Linear(dim, vocab_size)
-        self.patch_unembedder = ContextualPatchUnembedder(
-            output_channels=3, embed_dim=dim, patch_size=stride, mlp_depth=mlp_depth
-        )
 
         self.final_norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.param_init()
@@ -400,8 +444,11 @@ class coolerLDTformerZC(nn.Module):
         torch.nn.init.normal_(self.text_embed.weight, mean=0.0, std=0.02)
         init_linear(self.text_head)
         init_layer_norm(self.final_norm)
-        self.patch_embedder.param_init()
-        self.patch_unembedder.param_init()
+        # Only call param_init if the embedder has it (standard embedders do, sparse AE doesn't)
+        if hasattr(self.patch_embedder, 'param_init'):
+            self.patch_embedder.param_init()
+        if hasattr(self.patch_unembedder, 'param_init'):
+            self.patch_unembedder.param_init()
         for layer in self.layers:
             layer.param_init()
 

@@ -26,7 +26,10 @@ def build_model(cfg, device: torch.device):
     """Instantiate model from raw config dictionary."""
     m_cfg = cfg['model']
     p_cfg = m_cfg['patch_embedder']
-    
+
+    # Pass sparse AE config to model - it will create the AE as a submodule
+    sparse_ae_cfg = cfg['training']['sparse_ae'] if 'training' in cfg else None
+
     model = coolerLDTformerZC(
         dim=m_cfg['dim'],
         depth=m_cfg['depth'],
@@ -43,69 +46,39 @@ def build_model(cfg, device: torch.device):
         context_size=p_cfg['context_size'],
         stride=p_cfg['stride'],
         fourier_dim=p_cfg['fourier_dim'],
-        window_size=m_cfg['window_size']
+        window_size=m_cfg['window_size'],
+        sparse_ae_config=sparse_ae_cfg
     ).to(device)
     return model
 
 def build_components(cfg, device):
     """Build full component tuple."""
-    dtype_str = cfg['training']['precision']
-    dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
     dtype = cfg['dtype']
 
     model = build_model(cfg, device).to(dtype=dtype)
+
+    # Save references to submodules BEFORE compile (compiled model still exposes these,
+    # but explicitly saving avoids any potential issues with attribute access)
+    text_embed = model.text_embed
+    text_head = model.text_head
+    patch_embedder = model.patch_embedder
+    patch_unembedder = model.patch_unembedder
+
+    # Compile transformer layers if requested
     if cfg['training']['compile']:
+        # For sparse AE, compile the AE transformer layers separately
+        # (patchify/unpatchify have variable shapes that don't work with compile)
+        if model.uses_sparse_ae:
+            for enc in model.sparse_ae.encoders:
+                enc.transformer = torch.compile(enc.transformer)
+            for dec in model.sparse_ae.decoders:
+                dec.transformer = torch.compile(dec.transformer)
+        # Compile the main model
         model = torch.compile(model, dynamic=cfg['training']['compile_dynamic'])
 
-    # Check if sparse AE is enabled
-    sparse_ae_cfg = cfg['training']['sparse_ae']
-    if sparse_ae_cfg['enabled']:
-        from kmaze_ae.model_sparse_dim import (
-            SparsePerDimFSQAutoencoder,
-            SparseAEPatchEmbedder,
-            SparseAEPatchUnembedder
-        )
-
-        # Build sparse AE with config
-        attn_cfg = sparse_ae_cfg['attention']
-        sparse_ae = SparsePerDimFSQAutoencoder(
-            n_levels=sparse_ae_cfg['n_levels'],
-            patch_size=sparse_ae_cfg['patch_size'],
-            image_size=256,  # Will be dynamic per batch
-            hidden_dim=sparse_ae_cfg['hidden_dim'],
-            code_dim=sparse_ae_cfg['code_dim'],
-            k_per_patch=sparse_ae_cfg['k_per_patch'],
-            residual_scale=sparse_ae_cfg['residual_scale'],
-            fourier_dim=sparse_ae_cfg['fourier_dim'],
-            n_layers=sparse_ae_cfg['n_layers'],
-            attn_config=attn_cfg
-        ).to(device, dtype=dtype)
-
-        if cfg['training']['compile']:
-            # Only compile the transformer layers (where flex attention lives)
-            # NOT the whole module - patchify/unpatchify have variable shapes
-            for enc in sparse_ae.encoders:
-                enc.transformer = torch.compile(enc.transformer)
-            for dec in sparse_ae.decoders:
-                dec.transformer = torch.compile(dec.transformer)
-
-        # Create interface wrappers (move to device/dtype)
-        ae_embedder = SparseAEPatchEmbedder(sparse_ae, embed_dim=cfg['model']['dim']).to(device, dtype=dtype)
-        ae_unembedder = SparseAEPatchUnembedder(
-            sparse_ae, ae_embedder, fourier_dim=sparse_ae_cfg['fourier_dim']
-        ).to(device, dtype=dtype)
-
-        # Use sparse AE wrappers instead of model's patch embedder/unembedder
-        span_emb = SpanEmbedder(model.text_embed, ae_embedder)
-        span_unemb = SpanUnembedder(model.text_head, ae_unembedder)
-
-        print(f"[SparseAE] Enabled: {sparse_ae_cfg['n_levels']} levels, "
-              f"code_dim={sparse_ae_cfg['code_dim']}, k={sparse_ae_cfg['k_per_patch']}, "
-              f"attn={attn_cfg['mode']}")
-    else:
-        # Standard embedder/unembedder from model
-        span_emb = SpanEmbedder(model.text_embed, model.patch_embedder)
-        span_unemb = SpanUnembedder(model.text_head, model.patch_unembedder)
+    # Wrap embedders in SpanEmbedder/SpanUnembedder
+    span_emb = SpanEmbedder(text_embed, patch_embedder)
+    span_unemb = SpanUnembedder(text_head, patch_unembedder)
 
     # Page Table
     pt_cfg = cfg['page_table']
@@ -117,7 +90,6 @@ def build_components(cfg, device):
         device=device
     )
 
-    # Always return 4-tuple - sparse AE is integrated via span_emb/span_unemb
     return (model, span_emb, span_unemb, page_table)
 
 
@@ -169,10 +141,8 @@ def main():
     logger = ExperimentLogger(output_dir=str(cfg['logging']['output_dir']))
     
     print(f"\nTraining: {cfg['training']['mode'].upper()} mode")
-    # Use components[0] for model access (param_init)
-    components[0].param_init()
+    # param_init is called in model's __init__, no need to call again
 
-    
     # 5. Run Training
     df_ae = train_autoembed(components, cfg, val_iterator, logger)
     # Plot AE warmup metrics if AE training was run
