@@ -694,6 +694,108 @@ Interpretation:
 
 
 @torch.no_grad()
+def sample_viz_ae_only(components, iterator, config_dict, logger):
+    """
+    AE-only evaluation: Tests autoencoder reconstruction without diffusion.
+
+    Use this when:
+    - Running AE warmup only (diffuser weights untrained)
+    - Testing sparse AE quality in isolation
+    - Debugging AE vs diffusion bottlenecks
+
+    Plots: [GT (Clean), AE Input (=GT), AE Reconstruction, Error Map]
+    """
+    from .plotting import plot_dset_reconstruction
+
+    res = config_dict.get('res', 64)
+    n_samples = config_dict.get('num_samples', 8)
+    split_names = iterator.get_split_names()
+    n_per_split = max(1, n_samples // max(1, len(split_names)))
+
+    # Get embedder/unembedder
+    span_emb = components[1]
+    span_unemb = components[2]
+
+    # Check which embedder type we have
+    if hasattr(span_emb, 'patch_emb'):
+        patch_emb = span_emb.patch_emb
+    elif hasattr(span_emb, 'patch_embedder'):
+        patch_emb = span_emb.patch_embedder
+    else:
+        print("    AE-only eval: Could not find patch embedder, skipping")
+        return
+
+    if hasattr(span_unemb, 'patch_unembed'):
+        patch_unemb = span_unemb.patch_unembed
+    elif hasattr(span_unemb, 'patch_unembedder'):
+        patch_unemb = span_unemb.patch_unembedder
+    else:
+        print("    AE-only eval: Could not find patch unembedder, skipping")
+        return
+
+    recon_samples = {
+        'x0': [], 'noisy_input': [], 'reconstruction': [],
+        'logsnr_map': [], 'source': []
+    }
+
+    # Collect samples from each split
+    for split_name in split_names:
+        try:
+            blocks = iterator.generate_from_split(split_name, count=n_per_split, resolution=res)
+        except Exception as e:
+            print(f"    AE eval skip {split_name}: {e}")
+            continue
+
+        for b in blocks:
+            if b.type != 'latent':
+                continue
+
+            x0 = b.content  # [C, H, W]
+            logsnr = b.logsnr if b.logsnr is not None else torch.zeros(1, *x0.shape[-2:], device=x0.device)
+
+            # Pure AE encode/decode (no noise, no diffusion)
+            try:
+                z, grid_shape = patch_emb(x0, logsnr)
+                recon_full = patch_unemb(z, grid_shape)
+                recon = recon_full[:3]  # RGB only, drop logsnr channel
+            except Exception as e:
+                print(f"    AE forward failed: {e}")
+                continue
+
+            recon_samples['x0'].append(x0)
+            recon_samples['noisy_input'].append(x0.clone())  # For AE-only, input = clean
+            recon_samples['reconstruction'].append(recon)
+            recon_samples['logsnr_map'].append(logsnr)
+            recon_samples['source'].append(getattr(b, 'source', split_name))
+
+            if len(recon_samples['x0']) >= n_samples:
+                break
+        if len(recon_samples['x0']) >= n_samples:
+            break
+
+    if not recon_samples['x0']:
+        print("    AE-only eval: No samples collected")
+        return
+
+    # Compute metrics
+    mse_vals = []
+    for x0, recon in zip(recon_samples['x0'], recon_samples['reconstruction']):
+        mse = F.mse_loss(recon, x0).item()
+        mse_vals.append(mse)
+
+    avg_mse = sum(mse_vals) / len(mse_vals)
+    print(f"    AE-only eval @ {res}px: MSE={avg_mse:.6f} ({len(recon_samples['x0'])} samples)")
+
+    # Plot with error maps
+    plot_dset_reconstruction(
+        recon_samples, logger,
+        name=f"ae_only_{res}",
+        show_map=True,
+        show_error=True
+    )
+
+
+@torch.no_grad()
 def sample_viz_dset(components, iterator, config_dict, logger):
     """
     Visualization Wrapper: Inplace Refinement of Dataset Samples.

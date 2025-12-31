@@ -4,46 +4,6 @@ import numpy as np
 import torch
 from pathlib import Path
 
-def plot_dset_reconstruction(x0s, noisy, recon, lmaps, output_path, show_map=False):
-    """
-    Standard 3-4 column reconstruction plot.
-    """
-    n = len(x0s)
-    cols = 4 if (show_map and lmaps is not None) else 3
-    
-    fig, axes = plt.subplots(n, cols, figsize=(3*cols, 2*n))
-    if n == 1: axes = axes.reshape(1, -1)
-    
-    def to_img(t):
-        return t.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
-
-    for i in range(n):
-        # GT
-        axes[i, 0].imshow(to_img(x0s[i]))
-        axes[i, 0].set_title("Ground Truth" if i==0 else "")
-        axes[i, 0].axis("off")
-
-        # Noisy
-        axes[i, 1].imshow(to_img(noisy[i]))
-        axes[i, 1].set_title("Noisy Input" if i==0 else "")
-        axes[i, 1].axis("off")
-
-        # Recon
-        axes[i, 2].imshow(to_img(recon[i]))
-        axes[i, 2].set_title("Reconstruction" if i==0 else "")
-        axes[i, 2].axis("off")
-        
-        # Map
-        if show_map and lmaps is not None:
-            m = lmaps[i].detach().cpu().squeeze().numpy()
-            axes[i, 3].imshow(m, cmap="viridis")
-            axes[i, 3].set_title("LogSNR Map" if i==0 else "")
-            axes[i, 3].axis("off")
-            
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close(fig)
-
 def plot_causal_sweep(sequences, predictions, snr_values, output_path):
     """
     Visualizes the Causal Sweep (Row per sequence, Col per timestep).
@@ -284,55 +244,254 @@ def plot_multimetric_analysis(df, logger, stringy="multimetric_analysis"):
     plt.tight_layout()
     logger.save_figure(fig, stringy)
 
-def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False):
+def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False, show_error=False):
     # Expect lists of tensors, potentially of mixed resolution
     x0s = result_dict["x0"]
     noisy = result_dict["noisy_input"]
     recon = result_dict["reconstruction"]
     lmaps = result_dict.get("logsnr_map", None)
-    
+    sources = result_dict.get("source", None)
+
     n = len(x0s)
     if n == 0: return
 
-    cols = 4 if (show_map and lmaps is not None) else 3
-    
+    # Determine columns
+    cols = 3
+    if show_map and lmaps is not None:
+        cols += 1
+    if show_error:
+        cols += 1
+
     # Create figure
     fig, axes = plt.subplots(n, cols, figsize=(3*cols, 2*n))
     if n == 1: axes = axes.reshape(1, -1)
-    
+
     for i in range(n):
         # Helper to safely visualize a single tensor (C,H,W) -> numpy (H,W,C)
         def to_img(t):
             return t.detach().cpu().permute(1,2,0).clamp(0,1).numpy()
 
+        col = 0
+
         # Col 0: Ground Truth
-        axes[i, 0].imshow(to_img(x0s[i]))
-        axes[i, 0].axis("off")
-        if i==0: axes[i,0].set_title("Ground Truth")
+        axes[i, col].imshow(to_img(x0s[i]))
+        axes[i, col].axis("off")
+        row_label = f" [{sources[i]}]" if sources else ""
+        if i==0: axes[i,col].set_title("Ground Truth")
+        if sources: axes[i, col].set_ylabel(sources[i], rotation=0, labelpad=40, fontsize=8)
+        col += 1
 
         # Col 1: Noisy Input
-        axes[i, 1].imshow(to_img(noisy[i]))
-        axes[i, 1].axis("off")
-        if i==0: axes[i,1].set_title("Noisy Input")
+        axes[i, col].imshow(to_img(noisy[i]))
+        axes[i, col].axis("off")
+        if i==0: axes[i,col].set_title("Noisy Input")
+        col += 1
 
         # Col 2: Reconstruction
-        axes[i, 2].imshow(to_img(recon[i]))
-        axes[i, 2].axis("off")
-        if i==0: axes[i,2].set_title("Reconstruction")
-        
-        # Col 3: LogSNR Map
+        axes[i, col].imshow(to_img(recon[i]))
+        axes[i, col].axis("off")
+        if i==0: axes[i,col].set_title("Reconstruction")
+        col += 1
+
+        # Optional: Error Map (vs ground truth)
+        if show_error:
+            # Compute MSE error per pixel, average across channels
+            err = ((recon[i] - x0s[i]) ** 2).mean(dim=0)  # [H, W]
+            err_np = err.detach().cpu().numpy()
+            im = axes[i, col].imshow(err_np, cmap="hot", vmin=0, vmax=max(err_np.max() * 0.5, 1e-6))
+            axes[i, col].axis("off")
+            if i==0: axes[i,col].set_title("Recon Error")
+            col += 1
+
+        # Optional: LogSNR Map
         if show_map and lmaps is not None:
             # Map might be (1,H,W) or (H,W)
             m = lmaps[i].detach().cpu().squeeze().numpy()
-            axes[i, 3].imshow(m, cmap="viridis")
-            axes[i, 3].axis("off")
-            if i==0: axes[i,3].set_title("Split Map")
-            
+            axes[i, col].imshow(m, cmap="viridis")
+            axes[i, col].axis("off")
+            if i==0: axes[i,col].set_title("LogSNR Map")
+            col += 1
+
     plt.tight_layout()
     logger.save_figure(fig, name)
 
- 
- 
+
+def plot_ae_roundtrip(components, iterator, logger, name="ae_roundtrip", n_samples=8, resolution=64):
+    """
+    Visualize AE reconstruction quality with round-trip analysis.
+
+    Shows for each sample:
+    - Input image (clean)
+    - AE reconstruction (1st pass)
+    - MSE error field (1st pass)
+    - Round-trip reconstruction (AE applied twice)
+    - Round-trip MSE error field
+
+    This helps diagnose:
+    - How much information is lost in single AE pass
+    - Whether errors compound on multiple passes (indicates instability)
+    - Spatial distribution of reconstruction errors
+    """
+    import torch
+
+    span_emb = components[1]
+    span_unemb = components[2]
+
+    # Get the actual patch embedder/unembedder
+    if hasattr(span_emb, 'patch_emb'):
+        patch_emb = span_emb.patch_emb
+    elif hasattr(span_emb, 'patch_embedder'):
+        patch_emb = span_emb.patch_embedder
+    else:
+        print("    plot_ae_roundtrip: No patch embedder found")
+        return
+
+    if hasattr(span_unemb, 'patch_unembed'):
+        patch_unemb = span_unemb.patch_unembed
+    elif hasattr(span_unemb, 'patch_unembedder'):
+        patch_unemb = span_unemb.patch_unembedder
+    else:
+        print("    plot_ae_roundtrip: No patch unembedder found")
+        return
+
+    # Detect model dtype from first parameter
+    model_dtype = None
+    for p in patch_emb.parameters():
+        model_dtype = p.dtype
+        break
+    if model_dtype is None:
+        model_dtype = torch.float32
+
+    # Collect samples
+    samples = []
+    split_names = iterator.get_split_names()
+    n_per_split = max(1, n_samples // max(1, len(split_names)))
+
+    with torch.no_grad():
+        for split_name in split_names:
+            try:
+                blocks = iterator.generate_from_split(split_name, count=n_per_split, resolution=resolution)
+            except Exception as e:
+                continue
+
+            for b in blocks:
+                if b.type != 'latent':
+                    continue
+
+                x0 = b.content  # [C, H, W]
+                logsnr = b.logsnr if b.logsnr is not None else torch.zeros(1, *x0.shape[-2:], device=x0.device)
+
+                # Convert to model dtype
+                x0_cast = x0.to(model_dtype)
+                logsnr_cast = logsnr.to(model_dtype)
+
+                try:
+                    # First pass: encode then decode
+                    z1, grid_shape = patch_emb(x0_cast, logsnr_cast)
+                    recon1_full = patch_unemb(z1, grid_shape)
+                    recon1 = recon1_full[:3]  # RGB only
+
+                    # Round-trip: encode the reconstruction, decode again
+                    # Use same logsnr (or could use predicted logsnr from recon1_full[-1:])
+                    z2, grid_shape2 = patch_emb(recon1, logsnr_cast)
+                    recon2_full = patch_unemb(z2, grid_shape2)
+                    recon2 = recon2_full[:3]
+
+                    samples.append({
+                        'input': x0.float(),  # Keep original in float32
+                        'recon1': recon1.float(),  # Convert to float32 for plotting
+                        'recon2': recon2.float(),
+                        'source': getattr(b, 'source', split_name)
+                    })
+                except Exception as e:
+                    print(f"    AE forward failed: {e}")
+                    continue
+
+                if len(samples) >= n_samples:
+                    break
+            if len(samples) >= n_samples:
+                break
+
+    if not samples:
+        print("    plot_ae_roundtrip: No samples collected")
+        return
+
+    # Create figure: 5 columns per row
+    # [Input, Recon1, Error1, Recon2 (roundtrip), Error2 (roundtrip)]
+    n = len(samples)
+    fig, axes = plt.subplots(n, 5, figsize=(15, 2.5 * n))
+    if n == 1:
+        axes = axes.reshape(1, -1)
+
+    def to_img(t):
+        return t.detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+
+    mse1_total, mse2_total = 0.0, 0.0
+
+    for i, s in enumerate(samples):
+        x0 = s['input']
+        r1 = s['recon1']
+        r2 = s['recon2']
+
+        # Compute error maps
+        err1 = ((r1 - x0) ** 2).mean(dim=0)  # [H, W]
+        err2 = ((r2 - x0) ** 2).mean(dim=0)  # [H, W] - error vs original, not vs r1
+
+        mse1 = err1.mean().item()
+        mse2 = err2.mean().item()
+        mse1_total += mse1
+        mse2_total += mse2
+
+        # Column 0: Input
+        axes[i, 0].imshow(to_img(x0))
+        axes[i, 0].axis('off')
+        if i == 0:
+            axes[i, 0].set_title("Input")
+        axes[i, 0].set_ylabel(s['source'], rotation=0, labelpad=40, fontsize=8)
+
+        # Column 1: Reconstruction (1st pass)
+        axes[i, 1].imshow(to_img(r1))
+        axes[i, 1].axis('off')
+        if i == 0:
+            axes[i, 1].set_title("AE Recon")
+        axes[i, 1].text(0.02, 0.98, f"MSE:{mse1:.4f}", transform=axes[i, 1].transAxes,
+                        fontsize=7, va='top', color='white', backgroundcolor='black')
+
+        # Column 2: Error map (1st pass)
+        err1_np = err1.detach().cpu().numpy()
+        vmax1 = max(err1_np.max() * 0.7, 1e-4)
+        axes[i, 2].imshow(err1_np, cmap='hot', vmin=0, vmax=vmax1)
+        axes[i, 2].axis('off')
+        if i == 0:
+            axes[i, 2].set_title("Error (1st)")
+
+        # Column 3: Round-trip reconstruction
+        axes[i, 3].imshow(to_img(r2))
+        axes[i, 3].axis('off')
+        if i == 0:
+            axes[i, 3].set_title("Round-trip")
+        axes[i, 3].text(0.02, 0.98, f"MSE:{mse2:.4f}", transform=axes[i, 3].transAxes,
+                        fontsize=7, va='top', color='white', backgroundcolor='black')
+
+        # Column 4: Round-trip error map (vs original)
+        err2_np = err2.detach().cpu().numpy()
+        vmax2 = max(err2_np.max() * 0.7, 1e-4)
+        axes[i, 4].imshow(err2_np, cmap='hot', vmin=0, vmax=vmax2)
+        axes[i, 4].axis('off')
+        if i == 0:
+            axes[i, 4].set_title("Error (RT)")
+
+    # Add summary stats
+    avg_mse1 = mse1_total / n
+    avg_mse2 = mse2_total / n
+    fig.suptitle(f"AE Round-trip Analysis @ {resolution}px | Avg MSE: 1st={avg_mse1:.5f}, RT={avg_mse2:.5f}", fontsize=10)
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+    print(f"    AE roundtrip @ {resolution}px: MSE 1st={avg_mse1:.5f}, roundtrip={avg_mse2:.5f}")
+
+
+
 def plot_causal_sweep_v2(results: list, output_path, split_name: str):
     """
     Visualizes Causal Sweep with explicit metadata - no tensor shape inference.

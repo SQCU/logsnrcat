@@ -17,6 +17,7 @@ from .data_iterator import CompositeIterator
 from .utils import run_model_forward, predict_velocity_from_blocks
 from .sample import euler_forward_step, euler_reverse_step
 from .config import sanitize_config
+from .graph_runner import GraphRunner
 
 # src/train.py - Add near top
 
@@ -231,121 +232,245 @@ def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
 from .bucket_manager import build_bucket_manager_from_config
 
 def train_autoembed(components, config, iterator, logger=None):
-    # 1. Enforce Dictionary Type
+    """
+    Train the autoencoder (sparse AE) in isolation.
+
+    This trains ONLY the AE encoder/decoder to reconstruct clean images.
+    No transformer, no noise injection - pure AE reconstruction.
+    """
     config = sanitize_config(config)
-    
-    # 2. Strict Access (No defaults allowed here - define them in Pydantic schema)
-    mode = config['training']['mode']
+
     steps = config['training']['ae_steps']
     bs = config['training']['batch_size']
-    
-    
-    # 4. Optimizer Params (Strict)
-    opt_cfg = config['training']['ae_optimizer'] # distinct AE optimizer config
-    lr = opt_cfg['lr']
-    wd = opt_cfg['weight_decay']
-    max_lr = opt_cfg['max_lr']
-    pct_start = opt_cfg['pct_start']
-
-    
-    print(f"\n--- Training: Auto-Encoder ({mode.upper()}) ---")
-    model = components[0]
-    # this is bad. why are we doing this? oh yes, we are doing this because this is an immature single-device training script.
     device = config['device']
-    # 3. Build Manager
-    # We explicitly look up the stride from the model instance, or the config dict
+    dtype = config['dtype']
+
+    # Check config for sparse AE - this is the source of truth
+    sparse_ae_cfg = config['training']['sparse_ae']
+    if not sparse_ae_cfg['enabled']:
+        print("\n--- Skipping AE warmup (sparse_ae.enabled = false) ---")
+        return pd.DataFrame()
+
+    # Get components - SpanEmbedder wraps patch_emb, SpanUnembedder wraps patch_unembed
+    _, span_emb, span_unemb, _ = components
+    patch_emb = span_emb.patch_emb  # The actual patch embedder (SparseAEPatchEmbedder)
+    patch_unemb = span_unemb.patch_unembed  # The actual patch unembedder
+
+    # Get the sparse AE from the embedder wrapper
+    if not hasattr(patch_emb, 'ae'):
+        print("\n--- Skipping AE warmup (patch_emb has no .ae - check build_components) ---")
+        return pd.DataFrame()
+
+    sparse_ae = patch_emb.ae
+
+    print(f"\n--- Training: Sparse AutoEncoder ---")
+    print(f"    Levels: {sparse_ae.n_levels}, Code dim: {sparse_ae.code_dim}, "
+          f"Sparsity k: {sparse_ae.k_per_patch}")
+
+    # Optimizer for AE parameters only (not full model)
+    # NOTE: patch_emb and patch_unemb both hold references to sparse_ae via self.ae
+    # so we must NOT add their .parameters() directly (would duplicate sparse_ae params)
+    # Instead: add sparse_ae params once, then only the wrapper-specific projection layers
+    opt_cfg = config['training']['ae_optimizer']
+    ae_params = list(sparse_ae.parameters())
+    # Add only the wrapper-specific projection layers (not self.ae which is shared)
+    ae_params += list(patch_emb.code_proj.parameters())
+    ae_params += list(patch_emb.logsnr_proj.parameters())
+    ae_params += list(patch_unemb.code_unproj.parameters())
+    ae_params += list(patch_unemb.logsnr_decoder.parameters())
+
+    opt = torch.optim.AdamW(ae_params, lr=opt_cfg['lr'], weight_decay=opt_cfg['weight_decay'], fused=True)
+    scheduler = OneCycleLR(opt, max_lr=opt_cfg['max_lr'], total_steps=steps, pct_start=opt_cfg['pct_start'])
+
+    # Build bucket manager
+    model = components[0]
     model_stride = model.patch_embedder.stride
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
-    
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
-    fused=True)
-    scheduler = OneCycleLR(opt, max_lr=max_lr, total_steps=steps, pct_start=pct_start)
-    
-    history = []
     bucketing_enabled = config['training']['bucketing']['enabled']
-    # BF16 usually doesn't need a GradScaler, but FP16 does.
-    # We can use it conditionally.
-    dtype = config['dtype']
-    use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
-    # FIX: Use new torch.amp API
-    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
+
+    history = []
+    use_amp = dtype in (torch.bfloat16, torch.float16)
+    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
+    log_interval = config['logging']['log_interval']
+
     pbar = tqdm(range(steps), desc="train-ae")
     for i in pbar:
         opt.zero_grad()
-            
-               # --- AUTOCAST BLOCK ---
+
         with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
-            # 1. Get Clean Blocks
-            # 1. NEW: Sample Bucket
+            # Sample bucket for resolution
             if bucketing_enabled:
                 bucket = bucket_mgr.sample_bucket()
                 curr_res = bucket.resolution
                 curr_bs = bucket.batch_size
             else:
-                curr_res = 32 # Fallback
+                curr_res = 64
                 curr_bs = bs
-            
-            # 2. Generate Data with Dynamic Resolution
+
+            # Get clean image blocks
             clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
-            
-            # 2. Noise Injection (Forward Step)
-            noisy_blocks = []
-            target_imgs = []
-            target_lsnrs = []
-            
+
+            # === Batch-flattening pattern ===
+            # Group images by grid_shape for efficient batched processing
+            # This builds masks once per unique resolution and processes all same-res images together
+            latent_groups = {}  # grid_shape -> list of (block, img, logsnr)
+            sources = []
+
             for b in clean_blocks:
-                if b.type == 'latent':
-                    # AE training usually reconstructs from z_t. 
-                    # For pure AE (identity), we can use z_t = x0 (clean).
-                    # But let's stick to the script: x0 -> noise -> predict.
-                    noise = torch.randn_like(b.content)
-                    z_t, _, _ = euler_forward_step(b.content, b.logsnr, noise)
-                    
-                    # Construct input block
-                    noisy_blocks.append(ContextBlock(
-                        content=z_t, logsnr=b.logsnr, type='latent', causal=b.causal,
-                        shape_meta=b.shape_meta, group_id=b.group_id, id=b.id
-                    ))
-                    target_imgs.append(z_t) # AE target is input (identity)
-                    target_lsnrs.append(b.logsnr)
-                else:
-                    noisy_blocks.append(b) # Pass text through
-            
-            # 3. Forward
-            # Use run_model_forward directly to get raw outputs
-            decoded, aux = run_model_forward(components, noisy_blocks)
-            
-            loss_img = 0.0; loss_meta = 0.0; count = 0
-            latent_cursor = 0
-            for j, res in enumerate(decoded):
-                if 'image_vpreds' in res:
-                    loss_img += F.mse_loss(res['image_vpreds'], target_imgs[latent_cursor])
-                    loss_meta += F.l1_loss(res['image_logsnrs'], target_lsnrs[latent_cursor])
-                    latent_cursor += 1
-                    count += 1
-            
-            if count > 0:
-                loss_img /= count; loss_meta /= count
-                
-            total_loss = loss_img + 0.1 * loss_meta
+                if b.type != 'latent':
+                    continue
+
+                img = b.content  # [C, H, W]
+                lsnr = b.logsnr  # [1, H, W]
+                sources.append(getattr(b, 'source', 'unknown'))
+
+                # Compute grid_shape for grouping
+                p = patch_emb.stride
+                grid_shape = (img.shape[1] // p, img.shape[2] // p)
+
+                if grid_shape not in latent_groups:
+                    latent_groups[grid_shape] = []
+                latent_groups[grid_shape].append((b, img, lsnr))
+
+            if not latent_groups:
+                continue
+
+            # Process each grid_shape group as a batch
+            loss_recon_accum = torch.tensor(0.0, device=device)
+            loss_logsnr_accum = torch.tensor(0.0, device=device)
+            sparsity_accum = 0.0
+            n_latent = 0
+
+            for grid_shape, group in latent_groups.items():
+                # Stack into batch
+                imgs = torch.stack([g[1] for g in group], dim=0)  # [B, C, H, W]
+                logsnrs = torch.stack([g[2] for g in group], dim=0)  # [B, 1, H, W]
+                batch_size = imgs.shape[0]
+
+                # Use wrapper's cached masks for consistency with inference path
+                encoder_masks, decoder_masks = patch_emb._get_masks(grid_shape, device)
+
+                # Encode through sparse AE (batched)
+                codes_list, _ = patch_emb.ae.encode(imgs, logsnrs,
+                                                    grid_shape=grid_shape,
+                                                    encoder_masks=encoder_masks,
+                                                    decoder_masks=decoder_masks)
+
+                # Concatenate codes across levels and project to embeddings
+                codes_cat = torch.cat(codes_list, dim=-1)  # [B, N, code_dim * n_levels]
+                z = patch_emb.code_proj(codes_cat)  # [B, N, embed_dim]
+
+                # Decode through unembedder (batched)
+                recon_with_logsnr = patch_unemb(z, grid_shape)  # [B, C+1, H, W]
+                recon = recon_with_logsnr[:, :-1]  # [B, C, H, W]
+                logsnr_pred = recon_with_logsnr[:, -1:]  # [B, 1, H, W]
+
+                # Accumulate reconstruction loss
+                sq_err = (recon - imgs) ** 2
+                loss_recon_accum = loss_recon_accum + sq_err.mean() * batch_size
+
+                # Accumulate logsnr loss
+                loss_logsnr_accum = loss_logsnr_accum + F.l1_loss(logsnr_pred, logsnrs) * batch_size
+
+                # Compute sparsity from codes
+                nonzero_codes = (codes_cat != 0).sum()
+                total_codes = codes_cat.numel()
+                sparsity_accum += (1.0 - (nonzero_codes.item() / total_codes)) * batch_size
+                n_latent += batch_size
+
+            if n_latent == 0:
+                continue
+
+            # Average losses
+            loss_recon = loss_recon_accum / n_latent
+            loss_logsnr = loss_logsnr_accum / n_latent
+            sparsity = sparsity_accum / n_latent
+
+            # Total loss
+            ae_cfg = config['training']['sparse_ae']
+            total_loss = loss_recon + ae_cfg['logsnr_loss_weight'] * loss_logsnr
+
+        # Backward
         if dtype == torch.float16:
             scaler.scale(total_loss).backward()
             scaler.step(opt)
             scaler.update()
-            scheduler.step()
         else:
-            # BF16 or FP32: Standard backward
             total_loss.backward()
             opt.step()
-            scheduler.step()
-        
-        # Only sync to CPU at logging intervals (avoids per-step CPU-GPU sync)
-        log_interval = config['logging']['log_interval']
+        scheduler.step()
+
+        # Logging
         if i % log_interval == 0:
-            loss_val = loss_img.item() if isinstance(loss_img, torch.Tensor) else loss_img
-            history.append({'step': i, 'loss': loss_val, 'loss_ae': loss_val if count else 0})
-            pbar.set_postfix({'ae': f'{loss_val:.4f}'})
-            
+            loss_val = loss_recon.item()
+            sparsity_val = sparsity if isinstance(sparsity, float) else sparsity.item()
+
+            # Log per-source stats
+            for src in set(sources):
+                history.append({
+                    'step': i,
+                    'source': src,
+                    'type': 'latent',
+                    'loss': loss_val,
+                    'resolution': curr_res * curr_res,
+                    'sparsity': sparsity_val,
+                    'loss_logsnr': loss_logsnr.item()
+                })
+
+            pbar.set_postfix({
+                'recon': f'{loss_val:.4f}',
+                'sparse': f'{sparsity_val:.1%}'
+            })
+
+    # --- End of training: collect reconstruction samples for visualization ---
+    # This shows PURE AE encode/decode quality (no diffusion model involved)
+    if logger is not None and steps > 0:
+        print("Collecting AE reconstruction samples...")
+        recon_samples = {'x0': [], 'noisy_input': [], 'reconstruction': [], 'logsnr_map': [], 'source': []}
+
+        # Get the patch embedder/unembedder for direct AE encode/decode
+        # SpanEmbedder.patch_emb and SpanUnembedder.patch_unembed are the actual modules
+        patch_emb = span_emb.patch_emb  # SparseAEPatchEmbedder or ContextualPatchEmbedder
+        patch_unemb = span_unemb.patch_unembed  # SparseAEPatchUnembedder or ContextualPatchUnembedder
+
+        # Sample from each split
+        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+            for res in [64, 128, 256]:
+                try:
+                    sample_blocks = iterator.generate_batch_list(4, resolution=res)
+                except:
+                    continue
+
+                for b in sample_blocks:
+                    if b.type != 'latent':
+                        continue
+
+                    x0 = b.content  # [C, H, W]
+                    logsnr = b.logsnr  # [1, H, W]
+
+                    # Pure AE encode/decode (no noise, no diffusion)
+                    # This tests the autoencoder reconstruction quality directly
+                    z, grid_shape = patch_emb(x0, logsnr)  # Encode
+                    recon_full = patch_unemb(z, grid_shape)  # Decode [C+1, H, W]
+                    recon = recon_full[:3]  # RGB only, drop logsnr channel
+
+                    recon_samples['x0'].append(x0)
+                    recon_samples['noisy_input'].append(x0)  # For pure AE, input = clean
+                    recon_samples['reconstruction'].append(recon)
+                    recon_samples['logsnr_map'].append(logsnr)
+                    recon_samples['source'].append(getattr(b, 'source', 'unknown'))
+
+                    if len(recon_samples['x0']) >= 12:
+                        break
+                if len(recon_samples['x0']) >= 12:
+                    break
+
+        # Plot reconstructions
+        if recon_samples['x0']:
+            from .plotting import plot_dset_reconstruction
+            plot_dset_reconstruction(recon_samples, logger, name="ae_reconstruction", show_map=True, show_error=True)
+            print(f"  Saved {len(recon_samples['x0'])} AE reconstruction samples")
+
     return pd.DataFrame(history)
 
 def train_denoise(components, config, iterator, logger=None):
@@ -367,6 +492,7 @@ def train_denoise(components, config, iterator, logger=None):
 
     print(f"\n--- Training: Denoiser ({mode.upper()}) ---")
     model = components[0]
+    page_table = components[3]
     device = config['device']
     var_cfg = config['training']['online_variance_correction']
     if var_cfg['enabled']:
@@ -378,6 +504,17 @@ def train_denoise(components, config, iterator, logger=None):
     # We explicitly look up the stride from the model instance, or the config dict
     model_stride = model.patch_embedder.stride
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
+
+    # 4. CUDA Graph Runner (optional)
+    # One graph per block layout config. Shape = max_blocks × block_size.
+    graph_cfg = config['training']['graph_capture']
+    if graph_cfg['enabled']:
+        graph_runner = GraphRunner(model, page_table, config)
+        warmup_steps_needed = graph_cfg['warmup_steps']
+        print(f"[GraphRunner] CUDA Graph capture enabled, warmup={warmup_steps_needed} steps")
+    else:
+        graph_runner = None
+        warmup_steps_needed = 0
     
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd,
     fused=True)
@@ -429,8 +566,16 @@ def train_denoise(components, config, iterator, logger=None):
                     noisy_blocks.append(b)
                     
             # 3. Model Forward (Raw Decoded Output)
-            # we have text logits now so we are no longer using the get v from blocks wrapper
-            decoded_results, aux_loss = run_model_forward(components, noisy_blocks)
+            # Handle CUDA Graph warmup/capture/replay
+            # During early steps, run with warmup_mode=True to accumulate warmups per bucket
+            # Graph runner auto-captures after 3 warmups per bucket
+            # After capture, subsequent calls use replay automatically
+            use_warmup = (graph_runner is not None and i < warmup_steps_needed * 5)
+            decoded_results, aux_loss = run_model_forward(
+                components, noisy_blocks,
+                graph_runner=graph_runner,
+                warmup_mode=use_warmup
+            )
             
             # 4. Loss Calculation
             # Keep accumulators as tensors to avoid CPU-GPU sync per block

@@ -9,12 +9,16 @@ Usage:
 """
 import argparse
 import torch
+
+# Enable caching for flex attention backward - prevents recompilation overhead
+torch._inductor.config.unsafe_marked_cacheable_functions['torch.ops.higher_order.flex_attention_backward'] = True
+
 from src.config import load_config
 from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, PageTable
 from src.data_iterator import CompositeIterator
 from src.data_functional import get_tokenizer
 from src.train import train_autoembed, train_denoise
-from src.plotting import plot_multimetric_analysis, ExperimentLogger#, plot_dset_reconstruction
+from src.plotting import plot_multimetric_analysis, plot_ae_roundtrip, ExperimentLogger
 import src.sample as sampler
 
 
@@ -78,11 +82,18 @@ def build_components(cfg, device):
         ).to(device, dtype=dtype)
 
         if cfg['training']['compile']:
-            sparse_ae = torch.compile(sparse_ae, dynamic=cfg['training']['compile_dynamic'])
+            # Only compile the transformer layers (where flex attention lives)
+            # NOT the whole module - patchify/unpatchify have variable shapes
+            for enc in sparse_ae.encoders:
+                enc.transformer = torch.compile(enc.transformer)
+            for dec in sparse_ae.decoders:
+                dec.transformer = torch.compile(dec.transformer)
 
         # Create interface wrappers (move to device/dtype)
         ae_embedder = SparseAEPatchEmbedder(sparse_ae, embed_dim=cfg['model']['dim']).to(device, dtype=dtype)
-        ae_unembedder = SparseAEPatchUnembedder(sparse_ae, ae_embedder).to(device, dtype=dtype)
+        ae_unembedder = SparseAEPatchUnembedder(
+            sparse_ae, ae_embedder, fourier_dim=sparse_ae_cfg['fourier_dim']
+        ).to(device, dtype=dtype)
 
         # Use sparse AE wrappers instead of model's patch embedder/unembedder
         span_emb = SpanEmbedder(model.text_embed, ae_embedder)
@@ -164,9 +175,19 @@ def main():
     
     # 5. Run Training
     df_ae = train_autoembed(components, cfg, val_iterator, logger)
+    # Plot AE warmup metrics if AE training was run
+    if cfg['training']['ae_steps'] > 0 and not df_ae.empty:
+        plot_multimetric_analysis(df_ae, logger, f"multimetric_ae_{cfg['training']['mode']}")
+        # AE reconstruction quality with round-trip analysis
+        print("Plotting AE round-trip reconstruction...")
+        for res in cfg['sampling']['resolutions'][:2]:
+            plot_ae_roundtrip(components, val_iterator, logger,
+                              name=f"ae_roundtrip_{res}", n_samples=8, resolution=res)
+
     df_train = train_denoise(components, cfg, val_iterator, logger)
 
     print("\nPlotting Metrics...")
+    # Plot diffusion training metrics
     plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg['training']['mode']}")
     
 

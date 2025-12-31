@@ -5,9 +5,9 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # New SRC Imports
-from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedderr, PageTable
+from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, PageTable
 from src.data import CompositeIterator
-from src.utils import ExperimentLogge
+from src.utils import ExperimentLogger
 from src.sample import sample_viz_causal_sweep
 
 def find_video_path():

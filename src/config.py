@@ -91,7 +91,7 @@ class VideoParams(BaseModel):
 
 
 class DatasetSplit(BaseModel):
-    type: Literal["checkerboard", "torus", "video", "fractal"]
+    type: Literal["checkerboard", "torus", "video", "fractal", "infinite_fusion"]
     ratio: float = 1.0
     noise_mode: Literal["uniform", "split"] = "uniform"
     noise_params: NoiseParams = Field(default_factory=NoiseParams)
@@ -161,11 +161,15 @@ class OnlineVarianceCorrectionConfig(BaseModel):
 
 class AEAttentionConfig(BaseModel):
     """Attention configuration for sparse AE transformer layers."""
-    mode: Literal["full", "sliding", "gemma"] = "gemma"  # gemma = 3 local + 1 global
+    mode: Literal["full", "sliding", "gemma", "gemma_bigbird"] = "gemma"  # gemma = 3 local + 1 global
     window_size: int = 4  # For sliding window: attend to ±window_size patches
     global_layer_interval: int = 4  # For gemma mode: every Nth layer is global
     n_query_heads: int = 8
     n_kv_heads: int = 2  # GQA ratio
+    n_global_tokens: int = 4    # For bigbird/gemma_bigbird: number of register tokens
+    bigbird_layout: list = [2, 2]  # For gemma_bigbird: [n_local, n_bigbird] layers per cycle
+    random_min_k: int = 3       # Random attention: at least this many random keys
+    random_min_p: float = 0.02    # Random attention: at least this % of seq_len (whichever is larger)
 
 
 class SparseAEConfig(BaseModel):
@@ -182,6 +186,18 @@ class SparseAEConfig(BaseModel):
     logsnr_loss_weight: float = 0.1
     n_layers: int = 4  # Transformer layers per encoder/decoder
     attention: AEAttentionConfig = Field(default_factory=AEAttentionConfig)
+
+
+class GraphCaptureConfig(BaseModel):
+    """CUDA Graph capture configuration for model forward pass.
+
+    Graph capture requires warmup with REAL data before capture.
+    One graph is captured per sequence length bucket.
+    """
+    enabled: bool = False
+    warmup_steps: int = 3  # Number of warmup iterations before capture (minimum 3)
+    capture_after_warmup: bool = True  # Auto-capture after warmup completes
+    use_dedicated_stream: bool = True  # Use separate CUDA stream for capture
 
 
 class FractalParams(BaseModel):
@@ -211,6 +227,7 @@ class TrainingConfig(BaseModel):
     precision: str = "fp32"  # <--- ENABLE THIS # Options: "fp32", "bf16", "fp16"
     online_variance_correction: OnlineVarianceCorrectionConfig = Field(default_factory=OnlineVarianceCorrectionConfig)
     sparse_ae: SparseAEConfig = Field(default_factory=SparseAEConfig)
+    graph_capture: GraphCaptureConfig = Field(default_factory=GraphCaptureConfig)
 
 class SamplingConfig(BaseModel):
     num_samples: int = 8
