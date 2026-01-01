@@ -382,41 +382,83 @@ class coolerLDTformerZC(nn.Module):
         self.uses_sparse_ae = sparse_ae_config is not None and sparse_ae_config.get('enabled', False)
 
         if self.uses_sparse_ae:
-            from kmaze_ae.model_sparse_dim import (
-                SparsePerDimFSQAutoencoder,
-                SparseAEPatchEmbedder,
-                SparseAEPatchUnembedder
-            )
+            ae_type = sparse_ae_config.get('ae_type', 'sparse_dim')
 
             attn_cfg = sparse_ae_config.get('attention', {
                 'mode': 'full', 'window_size': 4, 'global_layer_interval': 4,
                 'n_query_heads': 8, 'n_kv_heads': 2, 'n_global_tokens': 4
             })
 
-            # Create sparse AE as a submodule - now part of model.parameters()
-            self.sparse_ae = SparsePerDimFSQAutoencoder(
-                n_levels=sparse_ae_config.get('n_levels', 6),
-                patch_size=sparse_ae_config.get('patch_size', 16),
-                image_size=256,  # Dynamic per batch
-                hidden_dim=sparse_ae_config.get('hidden_dim', 256),
-                code_dim=sparse_ae_config.get('code_dim', 128),
-                k_per_patch=sparse_ae_config.get('k_per_patch', 6),
-                residual_scale=sparse_ae_config.get('residual_scale', 2.0),
-                fourier_dim=sparse_ae_config.get('fourier_dim', 16),
-                n_layers=sparse_ae_config.get('n_layers', 4),
-                attn_config=attn_cfg
-            )
+            if ae_type == 'swiglu':
+                # SwiGLU variant: binary FSQ, level-global sparsity, 2D RoPE
+                from kmaze_ae.model_swiglu import (
+                    SwiGLUFSQAutoencoder,
+                    SwiGLUPatchEmbedder,
+                    SwiGLUPatchUnembedder
+                )
 
-            # Create embedder/unembedder wrappers (also submodules)
-            self.patch_embedder = SparseAEPatchEmbedder(self.sparse_ae, embed_dim=dim)
-            self.patch_unembedder = SparseAEPatchUnembedder(
-                self.sparse_ae, self.patch_embedder,
-                fourier_dim=sparse_ae_config.get('fourier_dim', 16)
-            )
+                # For swiglu, default to sliding window (3x3 neighborhood)
+                if 'mode' not in attn_cfg:
+                    attn_cfg['mode'] = 'sliding'
+                if 'window_size' not in attn_cfg:
+                    attn_cfg['window_size'] = 2  # Euclidean dist² ≤ 4 covers 3x3
 
-            print(f"[Model] Using SparseAE: {sparse_ae_config.get('n_levels', 6)} levels, "
-                  f"code_dim={sparse_ae_config.get('code_dim', 128)}, "
-                  f"k={sparse_ae_config.get('k_per_patch', 6)}")
+                self.sparse_ae = SwiGLUFSQAutoencoder(
+                    n_levels=sparse_ae_config.get('n_levels', 6),
+                    patch_size=sparse_ae_config.get('patch_size', 16),
+                    image_size=256,  # Dynamic per batch
+                    hidden_dim=sparse_ae_config.get('hidden_dim', 128),
+                    code_dim=sparse_ae_config.get('code_dim', 256),
+                    k_active=sparse_ae_config.get('k_per_patch', 8),
+                    residual_scale=sparse_ae_config.get('residual_scale', 2.0),
+                    fourier_dim=sparse_ae_config.get('fourier_dim', 16),
+                    n_layers=sparse_ae_config.get('n_layers', 1),
+                    n_heads=attn_cfg.get('n_query_heads', 4),
+                    n_kv_heads=attn_cfg.get('n_kv_heads', 2),
+                    attn_config=attn_cfg
+                )
+
+                self.patch_embedder = SwiGLUPatchEmbedder(self.sparse_ae, embed_dim=dim)
+                self.patch_unembedder = SwiGLUPatchUnembedder(
+                    self.sparse_ae, self.patch_embedder,
+                    fourier_dim=sparse_ae_config.get('fourier_dim', 16)
+                )
+
+                print(f"[Model] Using SwiGLU AE: {sparse_ae_config.get('n_levels', 6)} levels, "
+                      f"code_dim={sparse_ae_config.get('code_dim', 256)}, "
+                      f"k={sparse_ae_config.get('k_per_patch', 8)}, "
+                      f"attn={attn_cfg.get('mode', 'local')}")
+
+            else:
+                # Default: sparse_dim variant (3-bit, per-patch sparsity)
+                from kmaze_ae.model_sparse_dim import (
+                    SparsePerDimFSQAutoencoder,
+                    SparseAEPatchEmbedder,
+                    SparseAEPatchUnembedder
+                )
+
+                self.sparse_ae = SparsePerDimFSQAutoencoder(
+                    n_levels=sparse_ae_config.get('n_levels', 6),
+                    patch_size=sparse_ae_config.get('patch_size', 16),
+                    image_size=256,  # Dynamic per batch
+                    hidden_dim=sparse_ae_config.get('hidden_dim', 256),
+                    code_dim=sparse_ae_config.get('code_dim', 128),
+                    k_per_patch=sparse_ae_config.get('k_per_patch', 6),
+                    residual_scale=sparse_ae_config.get('residual_scale', 2.0),
+                    fourier_dim=sparse_ae_config.get('fourier_dim', 16),
+                    n_layers=sparse_ae_config.get('n_layers', 4),
+                    attn_config=attn_cfg
+                )
+
+                self.patch_embedder = SparseAEPatchEmbedder(self.sparse_ae, embed_dim=dim)
+                self.patch_unembedder = SparseAEPatchUnembedder(
+                    self.sparse_ae, self.patch_embedder,
+                    fourier_dim=sparse_ae_config.get('fourier_dim', 16)
+                )
+
+                print(f"[Model] Using SparseAE: {sparse_ae_config.get('n_levels', 6)} levels, "
+                      f"code_dim={sparse_ae_config.get('code_dim', 128)}, "
+                      f"k={sparse_ae_config.get('k_per_patch', 6)}")
         else:
             self.sparse_ae = None
             self.patch_embedder = ContextualPatchEmbedder(

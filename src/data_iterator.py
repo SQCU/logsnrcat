@@ -103,9 +103,9 @@ class CompositeIterator:
             elif sType == 'fractal':
                 from .fractal import FractalIterator
                 iterator = FractalIterator(device, params)
-            elif sType == 'infinite_fusion':
-                from .infinite_fusion import InfiniteFusionIterator
-                iterator = InfiniteFusionIterator(device, params)
+            elif sType == 'sprite_atlas':
+                from .sprite_atlas import SpriteAtlasIterator
+                iterator = SpriteAtlasIterator(device, params)
 
             if iterator:
                 self.splits.append({

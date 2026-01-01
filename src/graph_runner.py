@@ -98,22 +98,41 @@ class GraphRunner:
         self._utilization_warned = False
 
     def _create_static_buffers(self, mask_local: BlockMask, mask_global: BlockMask) -> GraphBuffers:
-        """Allocate static buffers at MAX context size."""
+        """Allocate static buffers at MAX context size.
+
+        Mask buffers are allocated at max_blocks in the Q-block dimension (first dim),
+        preserving the KV-blocks-per-Q dimension from the attention pattern.
+        This allows variable sequence lengths while keeping attention pattern fixed.
+        """
+        # Get KV dimension from incoming mask (determined by attention pattern, not seq len)
+        local_kv_dim = mask_local.kv_indices.shape[1] if mask_local.kv_indices.dim() > 1 else 1
+        local_full_kv_dim = mask_local.full_kv_indices.shape[1] if mask_local.full_kv_indices.dim() > 1 else 1
+        global_kv_dim = mask_global.kv_indices.shape[1] if mask_global.kv_indices.dim() > 1 else 1
+        global_full_kv_dim = mask_global.full_kv_indices.shape[1] if mask_global.full_kv_indices.dim() > 1 else 1
+
         return GraphBuffers(
             # Input buffers at max capacity
             z=torch.zeros(1, self.max_ctx, self.dim, device=self.device, dtype=self.dtype),
             topo=torch.zeros(1, self.max_ctx, self.topo_dim, device=self.device, dtype=self.dtype),
 
-            # Clone mask tensors - shapes determined by max_blocks
-            mask_local_kv_indices=mask_local.kv_indices.clone(),
-            mask_local_full_kv_indices=mask_local.full_kv_indices.clone(),
-            mask_local_kv_num_blocks=mask_local.kv_num_blocks.clone(),
-            mask_local_full_kv_num_blocks=mask_local.full_kv_num_blocks.clone(),
+            # Mask tensors at max_blocks in Q dimension, pattern-determined in KV dimension
+            mask_local_kv_indices=torch.zeros(
+                self.max_blocks, local_kv_dim, device=self.device, dtype=mask_local.kv_indices.dtype),
+            mask_local_full_kv_indices=torch.zeros(
+                self.max_blocks, local_full_kv_dim, device=self.device, dtype=mask_local.full_kv_indices.dtype),
+            mask_local_kv_num_blocks=torch.zeros(
+                self.max_blocks, device=self.device, dtype=mask_local.kv_num_blocks.dtype),
+            mask_local_full_kv_num_blocks=torch.zeros(
+                self.max_blocks, device=self.device, dtype=mask_local.full_kv_num_blocks.dtype),
 
-            mask_global_kv_indices=mask_global.kv_indices.clone(),
-            mask_global_full_kv_indices=mask_global.full_kv_indices.clone(),
-            mask_global_kv_num_blocks=mask_global.kv_num_blocks.clone(),
-            mask_global_full_kv_num_blocks=mask_global.full_kv_num_blocks.clone(),
+            mask_global_kv_indices=torch.zeros(
+                self.max_blocks, global_kv_dim, device=self.device, dtype=mask_global.kv_indices.dtype),
+            mask_global_full_kv_indices=torch.zeros(
+                self.max_blocks, global_full_kv_dim, device=self.device, dtype=mask_global.full_kv_indices.dtype),
+            mask_global_kv_num_blocks=torch.zeros(
+                self.max_blocks, device=self.device, dtype=mask_global.kv_num_blocks.dtype),
+            mask_global_full_kv_num_blocks=torch.zeros(
+                self.max_blocks, device=self.device, dtype=mask_global.full_kv_num_blocks.dtype),
 
             # Output buffer at max capacity
             z_out=torch.zeros(1, self.max_ctx, self.dim, device=self.device, dtype=self.dtype),
@@ -121,18 +140,30 @@ class GraphRunner:
         )
 
     def _create_static_masks(self, mask_local: BlockMask, mask_global: BlockMask) -> Tuple[BlockMask, BlockMask]:
-        """Create BlockMask objects that reference our static buffers."""
+        """Create BlockMask objects that reference our static buffers.
+
+        Updates both tensor attributes AND shape metadata to reflect max_blocks.
+        """
         static_local = copy.copy(mask_local)
         static_local.kv_indices = self._buffers.mask_local_kv_indices
         static_local.full_kv_indices = self._buffers.mask_local_full_kv_indices
         static_local.kv_num_blocks = self._buffers.mask_local_kv_num_blocks
         static_local.full_kv_num_blocks = self._buffers.mask_local_full_kv_num_blocks
+        # Update shape metadata if present (flex_attention BlockMask attrs)
+        if hasattr(static_local, 'num_rows'):
+            static_local.num_rows = self.max_blocks
+        if hasattr(static_local, 'num_cols'):
+            static_local.num_cols = self.max_blocks
 
         static_global = copy.copy(mask_global)
         static_global.kv_indices = self._buffers.mask_global_kv_indices
         static_global.full_kv_indices = self._buffers.mask_global_full_kv_indices
         static_global.kv_num_blocks = self._buffers.mask_global_kv_num_blocks
         static_global.full_kv_num_blocks = self._buffers.mask_global_full_kv_num_blocks
+        if hasattr(static_global, 'num_rows'):
+            static_global.num_rows = self.max_blocks
+        if hasattr(static_global, 'num_cols'):
+            static_global.num_cols = self.max_blocks
 
         return static_local, static_global
 
@@ -146,7 +177,8 @@ class GraphRunner:
         Copy data into static buffers. Returns valid length.
 
         Input z may be smaller than max_ctx - we copy into the valid region.
-        Mask contents update to reflect what's valid vs OOB.
+        Mask tensors may have fewer Q-blocks than max_blocks - we copy into
+        the valid slice and zero the remainder (kv_num_blocks=0 means no attention).
         """
         mask_local, mask_global = masks
         valid_len = z.shape[1]
@@ -155,16 +187,27 @@ class GraphRunner:
         self._buffers.z[:, :valid_len].copy_(z)
         self._buffers.topo[:, :valid_len].copy_(topo)
 
-        # Copy mask tensor CONTENTS (shapes must match static buffers)
-        self._buffers.mask_local_kv_indices.copy_(mask_local.kv_indices)
-        self._buffers.mask_local_full_kv_indices.copy_(mask_local.full_kv_indices)
-        self._buffers.mask_local_kv_num_blocks.copy_(mask_local.kv_num_blocks)
-        self._buffers.mask_local_full_kv_num_blocks.copy_(mask_local.full_kv_num_blocks)
+        # Get actual number of Q-blocks from incoming masks
+        actual_blocks_local = mask_local.kv_num_blocks.shape[0]
+        actual_blocks_global = mask_global.kv_num_blocks.shape[0]
 
-        self._buffers.mask_global_kv_indices.copy_(mask_global.kv_indices)
-        self._buffers.mask_global_full_kv_indices.copy_(mask_global.full_kv_indices)
-        self._buffers.mask_global_kv_num_blocks.copy_(mask_global.kv_num_blocks)
-        self._buffers.mask_global_full_kv_num_blocks.copy_(mask_global.full_kv_num_blocks)
+        # Zero out mask buffers first (kv_num_blocks=0 disables attention for OOB blocks)
+        self._buffers.mask_local_kv_num_blocks.zero_()
+        self._buffers.mask_local_full_kv_num_blocks.zero_()
+        self._buffers.mask_global_kv_num_blocks.zero_()
+        self._buffers.mask_global_full_kv_num_blocks.zero_()
+
+        # Copy local mask into valid slice
+        self._buffers.mask_local_kv_indices[:actual_blocks_local].copy_(mask_local.kv_indices)
+        self._buffers.mask_local_full_kv_indices[:actual_blocks_local].copy_(mask_local.full_kv_indices)
+        self._buffers.mask_local_kv_num_blocks[:actual_blocks_local].copy_(mask_local.kv_num_blocks)
+        self._buffers.mask_local_full_kv_num_blocks[:actual_blocks_local].copy_(mask_local.full_kv_num_blocks)
+
+        # Copy global mask into valid slice
+        self._buffers.mask_global_kv_indices[:actual_blocks_global].copy_(mask_global.kv_indices)
+        self._buffers.mask_global_full_kv_indices[:actual_blocks_global].copy_(mask_global.full_kv_indices)
+        self._buffers.mask_global_kv_num_blocks[:actual_blocks_global].copy_(mask_global.kv_num_blocks)
+        self._buffers.mask_global_full_kv_num_blocks[:actual_blocks_global].copy_(mask_global.full_kv_num_blocks)
 
         return valid_len
 

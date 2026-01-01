@@ -1,5 +1,6 @@
-# Sparse Hierarchical FSQ Autoencoder with Fractal Data
-# Use this for training the kmaze_ae jointly with the transformer
+# SwiGLU FSQ Autoencoder with Fractal Data
+# Same as sparse_ae_fractal.toml but using swiglu AE variant
+# Changes: ae_type, attention mode (local/3x3), output_dir
 
 [model]
 dim = 512
@@ -45,33 +46,28 @@ warmup_steps = 20
 capture_after_warmup = true
 use_dedicated_stream = true
 
-# Sparse AE Configuration - THIS ENABLES KMAZE_AE
+# Sparse AE Configuration - SWIGLU VARIANT
 [training.sparse_ae]
 enabled = true
-ae_type = "sparse_dim"  # "sparse_dim" (3-bit per-patch sparsity) | "swiglu" (binary level-global, 2D RoPE)
+ae_type = "swiglu"     # <<< Changed: binary FSQ, level-global sparsity, 2D RoPE
 n_levels = 6
 patch_size = 16
 hidden_dim = 256
 code_dim = 128
-k_per_patch = 4        # For sparse_dim: keep 4 of 128 dims = 97% sparsity
-                       # For swiglu: k_active (level-global dims)
+k_per_patch = 4        # For swiglu: level-global active dims
 residual_scale = 2.0
 fourier_dim = 16
-ae_loss_weight = 0.1   # Weight for AE reconstruction loss
-logsnr_loss_weight = 0.1  # Weight for logsnr prediction loss
-n_layers = 4           # Transformer layers per encoder/decoder
+ae_loss_weight = 0.1
+logsnr_loss_weight = 0.1
+n_layers = 4
 
-# Attention configuration for AE transformer layers
+# Attention configuration - sliding window for 3x3 neighborhood
 [training.sparse_ae.attention]
-mode = "gemma_bigbird" # "full" | "sliding" | "bigbird" | "gemma" | "gemma_bigbird"
-window_size = 4        # For sliding/bigbird: attend to ±window_size patches
-global_layer_interval = 4  # For gemma: every Nth layer is global
-n_global_tokens = 4    # For bigbird/gemma_bigbird: number of register tokens
-bigbird_layout = [2, 2]  # For gemma_bigbird: [n_local, n_bigbird] layers per cycle
-random_min_k = 3       # Random attention: at least this many random keys
-random_min_p = 0.02    # Random attention: at least this % of seq_len (whichever is larger)
+mode = "sliding"       # <<< Changed: sliding window (3x3 neighborhood)
+window_size = 2        # <<< Changed: Euclidean dist² ≤ 4 covers 3x3
+n_global_tokens = 0    # <<< No registers for pure sliding window
 n_query_heads = 8
-n_kv_heads = 2         # GQA ratio: 8/2 = 4x KV sharing
+n_kv_heads = 2
 
 [training.online_variance_correction]
 enabled = true
@@ -130,11 +126,11 @@ max_batch_size = 128
 max_logical_blocks = 1024
 
 [logging]
-output_dir = "./experiments_sparse_ae"
+output_dir = "./experiments_swiglu_ae"  # <<< Changed
 log_interval = 50
 sample_after_training = true
 
-# Dataset mix - Fractal-heavy for AE warmup
+# Dataset mix - Fractal-heavy for AE warmup (same as sparse_ae_fractal)
 [dataset_mix.fractal_main]
 type = "fractal"
 ratio = 0.5

@@ -34,6 +34,12 @@ compile_dynamic = true
 schedule_bounds = [5.0, -4.0]       #this dictates what the 'x_0' lsnr is, vs what the 'z_T' lsnr is. controls some eval samplers too.
 precision = "bf16"  # <--- ENABLE THIS
 
+[training.graph_capture]
+enabled = true
+warmup_steps = 5
+capture_after_warmup = true
+use_dedicated_stream = true
+
 [training.online_variance_correction]
 enabled = true  # flip to true for ablation
 num_buckets = 20

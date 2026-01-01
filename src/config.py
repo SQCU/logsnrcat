@@ -91,7 +91,7 @@ class VideoParams(BaseModel):
 
 
 class DatasetSplit(BaseModel):
-    type: Literal["checkerboard", "torus", "video", "fractal", "infinite_fusion"]
+    type: Literal["checkerboard", "torus", "video", "fractal", "sprite_atlas"]
     ratio: float = 1.0
     noise_mode: Literal["uniform", "split"] = "uniform"
     noise_params: NoiseParams = Field(default_factory=NoiseParams)
@@ -175,6 +175,7 @@ class AEAttentionConfig(BaseModel):
 class SparseAEConfig(BaseModel):
     """Configuration for kmaze_ae sparse hierarchical autoencoder."""
     enabled: bool = False
+    ae_type: Literal["sparse_dim", "swiglu"] = "sparse_dim"  # sparse_dim=3-bit, swiglu=binary+2D RoPE
     n_levels: int = 6
     patch_size: int = 16
     hidden_dim: int = 256

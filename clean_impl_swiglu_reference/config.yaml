@@ -1,0 +1,28 @@
+data_folder: /home/ubuntu/ComfyUI/SKU/export_tagged_images
+batch_size: 32
+learning_rate: 1e-4
+weight_decay: 0.01
+max_steps: 10000
+
+image_size: 256
+patches_per_level: [64, 64, 64, 64, 64, 64]
+dec_canvas_sizes: [256, 256, 256, 256, 256, 256]
+
+hidden_dim: 128
+code_dim: 256
+n_layers: 1
+residual_scale: 2.0
+share_weights: true
+
+n_query_heads: 4
+n_kv_heads: 2
+
+output_dir: outputs
+save_interval_seconds: 15
+clear_samples_on_launch: true
+
+k_starts: [64, 64, 64, 64, 64, 64]
+k_ends: [8, 8, 8, 8, 8, 8]
+anneal_steps: 5000
+
+loss_fn: cumulative_mse_contrib

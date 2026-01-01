@@ -1,5 +1,5 @@
-# Infinite Fusion Sprite Dataset Training Config
-# 122k+ fusion sprites (96x96), combinatorial Pokémon fusions with artist credits
+# Sprite Atlas Dataset Training Config
+# 120k+ fusion sprites (96x96), combinatorial sprite fusions with artist credits
 
 [model]
 dim = 512
@@ -113,22 +113,22 @@ max_batch_size = 128
 max_logical_blocks = 1024
 
 [logging]
-output_dir = "./experiments_fusion"
+output_dir = "./experiments_sprite_atlas"
 log_interval = 50
 sample_after_training = true
 
-# Dataset: Infinite Fusion sprites
-# 122k+ fusions, each 96x96 with artist credits and dex entries
-[dataset_mix.fusion_main]
-type = "infinite_fusion"
+# Dataset: Sprite atlas
+# 120k+ fusions, each 96x96 with artist credits and text entries
+[dataset_mix.sprite_main]
+type = "sprite_atlas"
 ratio = 0.8
 noise_mode = "uniform"
-[dataset_mix.fusion_main.params]
+[dataset_mix.sprite_main.params]
 seed = 42
 data_dir = "data/infinite_fusion"
 resolution = 96
 text_position = "none"
-[dataset_mix.fusion_main.noise_params]
+[dataset_mix.sprite_main.noise_params]
 min_snr = -4.0
 max_snr = 5.0
 
