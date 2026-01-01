@@ -8,8 +8,6 @@ configs/alt
 
 experiments_alt
 
-kmaze_ae
-
 # Dataset files (large binary data)
 data/
 !data/.gitkeep
