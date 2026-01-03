@@ -62,11 +62,11 @@ use_dedicated_stream = true
 enabled = true
 latent_diffusion = true  
 ae_type = "swiglu"     # <<< Changed: binary FSQ, per-patch sparsity, 2D RoPE
-n_levels = 6
+n_levels = 7
 patch_size = 16
 hidden_dim = 256
 code_dim = 128
-k_per_patch = 4        # Each patch selects its own top-4 dims (~97% sparsity)
+k_per_patch = 6        # Each patch selects its own top-4 dims (~97% sparsity)
 residual_scale = 2.0
 fourier_dim = 16
 ae_loss_weight = 0.1   # Weight for AE loss in joint training (not used in standalone AE warmup)
@@ -81,8 +81,8 @@ loss_type = "final_mse"  # Reference uses final only, cumulative dilutes gradien
 enabled = true
 mse_start = 1.0    # 100% MSE at start
 bce_start = 0.0    # 0% BCE at start
-mse_end = 0.1      # 10% MSE at end
-bce_end = 0.9      # 90% BCE at end
+mse_end = 0.8      # 10% MSE at end
+bce_end = 0.2      # 90% BCE at end
 schedule = "linear"  # "linear", "cosine", or "step"
 pct_switch = 0.8   # For "step" schedule: switch at this fraction
 
@@ -161,6 +161,7 @@ state_dtype = "bf16"  # bf16 for momentum buffer (no v term = numerically stable
 [training.optimizer.adamw]
 lr = 3e-4
 weight_decay = 0.1
+max_lr = 3e-5
 betas = [0.9, 0.95]
 # state_dtype = fp32 (always, PyTorch enforces this)
 
@@ -190,7 +191,7 @@ fsq_patterns = ["code_proj", "code_unproj", "fsq", "sparsity", "dim_logits", "le
 [training.ae_optimizer]
 lr = 3e-4
 weight_decay = 0.1
-max_lr = 3e-4
+max_lr = 3e-5
 pct_start = 0.1
 
 [sampling]
@@ -251,7 +252,7 @@ angle_range_deg = 45.0
 
 [dataset_mix.checker_baseline]
 type = "checkerboard"
-ratio = 0.3
+ratio = 0.2
 noise_mode = "split"
 [dataset_mix.checker_baseline.params]
 seed = 456
@@ -278,7 +279,7 @@ angle_range_deg = 45.0
 # Sparse sprite atlas - pixel art with logit-biased sampling
 [dataset_mix.sprite_atlas]
 type = "sprite_atlas"
-ratio = 0.4
+ratio = 1.0
 noise_mode = "uniform"
 [dataset_mix.sprite_atlas.params]
 data_dir = "data/infinite_fusion"

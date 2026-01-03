@@ -128,30 +128,16 @@ def cumulative_mse_with_contribution(
 # Scheduled MSE+BCE Loss
 # =============================================================================
 
-def scheduled_mse_bce_loss(
-    output: Dict[str, Any],
-    target: torch.Tensor,
-    step: int = 0,
-    total_steps: int = 1,
-    schedule_cfg: Optional[Dict[str, Any]] = None,
-    **kwargs
-) -> Tuple[torch.Tensor, Dict[str, Any]]:
+def _compute_schedule_weights(
+    step: int,
+    total_steps: int,
+    schedule_cfg: Dict[str, Any]
+) -> Tuple[float, float]:
     """
-    Scheduled MSE+BCE loss that lerps from pure MSE to mostly BCE over training.
+    Compute MSE and BCE weights from schedule config.
 
-    Early training: MSE provides smooth gradients for coarse structure.
-    Late training: BCE pushes for sharp, committed predictions.
-
-    Args:
-        output: Dict with 'recon' ([B, C, H, W]) in [0, 1]
-        target: [B, C, H, W] in [0, 1]
-        step: Current training step
-        total_steps: Total training steps
-        schedule_cfg: Dict with mse_start, mse_end, bce_start, bce_end, schedule type
+    Extracted helper to avoid duplication between final and cumulative variants.
     """
-    if schedule_cfg is None:
-        schedule_cfg = {}
-
     mse_start = schedule_cfg.get('mse_start', 1.0)
     mse_end = schedule_cfg.get('mse_end', 0.1)
     bce_start = schedule_cfg.get('bce_start', 0.0)
@@ -177,6 +163,37 @@ def scheduled_mse_bce_loss(
     mse_weight = mse_start + t * (mse_end - mse_start)
     bce_weight = bce_start + t * (bce_end - bce_start)
 
+    return mse_weight, bce_weight
+
+
+def scheduled_mse_bce_loss(
+    output: Dict[str, Any],
+    target: torch.Tensor,
+    step: int = 0,
+    total_steps: int = 1,
+    schedule_cfg: Optional[Dict[str, Any]] = None,
+    **kwargs
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Scheduled MSE+BCE loss that lerps from pure MSE to mostly BCE over training.
+
+    FINAL-ONLY variant: applies loss only to output['recon'].
+
+    Early training: MSE provides smooth gradients for coarse structure.
+    Late training: BCE pushes for sharp, committed predictions.
+
+    Args:
+        output: Dict with 'recon' ([B, C, H, W]) in [0, 1]
+        target: [B, C, H, W] in [0, 1]
+        step: Current training step
+        total_steps: Total training steps
+        schedule_cfg: Dict with mse_start, mse_end, bce_start, bce_end, schedule type
+    """
+    if schedule_cfg is None:
+        schedule_cfg = {}
+
+    mse_weight, bce_weight = _compute_schedule_weights(step, total_steps, schedule_cfg)
+
     recon = output['recon']
 
     # MSE loss
@@ -198,6 +215,79 @@ def scheduled_mse_bce_loss(
         'bce_loss': bce_loss.detach(),
         'mse_weight': mse_weight,
         'bce_weight': bce_weight,
+        'sparsity': output['sparsity'].detach()
+    }
+    return loss, stats
+
+
+def cumulative_scheduled_mse_bce_loss(
+    output: Dict[str, Any],
+    target: torch.Tensor,
+    step: int = 0,
+    total_steps: int = 1,
+    schedule_cfg: Optional[Dict[str, Any]] = None,
+    **kwargs
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Scheduled MSE+BCE loss applied to each level reconstruction independently.
+
+    CUMULATIVE variant: applies loss to each level_recons[i] vs target, then averages.
+
+    This gives clean gradient signals to each level rather than coupling all levels
+    through the final output. BCE's nonlinear gradient (∝ 1/(pred*(1-pred))) creates
+    interference when applied only to the final output because all levels contribute
+    through the residual chain. By applying BCE per-level, each level gets direct
+    feedback on its cumulative reconstruction quality.
+
+    Same schedule semantics as scheduled_mse_bce_loss:
+    - Early training: MSE provides smooth gradients for coarse structure
+    - Late training: BCE pushes for sharp, committed predictions at ALL levels
+
+    Args:
+        output: Dict with 'level_recons' (list of [B, C, H, W]) in [0, 1]
+        target: [B, C, H, W] in [0, 1]
+        step: Current training step
+        total_steps: Total training steps
+        schedule_cfg: Dict with mse_start, mse_end, bce_start, bce_end, schedule type
+    """
+    if schedule_cfg is None:
+        schedule_cfg = {}
+
+    mse_weight, bce_weight = _compute_schedule_weights(step, total_steps, schedule_cfg)
+
+    level_recons = output['level_recons']
+    n_levels = len(level_recons)
+
+    mse_losses = []
+    bce_losses = []
+
+    # Compute loss for each level's cumulative reconstruction
+    with torch.amp.autocast(device_type='cuda', enabled=False):
+        target_float = target.float()
+
+        for recon in level_recons:
+            # MSE for this level
+            mse_losses.append(F.mse_loss(recon, target))
+
+            # BCE for this level - clamp to avoid log(0)
+            recon_clamped = recon.float().clamp(1e-7, 1 - 1e-7)
+            bce_losses.append(F.binary_cross_entropy(recon_clamped, target_float))
+
+    # Average across levels
+    avg_mse = sum(mse_losses) / n_levels
+    avg_bce = sum(bce_losses) / n_levels
+
+    # Combined loss with schedule weights
+    loss = mse_weight * avg_mse + bce_weight * avg_bce
+
+    stats = {
+        'recon_loss': loss.detach(),
+        'mse_loss': avg_mse.detach(),
+        'bce_loss': avg_bce.detach(),
+        'mse_weight': mse_weight,
+        'bce_weight': bce_weight,
+        'per_level_mse': [l.detach() for l in mse_losses],
+        'per_level_bce': [l.detach() for l in bce_losses],
         'sparsity': output['sparsity'].detach()
     }
     return loss, stats
@@ -236,30 +326,7 @@ def scheduled_mse_bce_velocity_loss(
     if schedule_cfg is None:
         schedule_cfg = {}
 
-    mse_start = schedule_cfg.get('mse_start', 1.0)
-    mse_end = schedule_cfg.get('mse_end', 0.9)
-    bce_start = schedule_cfg.get('bce_start', 0.0)
-    bce_end = schedule_cfg.get('bce_end', 0.1)
-    schedule_type = schedule_cfg.get('schedule', 'linear')
-    pct_switch = schedule_cfg.get('pct_switch', 0.8)
-
-    # Compute progress [0, 1]
-    progress = min(step / max(total_steps, 1), 1.0)
-
-    # Compute lerp factor based on schedule type
-    if schedule_type == 'linear':
-        t = progress
-    elif schedule_type == 'cosine':
-        import math
-        t = 0.5 * (1 - math.cos(math.pi * progress))
-    elif schedule_type == 'step':
-        t = 1.0 if progress >= pct_switch else 0.0
-    else:
-        t = progress  # fallback to linear
-
-    # Lerp weights
-    mse_weight = mse_start + t * (mse_end - mse_start)
-    bce_weight = bce_start + t * (bce_end - bce_start)
+    mse_weight, bce_weight = _compute_schedule_weights(step, total_steps, schedule_cfg)
 
     # MSE loss (with optional variance tracking)
     sq_err = (v_pred - v_target) ** 2
@@ -401,9 +468,10 @@ def get_ae_loss_fn(config: Dict[str, Any]) -> Callable:
 
     Looks at config['training']['sparse_ae']['loss_type'] and ['loss_schedule'].
 
-    If loss_schedule.enabled is True, returns a scheduled MSE+BCE loss function
-    that lerps from pure MSE to mostly BCE over training. The returned function
-    accepts step= and total_steps= kwargs.
+    If loss_schedule.enabled is True, returns a CUMULATIVE scheduled MSE+BCE loss
+    that applies both MSE and BCE to each level_recons[i] independently before
+    averaging. This gives clean gradient signals to each level rather than
+    coupling all levels through the final output.
 
     NOTE: FSQ autoencoder is a pure image compression network.
     logsnr prediction is the LDTformer denoiser's job, not the AE's.
@@ -414,12 +482,13 @@ def get_ae_loss_fn(config: Dict[str, Any]) -> Callable:
     # Check if loss schedule is enabled
     loss_schedule_cfg = sparse_ae_cfg.get('loss_schedule', {})
     if isinstance(loss_schedule_cfg, dict) and loss_schedule_cfg.get('enabled', False):
-        # Return scheduled MSE+BCE loss with captured config
+        # Use CUMULATIVE variant: applies MSE+BCE to each level independently
+        # This avoids BCE gradient interference between residual levels
         def scheduled_loss_wrapper(output, target, **kwargs):
             # Extract step/total_steps before passing remaining kwargs
             step = kwargs.pop('step', 0)
             total_steps = kwargs.pop('total_steps', 1)
-            return scheduled_mse_bce_loss(
+            return cumulative_scheduled_mse_bce_loss(
                 output, target,
                 step=step,
                 total_steps=total_steps,

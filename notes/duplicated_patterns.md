@@ -92,7 +92,7 @@ if mode == 'sliding':
 **Locations:**
 - `config.py` `LossScheduleConfig` (for AE)
 - `config.py` `DiffusionLossScheduleConfig` (for v-field)
-- `losses.py` `scheduled_mse_bce_loss()`
+- `losses.py` `scheduled_mse_bce_loss()`, `cumulative_scheduled_mse_bce_loss()`
 - `losses.py` `scheduled_mse_bce_velocity_loss()`
 
 **Pattern:**
@@ -107,16 +107,18 @@ class SomeLossScheduleConfig:
     pct_switch: float = 0.8  # for step schedule
 ```
 
-Both loss functions compute lerp weights identically:
-```python
-t = step / max(total_steps - 1, 1)
-if schedule == 'linear':
-    mse_weight = mse_start + t * (mse_end - mse_start)
-    bce_weight = bce_start + t * (bce_end - bce_start)
-# ... cosine, step variants
-```
+**FIXED:** Extracted `_compute_schedule_weights(step, total_steps, cfg)` helper in `losses.py`.
+All three loss functions now use this helper:
+- `scheduled_mse_bce_loss` (final-only for AE)
+- `cumulative_scheduled_mse_bce_loss` (per-level for AE, now the default)
+- `scheduled_mse_bce_velocity_loss` (for v-field diffusion)
 
-**Refactor suggestion:** Single `LossScheduleConfig` + `compute_schedule_weights(cfg, step, total_steps)` utility function.
+**Remaining duplication:** Config schema still has two separate classes
+(`LossScheduleConfig`, `DiffusionLossScheduleConfig`) - minor, different default values.
+
+**Note on cumulative mode:** When loss_schedule.enabled=True, `get_ae_loss_fn()` now returns
+`cumulative_scheduled_mse_bce_loss` by default. This applies MSE+BCE to each `level_recons[i]`
+independently before averaging, avoiding BCE gradient interference between residual levels.
 
 ---
 
