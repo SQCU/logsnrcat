@@ -574,8 +574,13 @@ class SpriteAtlasIterator:
             use_validated_prior=True
         )
 
-        # RNG for rendering
-        self._rng = random.Random(sampling_dict.get('seed', 42))
+        # GPU-batched RNG for rendering (avoids per-call CPU-GPU sync)
+        # We generate batches of random floats on GPU, transfer once, consume from CPU
+        self._rand_buffer: List[float] = []
+        self._rand_idx = 0
+        self._rand_batch_size = 2048  # Refill when exhausted
+        self._gpu_gen = torch.Generator(device=device)
+        self._gpu_gen.manual_seed(sampling_dict.get('seed', 42))
 
         # GPU spritesheet cache: {sheet_path: tensor[4, H, W]}
         # Avoids repeated disk I/O and H2D transfers
@@ -589,23 +594,48 @@ class SpriteAtlasIterator:
             print(f"  Adjustments: {sampling_config.adjustments}")
 
     def _get_cached_sheet(self, sheet_path: str) -> torch.Tensor:
-        """Get spritesheet from GPU cache, loading if needed."""
+        """Get spritesheet from GPU cache, loading if needed.
+
+        Uses torchvision.io.read_image for direct tensor loading without
+        PIL/numpy intermediate - avoids CPU overhead and extra copies.
+        """
         if sheet_path not in self._sheet_cache:
             # Evict oldest if at capacity (simple FIFO)
             if len(self._sheet_cache) >= self._cache_max_sheets:
                 oldest_key = next(iter(self._sheet_cache))
                 del self._sheet_cache[oldest_key]
 
-            # Load sheet to GPU once
-            from PIL import Image
-            img = Image.open(sheet_path).convert('RGBA')
-            # Direct to tensor without numpy intermediate
-            import numpy as np
-            arr = np.array(img)
-            sheet_tensor = torch.from_numpy(arr).permute(2, 0, 1).float().div_(255.0)
-            self._sheet_cache[sheet_path] = sheet_tensor.to(self.device)
+            # Load sheet directly to tensor via torchvision (no PIL/numpy)
+            # Returns uint8 [C, H, W] - convert to float32 [0,1] on GPU
+            sheet_tensor = read_image(sheet_path, mode=ImageReadMode.RGB_ALPHA)
+            sheet_tensor = sheet_tensor.to(self.device).float().div_(255.0)
+            self._sheet_cache[sheet_path] = sheet_tensor
 
         return self._sheet_cache[sheet_path]
+
+    def _refill_rand_buffer(self):
+        """Batch-generate random floats on GPU and transfer once."""
+        rand_tensor = torch.rand(
+            self._rand_batch_size,
+            device=self.device,
+            generator=self._gpu_gen
+        )
+        self._rand_buffer = rand_tensor.tolist()  # Single GPU->CPU sync
+        self._rand_idx = 0
+
+    def _rand(self) -> float:
+        """Get next random float [0, 1) from batched buffer."""
+        if self._rand_idx >= len(self._rand_buffer):
+            self._refill_rand_buffer()
+        val = self._rand_buffer[self._rand_idx]
+        self._rand_idx += 1
+        return val
+
+    def _randint(self, low: int, high: int) -> int:
+        """Get random int in [low, high] using batched GPU random."""
+        if high <= low:
+            return low
+        return int(self._rand() * (high - low + 1)) + low
 
     def _generate_background(self, width: int, height: int) -> torch.Tensor:
         """Generate background texture based on render_config.background_mode.
@@ -633,16 +663,15 @@ class SpriteAtlasIterator:
             bg = bg.unsqueeze(0).expand(3, -1, -1).contiguous()
 
         elif mode == "gradient":
-            # Random gradient - all GPU ops
-            angle = torch.rand(1, device=self.device).item() * 6.28318  # 2*pi
+            # Random gradient - all GPU ops, no .item() sync
+            angle = torch.rand(1, device=self.device) * 6.28318  # 2*pi
             c1 = torch.rand(3, device=self.device)
             c2 = torch.rand(3, device=self.device)
             y = torch.linspace(0, 1, height, device=self.device)
             x = torch.linspace(0, 1, width, device=self.device)
             yy, xx = torch.meshgrid(y, x, indexing='ij')
-            # Use torch ops for trig
-            t = (torch.cos(torch.tensor(angle, device=self.device)) * xx +
-                 torch.sin(torch.tensor(angle, device=self.device)) * yy).clamp(0, 1)
+            # Trig ops directly on GPU tensor (angle stays on GPU)
+            t = (torch.cos(angle) * xx + torch.sin(angle) * yy).clamp(0, 1)
             bg = c1.view(3, 1, 1) * (1 - t) + c2.view(3, 1, 1) * t
 
         else:  # "noise" - default
@@ -677,8 +706,8 @@ class SpriteAtlasIterator:
                 crop_h = min(render_h, target_h)
                 crop_w = min(render_w, target_w)
                 if self.render_config.jitter:
-                    y0 = self._rng.randint(0, render_h - crop_h) if render_h > crop_h else 0
-                    x0 = self._rng.randint(0, render_w - crop_w) if render_w > crop_w else 0
+                    y0 = self._randint(0, render_h - crop_h) if render_h > crop_h else 0
+                    x0 = self._randint(0, render_w - crop_w) if render_w > crop_w else 0
                 else:
                     y0, x0 = 0, 0
                 sprite_rgba = sprite_rgba[:, y0:y0+crop_h, x0:x0+crop_w]
@@ -686,8 +715,8 @@ class SpriteAtlasIterator:
 
             # Calculate placement position
             if self.render_config.jitter:
-                place_y = self._rng.randint(0, max(0, target_h - render_h))
-                place_x = self._rng.randint(0, max(0, target_w - render_w))
+                place_y = self._randint(0, max(0, target_h - render_h))
+                place_x = self._randint(0, max(0, target_w - render_w))
             else:
                 place_y = (target_h - render_h) // 2
                 place_x = (target_w - render_w) // 2
@@ -704,8 +733,8 @@ class SpriteAtlasIterator:
                 if render_h < native or render_w < native:
                     # Crop from sprite
                     if self.render_config.jitter:
-                        y0 = self._rng.randint(0, native - render_h) if native > render_h else 0
-                        x0 = self._rng.randint(0, native - render_w) if native > render_w else 0
+                        y0 = self._randint(0, native - render_h) if native > render_h else 0
+                        x0 = self._randint(0, native - render_w) if native > render_w else 0
                     else:
                         y0, x0 = (native - render_h) // 2, (native - render_w) // 2
                     sprite_rgba = sprite_rgba[:, y0:y0+render_h, x0:x0+render_w]
@@ -721,8 +750,8 @@ class SpriteAtlasIterator:
 
             # Calculate placement
             if self.render_config.jitter:
-                place_y = self._rng.randint(0, max(0, target_h - render_h))
-                place_x = self._rng.randint(0, max(0, target_w - render_w))
+                place_y = self._randint(0, max(0, target_h - render_h))
+                place_x = self._randint(0, max(0, target_w - render_w))
             else:
                 place_y = (target_h - render_h) // 2
                 place_x = (target_w - render_w) // 2

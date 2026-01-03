@@ -128,9 +128,9 @@ class SpanEmbedder:
             # Build mask using the encoder mask infrastructure
             self._mask_cache[grid_shape] = build_encoder_mask(
                 grid_shape=grid_shape,
-                window_size=self.attn_config.get('window_size', 4.0),
-                n_registers=self.attn_config.get('n_global_tokens', 0),
-                mode=self.attn_config.get('mode', 'full'),
+                window_size=self.attn_config['window_size'],
+                n_registers=self.attn_config['n_global_tokens'],
+                mode=self.attn_config['mode'],
                 device=device
             )
         return self._mask_cache[grid_shape]
@@ -334,9 +334,9 @@ class SpanUnembedder:
         if grid_shape not in self._mask_cache:
             self._mask_cache[grid_shape] = build_encoder_mask(
                 grid_shape=grid_shape,
-                window_size=self.attn_config.get('window_size', 4.0),
-                n_registers=self.attn_config.get('n_global_tokens', 0),
-                mode=self.attn_config.get('mode', 'full'),
+                window_size=self.attn_config['window_size'],
+                n_registers=self.attn_config['n_global_tokens'],
+                mode=self.attn_config['mode'],
                 device=device
             )
         return self._mask_cache[grid_shape]
@@ -597,6 +597,127 @@ def render_topology_embeddings(
     return topo_embeds, flat_doc_ids
 
 
+def render_latent_topology_embeddings(
+    n_patches: int,
+    n_levels: int,
+    grid_shape: Tuple[int, int],
+    device: torch.device,
+    highway_offset: int = 0,
+    level_scale: float = 1.0,
+    dtype: torch.dtype = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Renders topology coordinates for latent diffusion with multi-level codes.
+
+    Creates 4D topology: [highway, spatial_x, spatial_y, level] where:
+    - highway: monotonic position across all (patch, level) tokens
+    - spatial_x, spatial_y: grid coordinates (same across levels for same patch)
+    - level: residual quantization level (scaled by level_scale)
+
+    Token ordering: patches are grouped by level (all patches at level 0, then level 1, etc.)
+    This matches the natural output of hierarchical AE encoding.
+
+    Args:
+        n_patches: Number of spatial patches per level (H * W)
+        n_levels: Number of residual quantization levels
+        grid_shape: (H, W) spatial grid dimensions
+        device: Target device
+        highway_offset: Starting highway position
+        level_scale: Scaling factor for level coordinates in RoPE
+        dtype: Output dtype (default float32)
+
+    Returns:
+        topo_embeds: [n_patches * n_levels, 4] topology coordinates
+        level_ids: [n_patches * n_levels] level index per token
+        patch_ids: [n_patches * n_levels] patch index per token
+    """
+    if dtype is None:
+        dtype = torch.float32
+
+    H, W = grid_shape
+    total_tokens = n_patches * n_levels
+
+    # Build spatial grid coordinates (shared across levels)
+    grid_y = torch.arange(H, device=device, dtype=dtype)
+    grid_x = torch.arange(W, device=device, dtype=dtype)
+    mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
+    spatial_coords = torch.stack([mesh_x.flatten(), mesh_y.flatten()], dim=-1)  # [n_patches, 2]
+
+    # Build per-token coordinates
+    highway = torch.arange(highway_offset, highway_offset + total_tokens, device=device, dtype=dtype)
+
+    # Tile spatial coords for each level
+    spatial_tiled = spatial_coords.repeat(n_levels, 1)  # [n_patches * n_levels, 2]
+
+    # Level coordinates: [0, 0, ..., 1, 1, ..., 2, 2, ...] each repeated n_patches times
+    level_coords = torch.arange(n_levels, device=device, dtype=dtype).repeat_interleave(n_patches)
+    level_coords = level_coords * level_scale
+
+    # Concatenate: [highway, spatial_x, spatial_y, level]
+    topo_embeds = torch.cat([
+        highway.unsqueeze(-1),
+        spatial_tiled,
+        level_coords.unsqueeze(-1)
+    ], dim=-1)  # [total_tokens, 4]
+
+    # Auxiliary indices for reconstruction
+    level_ids = torch.arange(n_levels, device=device).repeat_interleave(n_patches)
+    patch_ids = torch.arange(n_patches, device=device).repeat(n_levels)
+
+    return topo_embeds, level_ids, patch_ids
+
+
+def compute_latent_distance_squared(
+    q_spatial: Tuple[torch.Tensor, ...],
+    k_spatial: Tuple[torch.Tensor, ...],
+    q_level: torch.Tensor,
+    k_level: torch.Tensor,
+    q_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    level_lambda: float = 0.5,
+    vertical_free: bool = True
+) -> torch.Tensor:
+    """
+    Compute distance² for latent diffusion with level-aware metric.
+
+    dist² = spatial_dist² + (level_lambda * level_dist)²
+
+    With vertical_free=True, same-position cross-level attention has dist²=0
+    (creates "vertical tubes" through the level stack).
+
+    Args:
+        q_spatial: Tuple of spatial coordinate tensors for queries
+        k_spatial: Tuple of spatial coordinate tensors for keys
+        q_level: Level coordinates for queries
+        k_level: Level coordinates for keys
+        q_idx: Query indices
+        kv_idx: Key indices
+        level_lambda: Scaling for level distance
+        vertical_free: If True, same-position cross-level has zero distance
+
+    Returns:
+        dist_sq: Distance squared tensor
+    """
+    # Spatial distance
+    spatial_dist_sq = 0.0
+    for q_col, k_col in zip(q_spatial, k_spatial):
+        d = q_col[q_idx] - k_col[kv_idx]
+        spatial_dist_sq = spatial_dist_sq + (d * d)
+
+    # Level distance (scaled)
+    level_d = q_level[q_idx] - k_level[kv_idx]
+    level_dist_sq = (level_lambda * level_d) ** 2
+
+    if vertical_free:
+        # Same spatial position across levels = zero distance (vertical tube)
+        same_position = (spatial_dist_sq == 0.0)
+        # Return spatial distance only for same-position (which is 0),
+        # otherwise return full distance
+        return torch.where(same_position, spatial_dist_sq, spatial_dist_sq + level_dist_sq)
+    else:
+        return spatial_dist_sq + level_dist_sq
+
+
 # =========================================================
 # 5. CONNECTIVITY (Mask Construction)
 # =========================================================
@@ -797,6 +918,133 @@ def materialize_mask_for_analysis(spans: List[Span], topo_active: torch.Tensor) 
     return mod(0, 0, q, k)
 
 
+def build_latent_diffusion_mask(
+    n_patches: int,
+    n_levels: int,
+    grid_shape: Tuple[int, int],
+    window_size: float = 4.0,
+    level_lambda: float = 0.5,
+    vertical_free: bool = True,
+    mode: str = 'local',
+    device: torch.device = None,
+    dtype: torch.dtype = None
+) -> Optional[BlockMask]:
+    """
+    Build attention mask for latent diffusion over multi-level AE codes.
+
+    Creates masks for the flattened [n_patches * n_levels] token sequence where
+    each token represents one (patch_position, residual_level) tuple.
+
+    Distance metric: dist² = spatial_dist² + (level_lambda * level_dist)²
+    With vertical_free=True, same-position tokens across levels have zero distance.
+
+    Args:
+        n_patches: Number of spatial patches per level
+        n_levels: Number of residual quantization levels
+        grid_shape: (H, W) spatial grid dimensions
+        window_size: Spatial distance threshold for local attention
+        level_lambda: Scaling factor for level distance in metric
+        vertical_free: If True, same-position cross-level attention is always allowed
+        mode: 'full', 'local', or 'bidirectional'
+        device: Target device
+        dtype: Coordinate dtype
+
+    Returns:
+        BlockMask for flex_attention, or None for full attention
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if dtype is None:
+        dtype = torch.float32
+
+    if mode == 'full':
+        return None
+
+    H, W = grid_shape
+    total_tokens = n_patches * n_levels
+
+    # Build coordinate tensors (must be tensors for torch.compile compatibility)
+    # Spatial coordinates: tiled for each level
+    grid_y = torch.arange(H, device=device, dtype=dtype)
+    grid_x = torch.arange(W, device=device, dtype=dtype)
+    mesh_y, mesh_x = torch.meshgrid(grid_y, grid_x, indexing='ij')
+    spatial_x = mesh_x.flatten().repeat(n_levels)  # [total_tokens]
+    spatial_y = mesh_y.flatten().repeat(n_levels)  # [total_tokens]
+
+    # Level coordinates: [0, 0, ..., 1, 1, ..., n_levels-1, ...]
+    level_coords = torch.arange(n_levels, device=device, dtype=dtype).repeat_interleave(n_patches)
+
+    # Convert scalars to tensors for closure capture
+    win_sq = torch.tensor(window_size * window_size, device=device, dtype=dtype)
+    level_lam = torch.tensor(level_lambda, device=device, dtype=dtype)
+    vert_free = vertical_free  # Python bool is fine for branch
+
+    def mask_mod_latent(b, h, q_idx, kv_idx):
+        # Spatial distance squared
+        dx = spatial_x[q_idx] - spatial_x[kv_idx]
+        dy = spatial_y[q_idx] - spatial_y[kv_idx]
+        spatial_dist_sq = dx * dx + dy * dy
+
+        # Level distance (scaled)
+        dl = level_coords[q_idx] - level_coords[kv_idx]
+        level_dist_sq = (level_lam * dl) ** 2
+
+        if vert_free:
+            # Vertical tube: same spatial position = zero effective distance
+            same_position = (spatial_dist_sq == 0.0)
+            effective_dist_sq = torch.where(same_position, spatial_dist_sq, spatial_dist_sq + level_dist_sq)
+        else:
+            effective_dist_sq = spatial_dist_sq + level_dist_sq
+
+        return effective_dist_sq < win_sq
+
+    return create_block_mask(
+        mask_mod_latent, B=None, H=None, Q_LEN=total_tokens, KV_LEN=total_tokens
+    )
+
+
+# Cache for latent diffusion masks (keyed by geometry parameters)
+_latent_mask_cache: Dict[Tuple, Optional[BlockMask]] = {}
+
+
+def get_cached_latent_mask(
+    n_patches: int,
+    n_levels: int,
+    grid_shape: Tuple[int, int],
+    window_size: float,
+    level_lambda: float,
+    vertical_free: bool,
+    mode: str,
+    device: torch.device
+) -> Optional[BlockMask]:
+    """
+    Get or build cached latent diffusion mask.
+
+    Caching is critical for training efficiency - mask construction is expensive
+    and should happen once per unique geometry configuration.
+    """
+    key = (n_patches, n_levels, grid_shape, window_size, level_lambda, vertical_free, mode, str(device))
+
+    if key not in _latent_mask_cache:
+        _latent_mask_cache[key] = build_latent_diffusion_mask(
+            n_patches=n_patches,
+            n_levels=n_levels,
+            grid_shape=grid_shape,
+            window_size=window_size,
+            level_lambda=level_lambda,
+            vertical_free=vertical_free,
+            mode=mode,
+            device=device
+        )
+
+    return _latent_mask_cache[key]
+
+
+def clear_latent_mask_cache():
+    """Clear the latent diffusion mask cache."""
+    _latent_mask_cache.clear()
+
+
 # =========================================================
 # 6. ENCODER MASKS (Bidirectional for Image Encoders/Decoders)
 # =========================================================
@@ -939,11 +1187,11 @@ def get_encoder_mask_for_layer(
     Returns:
         BlockMask or None for this layer
     """
-    mode = attn_config.get('mode', 'full')
-    window_size = attn_config.get('window_size', 4.0)
-    n_registers = attn_config.get('n_global_tokens', 0)
-    global_interval = attn_config.get('global_layer_interval', 4)
-    bigbird_layout = tuple(attn_config.get('bigbird_layout', [2, 2]))
+    mode = attn_config['mode']
+    window_size = attn_config['window_size']
+    n_registers = attn_config['n_global_tokens']
+    global_interval = attn_config['global_layer_interval']
+    bigbird_layout = tuple(attn_config['bigbird_layout'])
 
     # Determine layer-specific mode
     if mode == 'full':

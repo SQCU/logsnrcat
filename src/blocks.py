@@ -355,7 +355,7 @@ class TransformerEncoder(nn.Module):
         self.mode = attn_config['mode']
         n_heads = attn_config['n_query_heads']
         n_kv_heads = attn_config['n_kv_heads']
-        self.n_global_tokens = attn_config.get('n_global_tokens', 4)
+        self.n_global_tokens = attn_config['n_global_tokens']
 
         # Learnable register tokens for bigbird modes
         self.uses_registers = _uses_registers(self.mode)
@@ -446,7 +446,7 @@ class TransformerDecoder(nn.Module):
         self.mode = attn_config['mode']
         n_heads = attn_config['n_query_heads']
         n_kv_heads = attn_config['n_kv_heads']
-        self.n_global_tokens = attn_config.get('n_global_tokens', 4)
+        self.n_global_tokens = attn_config['n_global_tokens']
 
         # Learnable register tokens for bigbird modes
         self.uses_registers = _uses_registers(self.mode)

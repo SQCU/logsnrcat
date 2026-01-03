@@ -116,13 +116,69 @@ class DatasetSplit(BaseModel):
 # Training Components
 # =============================================================================
 
+class MuonConfig(BaseModel):
+    """Muon optimizer config for transformer layers."""
+    lr: float = 0.02
+    momentum: float = 0.95
+    nesterov: bool = True
+    ns_steps: int = 5
+    state_dtype: str = "bf16"  # "fp32" or "bf16" - bf16 is safe (no v accumulator)
+
+
+class AdamWConfig(BaseModel):
+    """AdamW optimizer config for embedding/norm layers."""
+    lr: float = 3e-4
+    weight_decay: float = 0.1
+    betas: Tuple[float, float] = (0.9, 0.95)
+
+
+class SchedulerConfig(BaseModel):
+    """Learning rate scheduler config."""
+    type: str = "onecycle"  # "onecycle", "cosine", "none"
+    pct_start: float = 0.1
+    div_factor: float = 10.0
+    final_div_factor: float = 25.0
+    min_lr: float = 0.0  # For cosine
+
+
 class OptimizerConfig(BaseModel):
+    """Optimizer configuration - supports both simple AdamW and heterogeneous Muon+AdamW.
+
+    For simple AdamW (backwards compatible):
+        type = "adamw" (default)
+        lr, weight_decay, etc. at top level
+
+    For heterogeneous Muon+AdamW:
+        type = "heterogeneous"
+        muon = {...} for transformer layers
+        adamw = {...} for embedding/norm layers
+        scheduler = {...} for all groups
+    """
+    # Common fields (backwards compatible with simple AdamW)
+    type: str = "adamw"  # "adamw" or "heterogeneous"
     lr: float = 5e-4
     weight_decay: float = 0.1
     max_lr: float = 5e-4
     pct_start: float = 0.1
     div_factor: float = 10.0
     final_div_factor: float = 100.0
+    betas: Tuple[float, float] = (0.9, 0.95)
+
+    # Heterogeneous optimizer sub-configs
+    muon: Optional[MuonConfig] = None
+    adamw: Optional[AdamWConfig] = None
+    scheduler: Optional[SchedulerConfig] = None
+    targeting: Optional["ParameterTargetingConfig"] = None  # Forward ref, resolved below
+
+    @model_validator(mode="after")
+    def validate_heterogeneous_requires_subconfigs(self):
+        """Ensure muon and adamw subconfigs are present when type == 'heterogeneous'."""
+        if self.type == "heterogeneous":
+            if self.muon is None:
+                raise ValueError("type='heterogeneous' requires [training.optimizer.muon] config")
+            if self.adamw is None:
+                raise ValueError("type='heterogeneous' requires [training.optimizer.adamw] config")
+        return self
 
 
 class AEOptimizerConfig(BaseModel):
@@ -130,6 +186,37 @@ class AEOptimizerConfig(BaseModel):
     weight_decay: float = 0.01
     max_lr: float = 1e-3
     pct_start: float = 0.1
+
+
+class ParameterTargetingConfig(BaseModel):
+    """Configuration for parameter classification in heterogeneous optimizer.
+
+    Controls which parameters go to Muon vs AdamW based on name patterns.
+    Patterns are matched case-insensitively against parameter names.
+
+    Priority order: embedding > norm > ae > fsq_adjacent > transformer (Muon)
+    """
+    # Patterns for embedding/unembedding layers -> AdamW
+    embedding_patterns: List[str] = Field(
+        default_factory=lambda: ['embed', 'head', 'lm_head', 'wte', 'wpe', 'embedder', 'unembedder']
+    )
+    # Patterns for norm layers -> AdamW (no weight decay)
+    norm_patterns: List[str] = Field(
+        default_factory=lambda: ['norm', 'ln', 'layernorm', 'rmsnorm']
+    )
+    # Patterns for AE components -> AdamW (heterogeneous gradients from FSQ/sparsity)
+    ae_patterns: List[str] = Field(
+        default_factory=lambda: ['sparse_ae', 'encoders', 'decoders', 'level_logsnr']
+    )
+    # Patterns for FSQ-adjacent params -> AdamW (sigmoid STE attenuates gradients)
+    fsq_patterns: List[str] = Field(
+        default_factory=lambda: ['code_proj', 'code_unproj', 'fsq', 'sparsity', 'dim_logits', 'level_values', 'attn_gate', 'logsnr']
+    )
+
+
+# Resolve forward reference in OptimizerConfig for ParameterTargetingConfig
+OptimizerConfig.model_rebuild()
+
 
 class ResolutionBucketConfig(BaseModel):
     resolution: int
@@ -172,6 +259,42 @@ class AEAttentionConfig(BaseModel):
     random_min_p: float = 0.02    # Random attention: at least this % of seq_len (whichever is larger)
 
 
+class TopologyGeometryConfig(BaseModel):
+    """Configuration for topology coordinate computation and distance metrics.
+
+    Controls how tokens are positioned in the R^n topology space that RnRoPE
+    and SWA masks use for distance computations. Different geometries enable
+    different diffusion modes (pixel-space vs latent-space) via config alone.
+
+    The topology has dimensions: [highway, spatial_1, spatial_2, ..., level?]
+    - highway: monotonic context position (always present)
+    - spatial_*: grid coordinates for images, origin for text
+    - level: residual quantization level (only for latent diffusion)
+    """
+    # Diffusion space: "pixel" = patch embeddings, "latent" = AE code embeddings
+    diffusion_space: Literal["pixel", "latent"] = "pixel"
+
+    # Whether to include level as a topology dimension (auto-enabled for latent)
+    include_level_dim: bool = False
+
+    # Distance metric for level dimension in SWA masks
+    # dist² = spatial_dist² + (level_lambda * level_dist)²
+    level_lambda: float = 0.5  # Cost of crossing levels relative to spatial
+
+    # Level coordinate scaling (maps level index to coordinate value)
+    # Larger values = more separation between levels in RoPE frequencies
+    level_scale: float = 1.0
+
+    # Whether same-position cross-level attention is always allowed (ignores SWA window)
+    # Creates "vertical tubes" through the level stack
+    vertical_attention_free: bool = True
+
+    # Optional: custom distance metric for advanced use cases
+    # "euclidean" = standard sqrt(sum of squares)
+    # "product_geodesic" = treats level crossings as graph edges
+    distance_metric: Literal["euclidean", "product_geodesic"] = "euclidean"
+
+
 class SparseAEConfig(BaseModel):
     """Configuration for kmaze_ae sparse hierarchical autoencoder."""
     enabled: bool = False
@@ -183,10 +306,18 @@ class SparseAEConfig(BaseModel):
     k_per_patch: int = 4  # Sparsity control: keep k of code_dim dims
     residual_scale: float = 2.0
     fourier_dim: int = 16
-    ae_loss_weight: float = 0.1
-    logsnr_loss_weight: float = 0.1
+    ae_loss_weight: float = 0.1  # Weight for AE loss in joint training
+    # Loss function type for AE training
+    # cumulative_mse: average MSE across all level reconstructions (reference impl)
+    # final_mse: MSE only on final reconstruction
+    # cumulative_mse_contrib: MSE + penalty for levels that contribute too little
+    loss_type: Literal["cumulative_mse", "final_mse", "cumulative_mse_contrib"] = "cumulative_mse"
     n_layers: int = 4  # Transformer layers per encoder/decoder
     attention: AEAttentionConfig = Field(default_factory=AEAttentionConfig)
+    # Latent diffusion training mode (uses [training].steps for step count)
+    latent_diffusion: bool = False
+    # Topology geometry for latent diffusion (controls R^n embedding + distance metrics)
+    topology: TopologyGeometryConfig = Field(default_factory=TopologyGeometryConfig)
 
 
 class GraphCaptureConfig(BaseModel):
@@ -199,6 +330,19 @@ class GraphCaptureConfig(BaseModel):
     warmup_steps: int = 3  # Number of warmup iterations before capture (minimum 3)
     capture_after_warmup: bool = True  # Auto-capture after warmup completes
     use_dedicated_stream: bool = True  # Use separate CUDA stream for capture
+
+
+class PrecisionConfig(BaseModel):
+    """Mixed precision configuration for FP8 weight storage.
+
+    FP8 stores transformer weights in 8-bit (half memory), computes in bf16.
+    Embeddings and norms stay in bf16 for numerical stability.
+    """
+    weights: str = "bf16"  # "fp8" for 8-bit weights, "bf16" for default
+    activations: str = "bf16"  # activations always bf16 for now
+    skip_patterns: List[str] = Field(
+        default_factory=lambda: ["embed", "head", "norm", "embedder", "unembedder"]
+    )
 
 
 class FractalParams(BaseModel):
@@ -223,9 +367,10 @@ class TrainingConfig(BaseModel):
     optimizer: OptimizerConfig = Field(default_factory=OptimizerConfig)
     ae_optimizer: AEOptimizerConfig = Field(default_factory=AEOptimizerConfig)
 
-    # NEW: Register Bucketing Config
+    # Bucketing Config
     bucketing: BucketingConfig = Field(default_factory=BucketingConfig)
-    precision: str = "fp32"  # <--- ENABLE THIS # Options: "fp32", "bf16", "fp16"
+    precision: str = "fp32"  # Options: "fp32", "bf16", "fp16"
+    precision_config: PrecisionConfig = Field(default_factory=PrecisionConfig)  # FP8 weight config
     online_variance_correction: OnlineVarianceCorrectionConfig = Field(default_factory=OnlineVarianceCorrectionConfig)
     sparse_ae: SparseAEConfig = Field(default_factory=SparseAEConfig)
     graph_capture: GraphCaptureConfig = Field(default_factory=GraphCaptureConfig)

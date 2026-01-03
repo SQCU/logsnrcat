@@ -4,7 +4,7 @@
 
 [model]
 dim = 512
-depth = 8
+depth = 4
 num_heads = 8
 topo_dim = 3
 mlp_depth = 1
@@ -30,18 +30,29 @@ enabled = true
 n_kv_heads = 2         # 8 query heads / 2 kv heads = 4x sharing
 
 [training]
-ae_steps = 2000
+ae_steps = 500
 steps = 0
 lambda_coeff = 0.2
 mode = "naive"
-batch_size = 8
+batch_size = 4
 compile = true
 compile_dynamic = true
 schedule_bounds = [5.0, -4.0]
 precision = "bf16"
 
+# FP8 weight quantization (requires PyTorch 2.1+, best on Hopper/Ada)
+# Set weights = "fp8" to enable fp8 storage with bf16 compute
+[training.precision_config]
+weights = "bf16"         # "bf16" for default - FP8 disabled for debugging
+activations = "bf16"      # activations always bf16 for now
+skip_patterns = ["embed", "head", "norm", "embedder", "unembedder"]  # keep these in bf16
+
+# CUDA Graph capture - mutually exclusive with torch.compile for main model
+# When enabled, main model forward is captured as a CUDA graph (faster replay)
+# torch.compile is automatically skipped for the main model (flex_attention mask conflict)
+# Sparse AE transformers are still compiled separately (they don't use GraphRunner)
 [training.graph_capture]
-enabled = true
+enabled = false
 warmup_steps = 20
 capture_after_warmup = true
 use_dedicated_stream = true
@@ -49,17 +60,19 @@ use_dedicated_stream = true
 # Sparse AE Configuration - SWIGLU VARIANT
 [training.sparse_ae]
 enabled = true
-ae_type = "swiglu"     # <<< Changed: binary FSQ, level-global sparsity, 2D RoPE
+latent_diffusion = false  # LatentDenoiser rejected - use main LDTformer for diffusion
+ae_type = "swiglu"     # <<< Changed: binary FSQ, per-patch sparsity, 2D RoPE
 n_levels = 6
 patch_size = 16
 hidden_dim = 256
 code_dim = 128
-k_per_patch = 4        # For swiglu: level-global active dims
+k_per_patch = 4        # Each patch selects its own top-4 dims (~97% sparsity)
 residual_scale = 2.0
 fourier_dim = 16
-ae_loss_weight = 0.1
-logsnr_loss_weight = 0.1
+ae_loss_weight = 0.1   # Weight for AE loss in joint training (not used in standalone AE warmup)
 n_layers = 4
+# Loss function: cumulative_mse (reference impl), final_mse, or cumulative_mse_contrib
+loss_type = "final_mse"  # Reference uses final only, cumulative dilutes gradients by 1/n_levels
 
 # Attention configuration - sliding window for 3x3 neighborhood
 [training.sparse_ae.attention]
@@ -68,6 +81,17 @@ window_size = 2        # <<< Changed: Euclidean dist² ≤ 4 covers 3x3
 n_global_tokens = 0    # <<< No registers for pure sliding window
 n_query_heads = 8
 n_kv_heads = 2
+
+# Topology geometry for latent diffusion (R^n embedding + distance metrics)
+# Controls how AE codes are positioned in topology space for RnRoPE and SWA
+# Set diffusion_space = "latent" to enable latent-space diffusion with main LDTformer
+[training.sparse_ae.topology]
+diffusion_space = "pixel"        # "pixel" = patch embeddings, "latent" = AE codes
+include_level_dim = false        # Auto-enabled when diffusion_space = "latent"
+level_lambda = 0.5               # Cost of crossing levels: dist² += (lambda * level_dist)²
+level_scale = 1.0                # Scaling for level coords in RoPE frequencies
+vertical_attention_free = true   # Same-position cross-level attention always allowed
+distance_metric = "euclidean"    # "euclidean" or "product_geodesic"
 
 [training.online_variance_correction]
 enabled = true
@@ -80,7 +104,7 @@ warmup_steps = 100
 [training.bucketing]
 enabled = true
 base_resolution = 64
-base_batch_size = 32
+base_batch_size = 16
 caching_resolution = 128
 
 [[training.bucketing.image_buckets]]
@@ -95,14 +119,51 @@ weight = 1.0
 resolution = 256
 weight = 0.5
 
+# Heterogeneous optimizer: Muon for transformer, AdamW for embeddings/norms
 [training.optimizer]
-lr = 5e-4
+type = "adamw"  # "adamw" for single optimizer, "heterogeneous" for Muon+AdamW
+
+# Muon optimizer for transformer layers (momentum-orthogonalized updates)
+# Safe to use bf16 state because Muon has no v accumulator (unlike AdamW)
+[training.optimizer.muon]
+lr = 3e-4
+momentum = 0.95
+nesterov = true
+ns_steps = 5
+state_dtype = "bf16"  # bf16 for momentum buffer (no v term = numerically stable)
+
+# AdamW for embedding/unembedding and norm layers
+# Must use fp32 state - the v accumulator (EMA of squared grads) produces
+# extreme value ranges, and m/sqrt(v) is numerically unstable in lower precision
+[training.optimizer.adamw]
+lr = 3e-4
 weight_decay = 0.1
-max_lr = 5e-4
+betas = [0.9, 0.95]
+# state_dtype = fp32 (always, PyTorch enforces this)
+
+# Scheduler (applied to all optimizer groups)
+[training.optimizer.scheduler]
+type = "onecycle"
 pct_start = 0.1
 div_factor = 10.0
 final_div_factor = 25.0
 
+# Parameter targeting for heterogeneous optimizer
+# Controls which params go to Muon (transformer) vs AdamW (everything else)
+# Priority: embedding > norm > ae > fsq_adjacent > transformer (Muon)
+[training.optimizer.targeting]
+# Embedding layers -> AdamW
+embedding_patterns = ["embed", "head", "lm_head", "wte", "wpe", "embedder", "unembedder"]
+# Norm layers -> AdamW (no weight decay)
+norm_patterns = ["norm", "ln", "layernorm", "rmsnorm"]
+# AE components -> AdamW (heterogeneous gradients from FSQ/sparsity)
+ae_patterns = ["sparse_ae", "encoders", "decoders", "level_logsnr"]
+# FSQ-adjacent -> AdamW (sigmoid STE attenuates gradients)
+fsq_patterns = ["code_proj", "code_unproj", "fsq", "sparsity", "dim_logits", "level_values", "attn_gate", "logsnr"]
+# Everything else (denoiser.layers + AE transformers) -> Muon
+
+# AE standalone optimizer (simple AdamW, no Muon)
+# Used during AE warmup phase - FSQ gradients are too heterogeneous for Muon
 [training.ae_optimizer]
 lr = 3e-4
 weight_decay = 0.1
@@ -119,15 +180,18 @@ sweep_count = 4
 sweep_length = 4
 sweep_range = [5.0, 1.0]
 
+# Page table sized for actual workload:
+# base_cost = (64/4)² × 16 = 4096 tokens/batch
+# blocks_needed = 4096/128 = 32, minimal headroom to fit in 24GB
 [page_table]
-num_blocks = 1024
+num_blocks = 36
 block_size = 128
-max_batch_size = 128
-max_logical_blocks = 1024
+max_batch_size = 16
+max_logical_blocks = 32
 
 [logging]
 output_dir = "./experiments_swiglu_ae"  # <<< Changed
-log_interval = 50
+log_interval = 1
 sample_after_training = true
 
 # Dataset mix - Fractal-heavy for AE warmup (same as sparse_ae_fractal)
@@ -141,6 +205,7 @@ fractal_types = ["mandelbrot", "julia", "burning_ship"]
 color_palette = "random"
 text_position = "none"
 resolution = 256
+max_iterations = 256
 [dataset_mix.fractal_main.noise_params]
 min_snr = -4.0
 max_snr = 5.0
@@ -155,6 +220,7 @@ fractal_types = ["julia", "tricorn"]
 color_palette = "fire"
 text_position = "none"
 resolution = 256
+max_iterations = 256
 [dataset_mix.fractal_split.noise_params]
 min_snr = -5.0
 max_snr = 5.0

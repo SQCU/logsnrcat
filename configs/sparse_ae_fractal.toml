@@ -99,10 +99,23 @@ weight = 1.0
 resolution = 256
 weight = 0.5
 
+# Heterogeneous optimizer: Muon for transformer, AdamW for embeddings/norms
 [training.optimizer]
-lr = 5e-4
+type = "heterogeneous"
+
+[training.optimizer.muon]
+lr = 0.02
+momentum = 0.95
+nesterov = true
+ns_steps = 5
+
+[training.optimizer.adamw]
+lr = 3e-4
 weight_decay = 0.1
-max_lr = 5e-4
+betas = [0.9, 0.95]
+
+[training.optimizer.scheduler]
+type = "onecycle"
 pct_start = 0.1
 div_factor = 10.0
 final_div_factor = 25.0
@@ -123,11 +136,14 @@ sweep_count = 4
 sweep_length = 4
 sweep_range = [5.0, 1.0]
 
+# Page table sized for actual workload:
+# base_cost = (64/4)² × 32 = 8192 tokens/batch
+# blocks_needed = 8192/128 = 64, use 128 with 2x headroom
 [page_table]
-num_blocks = 1024
+num_blocks = 128
 block_size = 128
-max_batch_size = 128
-max_logical_blocks = 1024
+max_batch_size = 32
+max_logical_blocks = 128
 
 [logging]
 output_dir = "./experiments_sparse_ae"
@@ -145,6 +161,7 @@ fractal_types = ["mandelbrot", "julia", "burning_ship"]
 color_palette = "random"
 text_position = "none"
 resolution = 256
+max_iterations = 256
 [dataset_mix.fractal_main.noise_params]
 min_snr = -4.0
 max_snr = 5.0
@@ -159,6 +176,7 @@ fractal_types = ["julia", "tricorn"]
 color_palette = "fire"
 text_position = "none"
 resolution = 256
+max_iterations = 256
 [dataset_mix.fractal_split.noise_params]
 min_snr = -5.0
 max_snr = 5.0

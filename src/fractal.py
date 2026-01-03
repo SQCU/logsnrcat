@@ -575,12 +575,12 @@ def generate_fractal_query(seed: int, config: dict) -> dict:
     import random
     rng = random.Random(seed)
 
-    fractal_types = config.get('fractal_types', ['mandelbrot', 'julia'])
+    fractal_types = config['fractal_types']
     fractal_type = rng.choice(fractal_types)
 
     # Base parameters common to all types
     zoom = round(rng.uniform(0.5, 4.0), 3)
-    max_iter = config.get('max_iterations', 128)
+    max_iter = config['max_iterations']
 
     # Colormap parameters
     hue_offset = round(rng.uniform(0.0, 1.0), 3)
@@ -806,7 +806,7 @@ class FractalIterator:
         self.device = device
         self.config = config
         self.seed = config['seed']
-        self.resolution_override = config.get('resolution', None)
+        self.resolution_override = config['resolution']  # None if not specified in config
         self.text_pos = config['text_position']
         self.ContextBlock = ContextBlock
         self.serialize_query = serialize_query

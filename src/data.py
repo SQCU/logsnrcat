@@ -446,9 +446,9 @@ class VideoFolderIterator:
         return False
 
     def _sample_indices(self, total_frames, seq_len, sampler_config):
-        min_pct = sampler_config.get('min_pct', 0.0)
-        max_pct = sampler_config.get('max_pct', 1.0)
-        stride = sampler_config.get('stride', None)
+        min_pct = sampler_config['min_pct']
+        max_pct = sampler_config['max_pct']
+        stride = sampler_config['stride']
         
         if total_frames <= seq_len: return [i % total_frames for i in range(seq_len)]
         start_min = int(total_frames * min_pct)
@@ -485,7 +485,7 @@ class VideoFolderIterator:
 
             # We use the current config mainly for the Time Sampler settings
             seq_config = self.current_seq_config
-            sampler = seq_config[0].get('time_sampler', {})
+            sampler = seq_config[0]['time_sampler']
             seq_len = len(seq_config)
             
             batch_files = random.choices(self.files, k=self.horizon)
@@ -602,21 +602,21 @@ class VideoFolderIterator:
             
             # 2. Sequence Assembly & Final Resize
             for t, (frame, spec) in enumerate(zip(frames_gpu, sequence_config)):
-                target_res = spec.get('res', 32)
-                
+                target_res = spec['res']
+
                 # Resize if the cached resolution != target resolution
                 if frame.shape[-1] != target_res:
-                    # Note: We use bilinear here as it's faster on GPU and we are likely 
+                    # Note: We use bilinear here as it's faster on GPU and we are likely
                     # going from 128 -> 32 or 64. If going 128 -> 256, bilinear is also fine.
                     frame = F.interpolate(
-                        frame.unsqueeze(0), 
-                        size=(target_res, target_res), 
-                        mode='bilinear', 
+                        frame.unsqueeze(0),
+                        size=(target_res, target_res),
+                        mode='bilinear',
                         align_corners=False
                     ).squeeze(0)
-                
-                n_mode = spec.get('noise_mode', 'uniform')
-                n_params = spec.get('noise_params', {})
+
+                n_mode = spec['noise_mode']
+                n_params = spec['noise_params']
                 lsnr = get_logsnr_batch(n_mode, 1, target_res, target_res, self.device, n_params).squeeze(0)
                 
                 seq_blocks.append(ContextBlock(
@@ -650,41 +650,45 @@ class CompositeIterator:
         self.splits = []
         
         for split_key, cfg in config.items():
-            if isinstance(cfg, (float, int)): 
-                cfg = {'ratio': float(cfg), 'type': split_key, 'params': {}} # Normalize shorthand
-            
-            gen_type = cfg.get('type', split_key)
-            
+            if isinstance(cfg, (float, int)):
+                # Normalize shorthand to full config with all required fields
+                cfg = {
+                    'ratio': float(cfg),
+                    'type': split_key,
+                    'params': {},
+                    'noise_mode': 'uniform',
+                    'noise_params': {}
+                }
+
+            gen_type = cfg['type']
+
             if gen_type not in self._ITERATOR_MAP:
                 print(f"⚠️ Unknown iterator type '{gen_type}', defaulting to Checkerboard.")
                 iterator_cls = CheckerboardIterator
             else:
                 iterator_cls = self._ITERATOR_MAP[gen_type]
-            
-            # STRICT ACCESS: Trust the config schema.
-            # cfg['params'] is guaranteed to be a dict by src/config.py
+
             raw_params = cfg['params']
-            
+
             if gen_type == 'video':
-                 path = raw_params.get('path', None)
-                 # Pass the calculated max resolution to the video iterator
+                 path = raw_params['path']  # Required for video
                  iterator_instance = iterator_cls(
-                     path, 
-                     device=device, 
+                     path,
+                     device=device,
                      target_dtype=target_dtype,
                      caching_resolution=caching_resolution
                  )
-            else: 
+            else:
                  iterator_instance = iterator_cls(device)
-            
+
             self.splits.append({
-                'name': split_key, 
+                'name': split_key,
                 'type': gen_type,
-                'iterator': iterator_instance, 
-                'ratio': cfg.get('ratio', 1.0), 
-                'd_params': raw_params, # Pass the dict directly
-                'n_mode': cfg.get('noise_mode', 'uniform'), 
-                'n_params': cfg.get('noise_params', {}) # This might still need get if not fully sanitized, but params is the critical one
+                'iterator': iterator_instance,
+                'ratio': cfg['ratio'],
+                'd_params': raw_params,
+                'n_mode': cfg['noise_mode'],
+                'n_params': cfg['noise_params']
             })
             
         total = sum(s['ratio'] for s in self.splits)
@@ -716,13 +720,13 @@ class CompositeIterator:
                 seq_conf = d_params['sequence_structure']
                 
                 # Check for resolution overrides (from Bucketing)
-                resolution = kwargs.get('resolution')
+                resolution = kwargs.get('resolution')  # kwargs is external interface, .get() OK
                 if resolution is not None:
                     # Apply Relative Scaling Logic
                     overridden_seq = []
                     for frame_cfg in seq_conf:
                         new_cfg = frame_cfg.copy()
-                        rel = new_cfg.get('relative_res', 1.0)
+                        rel = new_cfg['relative_res']
                         # Abs = Bucket * Relative
                         abs_res = int(resolution * rel)
                         if abs_res % 2 != 0: abs_res += 1

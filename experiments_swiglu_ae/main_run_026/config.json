@@ -1,0 +1,334 @@
+{
+  "model": {
+    "dim": 512,
+    "depth": 4,
+    "num_heads": 8,
+    "topo_dim": 3,
+    "mlp_depth": 1,
+    "vocab_size": 151936,
+    "global_layer_interval": 4,
+    "num_experts": 8,
+    "num_active": 3,
+    "rope_base": 500,
+    "mlp_ratio": 4.0,
+    "jitter_noise": 0.1,
+    "window_size": 10.0,
+    "patch_embedder": {
+      "input_channels": 3,
+      "fourier_dim": 16,
+      "context_size": 6,
+      "stride": 4,
+      "mlp_depth": 2
+    },
+    "gqa": {
+      "enabled": true,
+      "n_kv_heads": 2
+    }
+  },
+  "training": {
+    "ae_steps": 500,
+    "steps": 500,
+    "lambda_coeff": 0.2,
+    "mode": "naive",
+    "batch_size": 4,
+    "compile": true,
+    "compile_dynamic": true,
+    "schedule_bounds": [
+      5.0,
+      -4.0
+    ],
+    "optimizer": {
+      "type": "heterogeneous",
+      "lr": 0.0005,
+      "weight_decay": 0.1,
+      "max_lr": 0.0005,
+      "pct_start": 0.1,
+      "div_factor": 10.0,
+      "final_div_factor": 100.0,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "muon": {
+        "lr": 0.0003,
+        "momentum": 0.95,
+        "nesterov": true,
+        "ns_steps": 5,
+        "state_dtype": "bf16"
+      },
+      "adamw": {
+        "lr": 0.0003,
+        "weight_decay": 0.1,
+        "betas": [
+          0.9,
+          0.95
+        ]
+      },
+      "scheduler": {
+        "type": "onecycle",
+        "pct_start": 0.1,
+        "div_factor": 10.0,
+        "final_div_factor": 25.0,
+        "min_lr": 0.0
+      },
+      "targeting": {
+        "embedding_patterns": [
+          "embed",
+          "head",
+          "lm_head",
+          "wte",
+          "wpe",
+          "embedder",
+          "unembedder"
+        ],
+        "norm_patterns": [
+          "norm",
+          "ln",
+          "layernorm",
+          "rmsnorm"
+        ],
+        "ae_patterns": [
+          "sparse_ae",
+          "encoders",
+          "decoders",
+          "level_logsnr"
+        ],
+        "fsq_patterns": [
+          "code_proj",
+          "code_unproj",
+          "fsq",
+          "sparsity",
+          "dim_logits",
+          "attn_gate",
+          "logsnr"
+        ]
+      }
+    },
+    "ae_optimizer": {
+      "lr": 0.0003,
+      "weight_decay": 0.1,
+      "max_lr": 0.0003,
+      "pct_start": 0.1
+    },
+    "bucketing": {
+      "enabled": true,
+      "base_resolution": 64,
+      "base_batch_size": 8,
+      "caching_resolution": 128,
+      "image_buckets": [
+        {
+          "resolution": 64,
+          "batch_size": null,
+          "weight": 1.0
+        },
+        {
+          "resolution": 128,
+          "batch_size": null,
+          "weight": 1.0
+        },
+        {
+          "resolution": 256,
+          "batch_size": null,
+          "weight": 0.5
+        }
+      ],
+      "video_buckets": []
+    },
+    "precision": "bf16",
+    "precision_config": {
+      "weights": "fp8",
+      "activations": "bf16",
+      "skip_patterns": [
+        "embed",
+        "head",
+        "norm",
+        "embedder",
+        "unembedder"
+      ]
+    },
+    "online_variance_correction": {
+      "enabled": true,
+      "num_buckets": 20,
+      "snr_min": -5.0,
+      "snr_max": 5.0,
+      "ema_decay": 0.99,
+      "warmup_steps": 100
+    },
+    "sparse_ae": {
+      "enabled": true,
+      "ae_type": "swiglu",
+      "n_levels": 6,
+      "patch_size": 16,
+      "hidden_dim": 256,
+      "code_dim": 128,
+      "k_per_patch": 4,
+      "residual_scale": 2.0,
+      "fourier_dim": 16,
+      "ae_loss_weight": 0.1,
+      "logsnr_loss_weight": 0.1,
+      "n_layers": 4,
+      "attention": {
+        "mode": "sliding",
+        "window_size": 2,
+        "global_layer_interval": 4,
+        "n_query_heads": 8,
+        "n_kv_heads": 2,
+        "n_global_tokens": 0,
+        "bigbird_layout": [
+          2,
+          2
+        ],
+        "random_min_k": 3,
+        "random_min_p": 0.02
+      },
+      "latent_diffusion": true
+    },
+    "graph_capture": {
+      "enabled": true,
+      "warmup_steps": 20,
+      "capture_after_warmup": true,
+      "use_dedicated_stream": true
+    }
+  },
+  "sampling": {
+    "num_samples": 8,
+    "steps": 25,
+    "target_logsnr": 10.0,
+    "resolutions": [
+      64,
+      128,
+      256
+    ],
+    "enable_sweep": false,
+    "sweep_count": 4,
+    "sweep_length": 4,
+    "sweep_range": [
+      5.0,
+      1.0
+    ],
+    "queries": []
+  },
+  "page_table": {
+    "num_blocks": 64,
+    "block_size": 128,
+    "max_batch_size": 16,
+    "max_logical_blocks": 64
+  },
+  "logging": {
+    "output_dir": "experiments_swiglu_ae",
+    "log_interval": 50,
+    "sample_after_training": true
+  },
+  "dataset_mix": {
+    "fractal_main": {
+      "type": "fractal",
+      "ratio": 0.5,
+      "noise_mode": "uniform",
+      "noise_params": {
+        "min_snr": -4.0,
+        "max_snr": 5.0,
+        "angle_range_deg": 30.0,
+        "jitter_pct": 0.05
+      },
+      "params": {
+        "seed": 42,
+        "fractal_types": [
+          "mandelbrot",
+          "julia",
+          "burning_ship"
+        ],
+        "color_palette": "random",
+        "text_position": "none",
+        "resolution": 256
+      }
+    },
+    "fractal_split": {
+      "type": "fractal",
+      "ratio": 0.5,
+      "noise_mode": "split",
+      "noise_params": {
+        "min_snr": -5.0,
+        "max_snr": 5.0,
+        "angle_range_deg": 45.0,
+        "jitter_pct": 0.05
+      },
+      "params": {
+        "seed": 123,
+        "fractal_types": [
+          "julia",
+          "tricorn"
+        ],
+        "color_palette": "fire",
+        "text_position": "none",
+        "resolution": 256
+      }
+    },
+    "checker_baseline": {
+      "type": "checkerboard",
+      "ratio": 0.3,
+      "noise_mode": "split",
+      "noise_params": {
+        "min_snr": -4.0,
+        "max_snr": 5.0,
+        "angle_range_deg": 30.0,
+        "jitter_pct": 0.05
+      },
+      "params": {
+        "seed": 456,
+        "resolution": 64,
+        "text_position": "none"
+      }
+    },
+    "torus_baseline": {
+      "type": "torus",
+      "ratio": 0.3,
+      "noise_mode": "split",
+      "noise_params": {
+        "min_snr": -4.0,
+        "max_snr": 5.0,
+        "angle_range_deg": 45.0,
+        "jitter_pct": 0.05
+      },
+      "params": {
+        "seed": 789,
+        "resolution": 64,
+        "text_position": "none"
+      }
+    },
+    "sprite_atlas": {
+      "type": "sprite_atlas",
+      "ratio": 0.4,
+      "noise_mode": "uniform",
+      "noise_params": {
+        "min_snr": -4.0,
+        "max_snr": 5.0,
+        "angle_range_deg": 30.0,
+        "jitter_pct": 0.05
+      },
+      "params": {
+        "data_dir": "data/infinite_fusion",
+        "sampling_config": {
+          "split": "all",
+          "mode": "uniform_sprites",
+          "adjustment_mode": "additive",
+          "temperature": 1.0,
+          "seed": 42,
+          "adjustments": {
+            "134": 0.1,
+            "*.134": 0.1,
+            "procedural:*": -0.1
+          }
+        },
+        "render_config": {
+          "res_scaling": "do_not",
+          "background_mode": "solid_random",
+          "jitter": true
+        }
+      }
+    }
+  },
+  "dataset_configs": [],
+  "eval_configs": [],
+  "dtype": "torch.bfloat16",
+  "device": "cuda"
+}

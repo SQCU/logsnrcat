@@ -96,8 +96,10 @@ class RnRoPE(nn.Module):
 
         # 1. Rotate into frequency-friendly space
         # Collapse B, H, L for efficient matmul
-        q = self.orthogonal(q.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D)
-        k = self.orthogonal(k.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D)
+        # Note: .contiguous() after reshape prevents stride accumulation that can
+        # overflow 32-bit C long on Windows when compiled with dynamic shapes
+        q = self.orthogonal(q.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D).contiguous()
+        k = self.orthogonal(k.reshape(B*H*L, D), inverse=True).reshape(B, H, L, D).contiguous()
 
         # 2. Vectorized Frequency Computation
         # Slice inputs to supported dimensions (handles implicit truncation if input has extra dims)
@@ -123,8 +125,11 @@ class RnRoPE(nn.Module):
         # 4. Create Rotation Matrices
         # [B, L, freq_dim] -> [B, 1, L, freq_dim] -> [B, 1, L, head_dim]
         # Duplicate for real/imaginary parts
-        cos = full_freqs.cos().unsqueeze(1).repeat(1, 1, 1, 2)[..., :D]
-        sin = full_freqs.sin().unsqueeze(1).repeat(1, 1, 1, 2)[..., :D]
+        # Use expand + contiguous instead of repeat to avoid stride issues with dynamic compile
+        cos_base = full_freqs.cos().unsqueeze(1)  # [B, 1, L, freq_dim]
+        sin_base = full_freqs.sin().unsqueeze(1)
+        cos = torch.cat([cos_base, cos_base], dim=-1)[..., :D].contiguous()
+        sin = torch.cat([sin_base, sin_base], dim=-1)[..., :D].contiguous()
 
         # 5. Apply RoPE (Standard Rotate Half)
         def rotate_half(x):
@@ -135,7 +140,7 @@ class RnRoPE(nn.Module):
         k_rot = (k * cos) + (rotate_half(k) * sin)
 
         # 6. Rotate back to original basis
-        q_out = self.orthogonal(q_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D)
-        k_out = self.orthogonal(k_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D)
+        q_out = self.orthogonal(q_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D).contiguous()
+        k_out = self.orthogonal(k_rot.reshape(B*H*L, D), inverse=False).reshape(B, H, L, D).contiguous()
 
         return q_out, k_out

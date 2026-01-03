@@ -1,0 +1,28 @@
+
+=== AE vs Diffusion Diagnostic @ 64px ===
+Samples: 5
+AE Reconstruction:
+  MSE: 1.109683 ± 0.153186
+Diffusion Reconstruction:
+  MSE: 1.052082 ± 0.128911
+AE better than Diffusion: 2/5
+
+Interpretation:
+  - If AE MSE >> Diff MSE: AE is bottleneck (increase capacity/decrease sparsity)
+  - If AE MSE << Diff MSE: Diffusion is bottleneck (train longer/tune schedule)
+  - If AE MSE ~ Diff MSE: Balanced pipeline
+
+
+=== AE vs Diffusion Diagnostic @ 128px ===
+Samples: 5
+AE Reconstruction:
+  MSE: 1.085105 ± 0.131018
+Diffusion Reconstruction:
+  MSE: 0.948949 ± 0.024469
+AE better than Diffusion: 1/5
+
+Interpretation:
+  - If AE MSE >> Diff MSE: AE is bottleneck (increase capacity/decrease sparsity)
+  - If AE MSE << Diff MSE: Diffusion is bottleneck (train longer/tune schedule)
+  - If AE MSE ~ Diff MSE: Balanced pipeline
+

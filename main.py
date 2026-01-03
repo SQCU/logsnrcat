@@ -10,6 +10,10 @@ Usage:
 import argparse
 import torch
 
+# Apply patches for upstream bugs BEFORE any torch.compile() calls
+from src.patches import apply_all as apply_patches
+apply_patches()
+
 # Enable caching for flex attention backward - prevents recompilation overhead
 torch._inductor.config.unsafe_marked_cacheable_functions['torch.ops.higher_order.flex_attention_backward'] = True
 
@@ -17,7 +21,7 @@ from src.config import load_config
 from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, PageTable
 from src.data_iterator import CompositeIterator
 from src.data_functional import get_tokenizer
-from src.train import train_autoembed, train_denoise
+from src.train import train_autoembed, train_denoise, train_latent_diffusion
 from src.plotting import plot_multimetric_analysis, plot_ae_roundtrip, ExperimentLogger
 import src.sample as sampler
 
@@ -65,16 +69,29 @@ def build_components(cfg, device):
     patch_unembedder = model.patch_unembedder
 
     # Compile transformer layers if requested
+    # NOTE: torch.compile + GraphRunner conflict for flex_attention:
+    # - GraphRunner pre-creates BlockMasks at init with CONCRETE dimensions (L=max_ctx)
+    # - torch.compile(dynamic=True) traces with SYMBOLIC dimensions (s27, s58...)
+    # - When compiled model calls flex_attention with pre-created mask, Inductor fails
+    #   ("unbacked_bindings" - mask's concrete L doesn't match trace's symbolic shapes)
+    # - Sparse AE works fine because it creates masks DURING forward (inside trace context)
+    graph_capture_enabled = cfg['training'].get('graph_capture', {}).get('enabled', False)
+
     if cfg['training']['compile']:
-        # For sparse AE, compile the AE transformer layers separately
-        # (patchify/unpatchify have variable shapes that don't work with compile)
+        # Sparse AE transformers: always safe to compile (masks created inline during forward)
         if model.uses_sparse_ae:
             for enc in model.sparse_ae.encoders:
                 enc.transformer = torch.compile(enc.transformer)
             for dec in model.sparse_ae.decoders:
                 dec.transformer = torch.compile(dec.transformer)
-        # Compile the main model
-        model = torch.compile(model, dynamic=cfg['training']['compile_dynamic'])
+
+        # Main model: only compile if NOT using GraphRunner (which pre-creates masks)
+        if not graph_capture_enabled:
+            model = torch.compile(model, dynamic=cfg['training']['compile_dynamic'])
+        else:
+            print("[INFO] graph_capture enabled - skipping torch.compile for main model")
+            print("       (GraphRunner pre-creates masks; torch.compile traces with symbolic shapes)")
+            print("       (CUDA graph capture provides equivalent optimization)")
 
     # Wrap embedders in SpanEmbedder/SpanUnembedder
     span_emb = SpanEmbedder(text_embed, patch_embedder)
@@ -139,7 +156,9 @@ def main():
     val_iterator = CompositeIterator(device, config=cfg['dataset_mix'], 
         caching_resolution=cfg['training']['bucketing']['caching_resolution'])
     logger = ExperimentLogger(output_dir=str(cfg['logging']['output_dir']))
-    
+    # Save config immediately for reproducibility (before any training)
+    logger.save_config(cfg, "config.json")
+
     print(f"\nTraining: {cfg['training']['mode'].upper()} mode")
     # param_init is called in model's __init__, no need to call again
 
@@ -147,6 +166,8 @@ def main():
     df_ae = train_autoembed(components, cfg, val_iterator, logger)
     # Plot AE warmup metrics if AE training was run
     if cfg['training']['ae_steps'] > 0 and not df_ae.empty:
+        # Save dataframe BEFORE plotting (crash safety)
+        logger.save_dataframe(df_ae, f"history_ae_{cfg['training']['mode']}")
         plot_multimetric_analysis(df_ae, logger, f"multimetric_ae_{cfg['training']['mode']}")
         # AE reconstruction quality with round-trip analysis
         print("Plotting AE round-trip reconstruction...")
@@ -154,9 +175,24 @@ def main():
             plot_ae_roundtrip(components, val_iterator, logger,
                               name=f"ae_roundtrip_{res}", n_samples=8, resolution=res)
 
-    df_train = train_denoise(components, cfg, val_iterator, logger)
+    # Use latent diffusion if sparse AE is enabled with latent_diffusion=true
+    sparse_ae_cfg = cfg['training'].get('sparse_ae', {})
+    use_latent_diffusion = (
+        sparse_ae_cfg.get('enabled', False) and
+        sparse_ae_cfg.get('latent_diffusion', False)
+    )
+
+    if use_latent_diffusion:
+        print("\n[Main] Using LATENT diffusion (noise in code space)")
+        df_train = train_latent_diffusion(components, cfg, val_iterator, logger)
+    else:
+        print("\n[Main] Using PIXEL diffusion (noise in pixel space)")
+        df_train = train_denoise(components, cfg, val_iterator, logger)
 
     print("\nPlotting Metrics...")
+    # Save dataframe BEFORE plotting (crash safety)
+    if not df_train.empty:
+        logger.save_dataframe(df_train, f"history_denoise_{cfg['training']['mode']}")
     # Plot diffusion training metrics
     plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg['training']['mode']}")
     

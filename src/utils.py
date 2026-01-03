@@ -475,50 +475,42 @@ def run_model_forward(components, blocks: List[ContextBlock], graph_runner=None,
     # 2. Topology (dtype inferred from model) - OUTSIDE graph
     topo_embeds, _ = render_topology_embeddings(span_objects, 3, device, dtype=dtype)
 
-    # 3. Masking - OUTSIDE graph
+    # 3. Transformer - Use graph runner if available
     L_total = z_flat.shape[0]
-    block_size = page_table.block_size
-    num_blocks = (L_total + block_size - 1) // block_size
-    flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
-
-    block_masks = build_dual_masks(
-        span_objects, topo_embeds, topo_embeds,
-        page_table, flat_page_table, None,
-        window_size=getattr(model, 'window_size', 10.0)
-    )
-
-    # 4. Transformer - Use graph runner if available
     rope_scale = max(1.0, L_total / 64.0)
 
     z_input = z_flat.unsqueeze(0)
     topo_input = topo_embeds.unsqueeze(0)
 
     if graph_runner is not None:
+        # GraphRunner has its own static masks at max_ctx - no per-batch mask generation
         if graph_runner.is_captured:
             # Graph replay path (fast!) - single CUDA call for transformer forward
-            z_out, aux_loss = graph_runner.replay(z_input, topo_input, block_masks)
+            z_out, aux_loss = graph_runner.replay(z_input, topo_input)
         elif warmup_mode:
             # Warmup phase: feed real data through graph runner
             # Auto-captures after warmup_count reaches threshold
-            z_out, aux_val = graph_runner.warmup(
-                z_input, topo_input, block_masks, scale=rope_scale
-            )
+            z_out, aux_val = graph_runner.warmup(z_input, topo_input, scale=rope_scale)
             aux_loss = torch.tensor(aux_val, device=device, dtype=dtype)
 
             # Auto-capture after sufficient warmups
             if graph_runner.warmup_count >= 3 and not graph_runner.is_captured:
                 graph_runner.capture(scale=rope_scale)
         else:
-            # Graph runner exists but not captured and not warming up - eager forward
-            z_out, aux_loss = model(
-                z_input,
-                topo_input,
-                slot_mapping=None,
-                block_masks=block_masks,
-                scale=rope_scale
-            )
+            # Graph runner exists but not captured and not warming up - use its forward
+            z_out, aux_loss = graph_runner.forward(z_input, topo_input, scale=rope_scale)
     else:
-        # No graph runner - standard eager forward
+        # No graph runner - standard eager forward with per-batch masks
+        block_size = page_table.block_size
+        num_blocks = (L_total + block_size - 1) // block_size
+        flat_page_table = torch.arange(num_blocks, device=device, dtype=torch.long)
+
+        block_masks = build_dual_masks(
+            span_objects, topo_embeds, topo_embeds,
+            page_table, flat_page_table, None,
+            window_size=getattr(model, 'window_size', 10.0)
+        )
+
         z_out, aux_loss = model(
             z_input,
             topo_input,

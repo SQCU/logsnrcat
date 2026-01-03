@@ -46,7 +46,9 @@ dependencies = [
     #pytorch3d is fictional
     #crimes against nature
     "pyzmq",
-    "cloudpickle"
+    "cloudpickle",
+    #dataframe serialization
+    "pyarrow",
 ]
 
 [project.optional-dependencies]

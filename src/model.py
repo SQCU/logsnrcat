@@ -52,9 +52,14 @@ from .context_manager import (
     SpanUnembedder,
     generate_content_hash_stream,
     render_topology_embeddings,
+    render_latent_topology_embeddings,
+    compute_latent_distance_squared,
     build_dual_masks,
     materialize_mask_for_analysis,
     build_encoder_mask,
+    build_latent_diffusion_mask,
+    get_cached_latent_mask,
+    clear_latent_mask_cache,
     get_encoder_mask_for_layer,
 )
 
@@ -74,8 +79,11 @@ __all__ = [
     # context_manager
     'ContextBlock', 'Span', 'SpanEmbedder', 'SpanUnembedder',
     'generate_content_hash_stream', 'render_topology_embeddings',
+    'render_latent_topology_embeddings', 'compute_latent_distance_squared',
     'build_dual_masks', 'materialize_mask_for_analysis',
-    'build_encoder_mask', 'get_encoder_mask_for_layer',
+    'build_encoder_mask', 'build_latent_diffusion_mask',
+    'get_cached_latent_mask', 'clear_latent_mask_cache',
+    'get_encoder_mask_for_layer',
     # This file
     'LDTformerAttentionKVC', 'LDTformerAttentionZC',
     'LDTformerBlockKVC', 'LDTformerBlockZC',
@@ -379,15 +387,11 @@ class coolerLDTformerZC(nn.Module):
         # Build patch embedder/unembedder based on config
         # When sparse_ae_config is provided, use SparseAE components
         # Otherwise use standard ContextualPatchEmbedder/Unembedder
-        self.uses_sparse_ae = sparse_ae_config is not None and sparse_ae_config.get('enabled', False)
+        self.uses_sparse_ae = sparse_ae_config is not None and sparse_ae_config['enabled']
 
         if self.uses_sparse_ae:
-            ae_type = sparse_ae_config.get('ae_type', 'sparse_dim')
-
-            attn_cfg = sparse_ae_config.get('attention', {
-                'mode': 'full', 'window_size': 4, 'global_layer_interval': 4,
-                'n_query_heads': 8, 'n_kv_heads': 2, 'n_global_tokens': 4
-            })
+            ae_type = sparse_ae_config['ae_type']
+            attn_cfg = sparse_ae_config['attention']
 
             if ae_type == 'swiglu':
                 # SwiGLU variant: binary FSQ, level-global sparsity, 2D RoPE
@@ -404,30 +408,23 @@ class coolerLDTformerZC(nn.Module):
                     attn_cfg['window_size'] = 2  # Euclidean dist² ≤ 4 covers 3x3
 
                 self.sparse_ae = SwiGLUFSQAutoencoder(
-                    n_levels=sparse_ae_config.get('n_levels', 6),
-                    patch_size=sparse_ae_config.get('patch_size', 16),
-                    image_size=256,  # Dynamic per batch
-                    hidden_dim=sparse_ae_config.get('hidden_dim', 128),
-                    code_dim=sparse_ae_config.get('code_dim', 256),
-                    k_active=sparse_ae_config.get('k_per_patch', 8),
-                    residual_scale=sparse_ae_config.get('residual_scale', 2.0),
-                    fourier_dim=sparse_ae_config.get('fourier_dim', 16),
-                    n_layers=sparse_ae_config.get('n_layers', 1),
-                    n_heads=attn_cfg.get('n_query_heads', 4),
-                    n_kv_heads=attn_cfg.get('n_kv_heads', 2),
+                    n_levels=sparse_ae_config['n_levels'],
+                    patch_size=sparse_ae_config['patch_size'],
+                    hidden_dim=sparse_ae_config['hidden_dim'],
+                    code_dim=sparse_ae_config['code_dim'],
+                    k_per_patch=sparse_ae_config['k_per_patch'],
+                    residual_scale=sparse_ae_config['residual_scale'],
+                    n_layers=sparse_ae_config['n_layers'],
                     attn_config=attn_cfg
                 )
 
                 self.patch_embedder = SwiGLUPatchEmbedder(self.sparse_ae, embed_dim=dim)
-                self.patch_unembedder = SwiGLUPatchUnembedder(
-                    self.sparse_ae, self.patch_embedder,
-                    fourier_dim=sparse_ae_config.get('fourier_dim', 16)
-                )
+                self.patch_unembedder = SwiGLUPatchUnembedder(self.sparse_ae, self.patch_embedder)
 
-                print(f"[Model] Using SwiGLU AE: {sparse_ae_config.get('n_levels', 6)} levels, "
-                      f"code_dim={sparse_ae_config.get('code_dim', 256)}, "
-                      f"k={sparse_ae_config.get('k_per_patch', 8)}, "
-                      f"attn={attn_cfg.get('mode', 'local')}")
+                print(f"[Model] Using SwiGLU AE: {sparse_ae_config['n_levels']} levels, "
+                      f"code_dim={sparse_ae_config['code_dim']}, "
+                      f"k={sparse_ae_config['k_per_patch']}, "
+                      f"attn={attn_cfg['mode']}")
 
             else:
                 # Default: sparse_dim variant (3-bit, per-patch sparsity)
@@ -438,27 +435,27 @@ class coolerLDTformerZC(nn.Module):
                 )
 
                 self.sparse_ae = SparsePerDimFSQAutoencoder(
-                    n_levels=sparse_ae_config.get('n_levels', 6),
-                    patch_size=sparse_ae_config.get('patch_size', 16),
+                    n_levels=sparse_ae_config['n_levels'],
+                    patch_size=sparse_ae_config['patch_size'],
                     image_size=256,  # Dynamic per batch
-                    hidden_dim=sparse_ae_config.get('hidden_dim', 256),
-                    code_dim=sparse_ae_config.get('code_dim', 128),
-                    k_per_patch=sparse_ae_config.get('k_per_patch', 6),
-                    residual_scale=sparse_ae_config.get('residual_scale', 2.0),
-                    fourier_dim=sparse_ae_config.get('fourier_dim', 16),
-                    n_layers=sparse_ae_config.get('n_layers', 4),
+                    hidden_dim=sparse_ae_config['hidden_dim'],
+                    code_dim=sparse_ae_config['code_dim'],
+                    k_per_patch=sparse_ae_config['k_per_patch'],
+                    residual_scale=sparse_ae_config['residual_scale'],
+                    fourier_dim=sparse_ae_config['fourier_dim'],
+                    n_layers=sparse_ae_config['n_layers'],
                     attn_config=attn_cfg
                 )
 
                 self.patch_embedder = SparseAEPatchEmbedder(self.sparse_ae, embed_dim=dim)
                 self.patch_unembedder = SparseAEPatchUnembedder(
                     self.sparse_ae, self.patch_embedder,
-                    fourier_dim=sparse_ae_config.get('fourier_dim', 16)
+                    fourier_dim=sparse_ae_config['fourier_dim']
                 )
 
-                print(f"[Model] Using SparseAE: {sparse_ae_config.get('n_levels', 6)} levels, "
-                      f"code_dim={sparse_ae_config.get('code_dim', 128)}, "
-                      f"k={sparse_ae_config.get('k_per_patch', 6)}")
+                print(f"[Model] Using SparseAE: {sparse_ae_config['n_levels']} levels, "
+                      f"code_dim={sparse_ae_config['code_dim']}, "
+                      f"k={sparse_ae_config['k_per_patch']}")
         else:
             self.sparse_ae = None
             self.patch_embedder = ContextualPatchEmbedder(
@@ -514,6 +511,39 @@ class coolerLDTformerZC(nn.Module):
 
         x = self.final_norm(x)
         return x, total_aux
+
+    def forward_latent_diffusion(
+        self,
+        x: torch.Tensor,
+        topo_embeds: torch.Tensor,
+        block_mask: object,
+        scale: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Forward pass for latent diffusion with 4D topology.
+
+        Uses a single level-aware block_mask for all layers (no global/local distinction).
+        The mask implements vertical tubes and level-lambda distance weighting.
+
+        Args:
+            x: [B, N*L, dim] input tokens (flattened codes across levels)
+            topo_embeds: [B, N*L, 4] topology coords [highway, spatial_x, spatial_y, level]
+            block_mask: Level-aware BlockMask from get_cached_latent_mask
+            scale: MoE scale factor
+
+        Returns:
+            x: [B, N*L, dim] processed tokens
+        """
+        B, T, _ = x.shape
+        # Create dummy slot_mapping (all tokens belong to same document per batch item)
+        slot_mapping = torch.zeros(B, T, dtype=torch.long, device=x.device)
+
+        for layer in self.layers:
+            # Use same mask for all layers in latent diffusion mode
+            x, _ = layer(x, topo_embeds, slot_mapping, block_mask, scale=scale)
+
+        x = self.final_norm(x)
+        return x
 
     def dump(self) -> Dict[str, torch.Tensor]:
         """Return reference to parameters (no move)."""

@@ -5,33 +5,30 @@ Graph shape is determined by memory block layout (max_blocks × block_size),
 NOT by "sequence length" or "batch size". With paged attention:
 - Tensors are allocated at max capacity upfront
 - "Variable length" means different valid regions, not different shapes
-- Mask CONTENTS change, mask SHAPES are fixed
+- Mask SHAPES are fixed at max_ctx, content determines valid regions
 
 One graph per block layout configuration. Currently we use one PageTable
-config, so there's ONE graph. Bucketing would only matter if we had
-multiple block size/count configurations for bin-packing different
-context size classes.
+config, so there's ONE graph.
 
 Usage:
-    runner = GraphRunner(model, page_table, config)
+    runner = GraphRunner(model, page_table, config, window_size=10.0)
 
     # Warmup with REAL data (required - 3+ times)
     for batch in warmup_batches:
-        z, topo, masks = prepare_data(batch)
-        runner.warmup(z, topo, masks)
+        z, topo = prepare_data(batch)
+        runner.warmup(z, topo)
 
     runner.capture()
 
     # Training/inference loop:
-    z, topo, masks = prepare_data(batch)
-    z_out, aux = runner.replay(z, topo, masks)
+    z, topo = prepare_data(batch)
+    z_out, aux = runner.replay(z, topo)
 """
 
 import torch
-from torch.nn.attention.flex_attention import BlockMask
+from torch.nn.attention.flex_attention import create_block_mask, BlockMask
 from typing import Tuple, Optional
 from dataclasses import dataclass
-import copy
 
 
 @dataclass
@@ -40,17 +37,6 @@ class GraphBuffers:
     # Input buffers - sized for max_ctx
     z: torch.Tensor              # [1, max_ctx, D]
     topo: torch.Tensor           # [1, max_ctx, topo_dim]
-
-    # BlockMask tensor buffers - sized for max_blocks
-    mask_local_kv_indices: torch.Tensor
-    mask_local_full_kv_indices: torch.Tensor
-    mask_local_kv_num_blocks: torch.Tensor
-    mask_local_full_kv_num_blocks: torch.Tensor
-
-    mask_global_kv_indices: torch.Tensor
-    mask_global_full_kv_indices: torch.Tensor
-    mask_global_kv_num_blocks: torch.Tensor
-    mask_global_full_kv_num_blocks: torch.Tensor
 
     # Output buffer
     z_out: torch.Tensor          # [1, max_ctx, D]
@@ -64,15 +50,16 @@ class GraphRunner:
     ONE graph per memory block configuration. Shape determined by:
     - page_table.num_blocks × page_table.block_size = max context capacity
 
-    All "variable length" inputs are just different valid regions within
-    fixed-size buffers. Masks control what's valid, not tensor shapes.
+    Creates STATIC masks at max_ctx during initialization. No mask resizing
+    or per-batch mask generation - the pattern is fixed (causal + windowed).
     """
 
-    def __init__(self, model, page_table, config: dict):
+    def __init__(self, model, page_table, config: dict, window_size: float = 10.0):
         self.model = model
         self.page_table = page_table
         self.device = config['device']
         self.dtype = config['dtype']
+        self.window_size = window_size
 
         # Model config
         self.dim = model.text_embed.weight.shape[1]
@@ -86,7 +73,6 @@ class GraphRunner:
         # Graph state
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._buffers: Optional[GraphBuffers] = None
-        self._static_masks: Optional[Tuple[BlockMask, BlockMask]] = None
         self._warmup_count = 0
         self._captured = False
 
@@ -97,117 +83,81 @@ class GraphRunner:
         self._utilization_samples: list = []
         self._utilization_warned = False
 
-    def _create_static_buffers(self, mask_local: BlockMask, mask_global: BlockMask) -> GraphBuffers:
-        """Allocate static buffers at MAX context size.
+        # Create static masks at max_ctx - ONCE, at initialization
+        self._static_masks = self._create_static_masks()
+        print(f"[GraphRunner] Created static masks at max_ctx={self.max_ctx}, "
+              f"window_size={window_size}")
 
-        Mask buffers are allocated at max_blocks in the Q-block dimension (first dim),
-        preserving the KV-blocks-per-Q dimension from the attention pattern.
-        This allows variable sequence lengths while keeping attention pattern fixed.
+    def _create_static_masks(self) -> Tuple[BlockMask, BlockMask]:
         """
-        # Get KV dimension from incoming mask (determined by attention pattern, not seq len)
-        local_kv_dim = mask_local.kv_indices.shape[1] if mask_local.kv_indices.dim() > 1 else 1
-        local_full_kv_dim = mask_local.full_kv_indices.shape[1] if mask_local.full_kv_indices.dim() > 1 else 1
-        global_kv_dim = mask_global.kv_indices.shape[1] if mask_global.kv_indices.dim() > 1 else 1
-        global_full_kv_dim = mask_global.full_kv_indices.shape[1] if mask_global.full_kv_indices.dim() > 1 else 1
+        Create static BlockMasks at max_ctx with fixed pattern.
 
+        Pattern:
+        - Local: causal + spatial window (dist² < window_size²)
+        - Global: causal only (full attention within causal constraint)
+
+        These masks are created ONCE and reused for all forward passes.
+        The valid region is determined by actual data copied into buffers,
+        not by mask shape.
+        """
+        L = self.max_ctx
+        win_sq = self.window_size * self.window_size
+
+        # For static masks, we use simple causal pattern
+        # Positions are just indices 0..L-1, no span structure needed
+
+        def mask_mod_local(b, h, q_idx, kv_idx):
+            """Causal + spatial window."""
+            # Causal: can only attend to past (including self)
+            causal_ok = q_idx >= kv_idx
+
+            # Spatial window: assume positions are laid out as 1D for simplicity
+            # For 2D spatial, we'd need topology - but for static masks,
+            # we approximate with 1D distance
+            dist = q_idx - kv_idx
+            window_ok = (dist * dist) < win_sq
+
+            return causal_ok & window_ok
+
+        def mask_mod_global(b, h, q_idx, kv_idx):
+            """Causal only (full attention within past)."""
+            return q_idx >= kv_idx
+
+        # Create masks at max_ctx
+        local_mask = create_block_mask(
+            mask_mod_local, B=None, H=None, Q_LEN=L, KV_LEN=L
+        )
+        global_mask = create_block_mask(
+            mask_mod_global, B=None, H=None, Q_LEN=L, KV_LEN=L
+        )
+
+        return local_mask, global_mask
+
+    def _create_buffers(self) -> GraphBuffers:
+        """Allocate static buffers at max context size."""
         return GraphBuffers(
-            # Input buffers at max capacity
             z=torch.zeros(1, self.max_ctx, self.dim, device=self.device, dtype=self.dtype),
             topo=torch.zeros(1, self.max_ctx, self.topo_dim, device=self.device, dtype=self.dtype),
-
-            # Mask tensors at max_blocks in Q dimension, pattern-determined in KV dimension
-            mask_local_kv_indices=torch.zeros(
-                self.max_blocks, local_kv_dim, device=self.device, dtype=mask_local.kv_indices.dtype),
-            mask_local_full_kv_indices=torch.zeros(
-                self.max_blocks, local_full_kv_dim, device=self.device, dtype=mask_local.full_kv_indices.dtype),
-            mask_local_kv_num_blocks=torch.zeros(
-                self.max_blocks, device=self.device, dtype=mask_local.kv_num_blocks.dtype),
-            mask_local_full_kv_num_blocks=torch.zeros(
-                self.max_blocks, device=self.device, dtype=mask_local.full_kv_num_blocks.dtype),
-
-            mask_global_kv_indices=torch.zeros(
-                self.max_blocks, global_kv_dim, device=self.device, dtype=mask_global.kv_indices.dtype),
-            mask_global_full_kv_indices=torch.zeros(
-                self.max_blocks, global_full_kv_dim, device=self.device, dtype=mask_global.full_kv_indices.dtype),
-            mask_global_kv_num_blocks=torch.zeros(
-                self.max_blocks, device=self.device, dtype=mask_global.kv_num_blocks.dtype),
-            mask_global_full_kv_num_blocks=torch.zeros(
-                self.max_blocks, device=self.device, dtype=mask_global.full_kv_num_blocks.dtype),
-
-            # Output buffer at max capacity
             z_out=torch.zeros(1, self.max_ctx, self.dim, device=self.device, dtype=self.dtype),
             aux_out=torch.zeros(1, device=self.device, dtype=self.dtype),
         )
 
-    def _create_static_masks(self, mask_local: BlockMask, mask_global: BlockMask) -> Tuple[BlockMask, BlockMask]:
-        """Create BlockMask objects that reference our static buffers.
-
-        Updates both tensor attributes AND shape metadata to reflect max_blocks.
-        """
-        static_local = copy.copy(mask_local)
-        static_local.kv_indices = self._buffers.mask_local_kv_indices
-        static_local.full_kv_indices = self._buffers.mask_local_full_kv_indices
-        static_local.kv_num_blocks = self._buffers.mask_local_kv_num_blocks
-        static_local.full_kv_num_blocks = self._buffers.mask_local_full_kv_num_blocks
-        # Update shape metadata if present (flex_attention BlockMask attrs)
-        if hasattr(static_local, 'num_rows'):
-            static_local.num_rows = self.max_blocks
-        if hasattr(static_local, 'num_cols'):
-            static_local.num_cols = self.max_blocks
-
-        static_global = copy.copy(mask_global)
-        static_global.kv_indices = self._buffers.mask_global_kv_indices
-        static_global.full_kv_indices = self._buffers.mask_global_full_kv_indices
-        static_global.kv_num_blocks = self._buffers.mask_global_kv_num_blocks
-        static_global.full_kv_num_blocks = self._buffers.mask_global_full_kv_num_blocks
-        if hasattr(static_global, 'num_rows'):
-            static_global.num_rows = self.max_blocks
-        if hasattr(static_global, 'num_cols'):
-            static_global.num_cols = self.max_blocks
-
-        return static_local, static_global
-
-    def _copy_inputs_to_buffers(
-        self,
-        z: torch.Tensor,
-        topo: torch.Tensor,
-        masks: Tuple[BlockMask, BlockMask]
-    ) -> int:
+    def _copy_inputs_to_buffers(self, z: torch.Tensor, topo: torch.Tensor) -> int:
         """
         Copy data into static buffers. Returns valid length.
 
         Input z may be smaller than max_ctx - we copy into the valid region.
-        Mask tensors may have fewer Q-blocks than max_blocks - we copy into
-        the valid slice and zero the remainder (kv_num_blocks=0 means no attention).
+        Rest of buffer is zeroed (or stale from previous, but masked out).
         """
-        mask_local, mask_global = masks
         valid_len = z.shape[1]
 
-        # Copy input tensors into valid region (rest stays zero/stale, masked out)
+        # Zero buffers first (ensures clean state for smaller inputs)
+        self._buffers.z.zero_()
+        self._buffers.topo.zero_()
+
+        # Copy input tensors into valid region
         self._buffers.z[:, :valid_len].copy_(z)
         self._buffers.topo[:, :valid_len].copy_(topo)
-
-        # Get actual number of Q-blocks from incoming masks
-        actual_blocks_local = mask_local.kv_num_blocks.shape[0]
-        actual_blocks_global = mask_global.kv_num_blocks.shape[0]
-
-        # Zero out mask buffers first (kv_num_blocks=0 disables attention for OOB blocks)
-        self._buffers.mask_local_kv_num_blocks.zero_()
-        self._buffers.mask_local_full_kv_num_blocks.zero_()
-        self._buffers.mask_global_kv_num_blocks.zero_()
-        self._buffers.mask_global_full_kv_num_blocks.zero_()
-
-        # Copy local mask into valid slice
-        self._buffers.mask_local_kv_indices[:actual_blocks_local].copy_(mask_local.kv_indices)
-        self._buffers.mask_local_full_kv_indices[:actual_blocks_local].copy_(mask_local.full_kv_indices)
-        self._buffers.mask_local_kv_num_blocks[:actual_blocks_local].copy_(mask_local.kv_num_blocks)
-        self._buffers.mask_local_full_kv_num_blocks[:actual_blocks_local].copy_(mask_local.full_kv_num_blocks)
-
-        # Copy global mask into valid slice
-        self._buffers.mask_global_kv_indices[:actual_blocks_global].copy_(mask_global.kv_indices)
-        self._buffers.mask_global_full_kv_indices[:actual_blocks_global].copy_(mask_global.full_kv_indices)
-        self._buffers.mask_global_kv_num_blocks[:actual_blocks_global].copy_(mask_global.kv_num_blocks)
-        self._buffers.mask_global_full_kv_num_blocks[:actual_blocks_global].copy_(mask_global.full_kv_num_blocks)
 
         return valid_len
 
@@ -215,7 +165,6 @@ class GraphRunner:
         self,
         z: torch.Tensor,
         topo: torch.Tensor,
-        masks: Tuple[BlockMask, BlockMask],
         scale: float = 1.0
     ) -> Tuple[torch.Tensor, float]:
         """
@@ -224,17 +173,14 @@ class GraphRunner:
         First call allocates buffers. Subsequent calls warm up CUDA internals.
         Returns output so training can continue during warmup phase.
         """
-        mask_local, mask_global = masks
-
-        # First warmup: allocate buffers at max size
+        # First warmup: allocate buffers
         if self._buffers is None:
-            self._buffers = self._create_static_buffers(mask_local, mask_global)
-            self._static_masks = self._create_static_masks(mask_local, mask_global)
+            self._buffers = self._create_buffers()
             print(f"[GraphRunner] Allocated buffers: max_ctx={self.max_ctx}, "
                   f"max_blocks={self.max_blocks}, block_size={self.block_size}")
 
         # Copy data to static buffers
-        valid_len = self._copy_inputs_to_buffers(z, topo, masks)
+        valid_len = self._copy_inputs_to_buffers(z, topo)
 
         # Run forward on capture stream
         self._stream.wait_stream(torch.cuda.current_stream())
@@ -297,20 +243,19 @@ class GraphRunner:
     def replay(
         self,
         z: torch.Tensor,
-        topo: torch.Tensor,
-        masks: Tuple[BlockMask, BlockMask]
+        topo: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Replay captured graph with new data.
 
         Copies new data into static buffers, replays graph, returns valid region.
-        Mask contents control what's valid - tensor shapes are fixed.
+        Mask is fixed at max_ctx - valid data region determined by input size.
         """
         if not self._captured:
             raise RuntimeError("No graph captured - call capture() first")
 
         # Copy new data into static buffers
-        valid_len = self._copy_inputs_to_buffers(z, topo, masks)
+        valid_len = self._copy_inputs_to_buffers(z, topo)
 
         # Replay graph (single CUDA call for entire transformer forward)
         self._graph.replay()
@@ -318,7 +263,7 @@ class GraphRunner:
         # Track utilization for config recommendations
         self._check_utilization(valid_len)
 
-        # Return view of valid region - no clone needed, backward completes before next replay
+        # Return view of valid region
         z_out = self._buffers.z_out[:, :valid_len]
         aux = self._buffers.aux_out
         return z_out, aux
@@ -327,18 +272,17 @@ class GraphRunner:
         self,
         z: torch.Tensor,
         topo: torch.Tensor,
-        masks: Tuple[BlockMask, BlockMask],
         scale: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Unified forward - uses replay if captured, else eager.
+        Unified forward - uses replay if captured, else eager with static masks.
         """
         if self._captured:
-            return self.replay(z, topo, masks)
+            return self.replay(z, topo)
         else:
-            # Eager fallback
+            # Eager fallback - still use static masks
             z_out, aux = self.model(
-                z, topo, slot_mapping=None, block_masks=masks, scale=scale
+                z, topo, slot_mapping=None, block_masks=self._static_masks, scale=scale
             )
             aux_tensor = aux if isinstance(aux, torch.Tensor) else torch.tensor(
                 float(aux) if aux else 0.0, device=self.device, dtype=self.dtype
@@ -370,10 +314,8 @@ class GraphRunner:
                 self._utilization_warned = True
 
                 # Calculate recommended config
-                # Round up to next power of 2 for block count
                 avg_tokens = int(max_util * self.max_ctx * 1.25)  # 25% headroom
                 recommended_blocks = (avg_tokens + self.block_size - 1) // self.block_size
-                # Round to nice number
                 nice_blocks = 1
                 while nice_blocks < recommended_blocks:
                     nice_blocks *= 2
@@ -390,10 +332,9 @@ class GraphRunner:
                 print(f"  This would reduce graph capture overhead by {self.max_blocks // nice_blocks}x\n")
 
     def reset(self):
-        """Clear captured graph and buffers."""
+        """Clear captured graph and buffers (but keep static masks)."""
         self._graph = None
         self._buffers = None
-        self._static_masks = None
         self._warmup_count = 0
         self._captured = False
         self._utilization_samples = []

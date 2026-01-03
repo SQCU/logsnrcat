@@ -4,7 +4,8 @@
       "Bash(python:*)",
       "Bash(python analyze_throughput.py:*)",
       "Bash(python3:*)",
-      "Bash(iconv:*)"
+      "Bash(iconv:*)",
+      "Bash(.venv/Scripts/python.exe:*)"
     ]
   }
 }

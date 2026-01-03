@@ -259,8 +259,8 @@ def taufield_spatial_sampling(
     """
     if not targets:
         return # Nothing to do
-        
-    steps = sampling_config.get('steps', 50)
+
+    steps = sampling_config['steps']
     device = context.blocks[targets[0]['idx']].content.device # Assume consistent device
     
     # 1. Construct the Field

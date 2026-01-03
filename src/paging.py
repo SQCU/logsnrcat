@@ -23,6 +23,7 @@ class PageTable:
                  max_logical_blocks: int,
                  device='cuda'):
 
+        self.num_blocks = num_blocks  # Required by GraphRunner
         self.block_size = block_size
         self.device = device
 

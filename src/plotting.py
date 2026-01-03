@@ -124,6 +124,7 @@ def run_pipeline_analysis(blocks, device):
 
 from pathlib import Path
 import sys
+import json
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -153,6 +154,60 @@ class ExperimentLogger:
         filepath = self.run_dir / filename
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(text + "\n")
+
+    def save_config(self, config: dict, filename: str = "config.json"):
+        """Save experiment config to JSON file in run directory.
+
+        Called early in training to preserve config even if run crashes.
+        Handles non-serializable types (Path, torch.dtype, etc.) gracefully.
+        """
+        def make_serializable(obj):
+            if isinstance(obj, Path):
+                return str(obj)
+            elif hasattr(obj, 'item'):  # torch.Tensor scalar
+                return obj.item()
+            elif hasattr(obj, '__name__'):  # types like torch.float32
+                return str(obj)
+            elif isinstance(obj, dict):
+                return {k: make_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [make_serializable(v) for v in obj]
+            else:
+                return obj
+
+        filepath = self.run_dir / filename
+        try:
+            serializable = make_serializable(config)
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, indent=2, default=str)
+        except Exception as e:
+            # Fallback: write repr if JSON fails
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(repr(config))
+            print(f"[Logger] Config serialization warning: {e}")
+
+    def save_dataframe(self, df: pd.DataFrame, name: str, format: str = "parquet"):
+        """Save dataframe to run directory. Call BEFORE plotting for crash safety.
+
+        Args:
+            df: DataFrame to save
+            name: Base filename (without extension)
+            format: 'parquet' (fast, compact) or 'csv' (human-readable)
+        """
+        if df.empty:
+            return
+
+        if format == "parquet":
+            try:
+                filepath = self.run_dir / f"{name}.parquet"
+                df.to_parquet(filepath, index=False)
+            except ImportError:
+                # Fallback to CSV if pyarrow/fastparquet not installed
+                filepath = self.run_dir / f"{name}.csv"
+                df.to_csv(filepath, index=False)
+        else:
+            filepath = self.run_dir / f"{name}.csv"
+            df.to_csv(filepath, index=False)
 
 def plot_losses(df_naive, df_fact, logger, metric="loss_total", title="Training Loss"):
     if df_naive.empty and df_fact.empty: return
@@ -334,40 +389,33 @@ def plot_ae_roundtrip(components, iterator, logger, name="ae_roundtrip", n_sampl
     """
     import torch
 
-    span_emb = components[1]
-    span_unemb = components[2]
+    # Access sparse_ae directly from model (like train_autoembed does)
+    model = components[0]
 
-    # Get the actual patch embedder/unembedder
-    if hasattr(span_emb, 'patch_emb'):
-        patch_emb = span_emb.patch_emb
-    elif hasattr(span_emb, 'patch_embedder'):
-        patch_emb = span_emb.patch_embedder
-    else:
-        print("    plot_ae_roundtrip: No patch embedder found")
+    if not hasattr(model, 'sparse_ae') or model.sparse_ae is None:
+        print("    plot_ae_roundtrip: Model has no sparse_ae")
         return
 
-    if hasattr(span_unemb, 'patch_unembed'):
-        patch_unemb = span_unemb.patch_unembed
-    elif hasattr(span_unemb, 'patch_unembedder'):
-        patch_unemb = span_unemb.patch_unembedder
-    else:
-        print("    plot_ae_roundtrip: No patch unembedder found")
-        return
+    sparse_ae = model.sparse_ae
+    device = next(sparse_ae.parameters()).device
 
     # Detect model dtype from first parameter
     model_dtype = None
-    for p in patch_emb.parameters():
+    for p in sparse_ae.parameters():
         model_dtype = p.dtype
         break
     if model_dtype is None:
-        model_dtype = torch.float32
+        model_dtype = torch.bfloat16
 
     # Collect samples
     samples = []
     split_names = iterator.get_split_names()
     n_per_split = max(1, n_samples // max(1, len(split_names)))
 
-    with torch.no_grad():
+    # Use autocast like train_autoembed does - this is the key fix
+    use_amp = model_dtype in (torch.bfloat16, torch.float16)
+
+    with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=model_dtype, enabled=use_amp):
         for split_name in split_names:
             try:
                 blocks = iterator.generate_from_split(split_name, count=n_per_split, resolution=resolution)
@@ -381,25 +429,40 @@ def plot_ae_roundtrip(components, iterator, logger, name="ae_roundtrip", n_sampl
                 x0 = b.content  # [C, H, W]
                 logsnr = b.logsnr if b.logsnr is not None else torch.zeros(1, *x0.shape[-2:], device=x0.device)
 
-                # Convert to model dtype
-                x0_cast = x0.to(model_dtype)
-                logsnr_cast = logsnr.to(model_dtype)
-
                 try:
-                    # First pass: encode then decode
-                    z1, grid_shape = patch_emb(x0_cast, logsnr_cast)
-                    recon1_full = patch_unemb(z1, grid_shape)
-                    recon1 = recon1_full[:3]  # RGB only
+                    # Add batch dimension for AE forward
+                    x0_batch = x0.unsqueeze(0)  # [1, C, H, W]
+                    logsnr_batch = logsnr.unsqueeze(0)  # [1, 1, H, W]
+
+                    # Compute grid shape
+                    p = sparse_ae.patch_size
+                    grid_shape = (x0.shape[1] // p, x0.shape[2] // p)
+
+                    # Build masks (like train_autoembed does)
+                    encoder_masks, decoder_masks = sparse_ae.build_masks(grid_shape, device)
+
+                    # First pass: DIRECT AE forward (no projection bottleneck)
+                    output1 = sparse_ae(
+                        x0_batch,
+                        encoder_masks=encoder_masks,
+                        decoder_masks=decoder_masks,
+                        grid_shape=grid_shape
+                    )
+                    recon1 = output1['recon'][0]  # [C, H, W]
 
                     # Round-trip: encode the reconstruction, decode again
-                    # Use same logsnr (or could use predicted logsnr from recon1_full[-1:])
-                    z2, grid_shape2 = patch_emb(recon1, logsnr_cast)
-                    recon2_full = patch_unemb(z2, grid_shape2)
-                    recon2 = recon2_full[:3]
+                    recon1_batch = recon1.unsqueeze(0)
+                    output2 = sparse_ae(
+                        recon1_batch,
+                        encoder_masks=encoder_masks,
+                        decoder_masks=decoder_masks,
+                        grid_shape=grid_shape
+                    )
+                    recon2 = output2['recon'][0]  # [C, H, W]
 
                     samples.append({
-                        'input': x0.float(),  # Keep original in float32
-                        'recon1': recon1.float(),  # Convert to float32 for plotting
+                        'input': x0.float(),  # Keep original in float32 for plotting
+                        'recon1': recon1.float(),
                         'recon2': recon2.float(),
                         'source': getattr(b, 'source', split_name)
                     })

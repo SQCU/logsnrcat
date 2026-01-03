@@ -2,7 +2,7 @@
 from .config import ExperimentConfig, load_config
 from .model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, ContextBlock, PageTable
 #from .data_iterator import CompositeIterator
-from .train import train_autoembed, train_denoise
+from .train import train_autoembed, train_denoise, train_latent_diffusion
 #from .sample import sample_viz_dset, spatial_euler_solver
 from .plotting import ExperimentLogger, plot_multimetric_analysis, plot_dset_reconstruction
 from .bucket_manager import BucketManager
