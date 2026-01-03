@@ -1,4 +1,6 @@
 # plotting.py
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend - prevents tkinter threading crash
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

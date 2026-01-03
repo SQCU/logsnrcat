@@ -193,6 +193,38 @@ class SwiGLUEncoder(nn.Module):
 
         return sparse_codes, gate_weights
 
+    def forward_with_prequant(
+        self,
+        patches: torch.Tensor,
+        grid_shape: Tuple[int, int],
+        block_masks: Optional[List] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass that also returns pre-quantization logits for latent diffusion.
+
+        Args:
+            patches: [B, N, patch_dim]
+            grid_shape: (GH, GW) for attention masks
+            block_masks: optional pre-built masks
+
+        Returns:
+            sparse_codes: [B, N, code_dim] sparse binary codes in {-1, +1, 0}
+            gate_weights: [B, N, code_dim] soft weights for logging
+            pre_quant: [B, N, code_dim] continuous logits before FSQ quantization
+        """
+        h = self.input_proj(patches)
+        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
+        logits = self.code_proj(h)
+
+        # Binary FSQ: sigmoid -> threshold -> STE -> normalize to [-1, +1]
+        codes = self.fsq(logits)
+        codes = codes * 2 - 1  # {0, 1} -> {-1, +1}
+
+        # Per-patch sparsity: each patch independently selects top-k dims
+        sparse_codes, gate_weights = self.sparsity(codes)
+
+        return sparse_codes, gate_weights, logits
+
 
 class SwiGLUDecoder(nn.Module):
     """
@@ -503,6 +535,121 @@ class SwiGLUFSQAutoencoder(nn.Module):
 
         return self.unpatchify(cumulative_recon, grid_shape)
 
+    def encode_with_prequant(
+        self,
+        images: torch.Tensor,
+        logsnr_map: Optional[torch.Tensor] = None,  # Interface compat, ignored
+        grid_shape: Optional[Tuple[int, int]] = None,
+        encoder_masks: Optional[List] = None,
+        decoder_masks: Optional[List] = None
+    ) -> Tuple[List[torch.Tensor], None, List[torch.Tensor]]:
+        """
+        Encode images to codes AND return pre-quantization values for latent diffusion.
+
+        The pre_quant values are the continuous logits before FSQ quantization.
+        These are used as the diffusion target in latent space.
+
+        NOTE: logsnr_map is accepted for interface compatibility but ignored.
+
+        Args:
+            images: [B, C, H, W] input images
+            logsnr_map: IGNORED - for interface compatibility
+            grid_shape: optional (GH, GW)
+            encoder_masks: optional pre-built encoder masks
+            decoder_masks: optional pre-built decoder masks
+
+        Returns:
+            codes_list: list of [B, N, code_dim] sparse codes per level
+            level_logsnrs: None (no logsnr prediction in this variant)
+            prequant_list: list of [B, N, code_dim] pre-quantization logits per level
+        """
+        B = images.shape[0]
+        p = self.patch_size
+
+        if grid_shape is None:
+            H, W = images.shape[2], images.shape[3]
+            grid_shape = (H // p, W // p)
+
+        device = images.device
+
+        if encoder_masks is None or decoder_masks is None:
+            encoder_masks, decoder_masks = self.build_masks(grid_shape, device)
+
+        patches = self.patchify(images, grid_shape)
+
+        codes_list = []
+        prequant_list = []
+        cumulative_recon = torch.zeros_like(patches)
+
+        for level in range(self.n_levels):
+            if level > 0:
+                residual = (patches - cumulative_recon.detach()) * self.residual_scale
+            else:
+                residual = patches
+
+            # Encode with pre-quant values
+            sparse_codes, _, pre_quant = self.encoders[level].forward_with_prequant(
+                residual, grid_shape, encoder_masks
+            )
+            codes_list.append(sparse_codes)
+            prequant_list.append(pre_quant)
+
+            # Decode to compute next residual
+            decoded = self.decoders[level](sparse_codes, grid_shape, decoder_masks)
+            if level > 0:
+                decoded = decoded / self.residual_scale
+            cumulative_recon = cumulative_recon + decoded
+
+        return codes_list, None, prequant_list
+
+    def quantize_and_decode(
+        self,
+        prequant_list: List[torch.Tensor],
+        grid_shape: Tuple[int, int],
+        decoder_masks: Optional[List] = None
+    ) -> torch.Tensor:
+        """
+        Quantize pre-quant values and decode to image.
+
+        Used in latent diffusion to convert predicted pre_quant values back to images.
+        Applies FSQ quantization and sparsity masking before decoding.
+
+        Args:
+            prequant_list: list of [B, N, code_dim] continuous logits per level
+            grid_shape: (GH, GW) grid dimensions
+            decoder_masks: optional pre-built decoder masks
+
+        Returns:
+            recon: [B, C, H, W] reconstructed image
+        """
+        device = prequant_list[0].device
+
+        if decoder_masks is None:
+            decoder_masks = self.decoders[0].transformer.build_masks(grid_shape, device)
+
+        cumulative_recon = None
+
+        for level, pre_quant in enumerate(prequant_list):
+            # Apply FSQ quantization
+            codes = self.encoders[level].fsq(pre_quant)
+            codes = codes * 2 - 1  # {0, 1} -> {-1, +1}
+
+            # Apply per-patch sparsity
+            sparse_codes, _ = self.encoders[level].sparsity(codes)
+
+            # Decode
+            decoded = self.decoders[level](sparse_codes, grid_shape, decoder_masks)
+
+            if level > 0:
+                decoded = decoded / self.residual_scale
+
+            if cumulative_recon is None:
+                cumulative_recon = decoded
+            else:
+                cumulative_recon = cumulative_recon + decoded
+
+        return self.unpatchify(cumulative_recon, grid_shape)
+
 
 # =============================================================================
 # Interface Wrappers for Integration with src/model.py
@@ -529,9 +676,14 @@ class SwiGLUPatchEmbedder(nn.Module):
         self.code_dim = ae.code_dim
         self.n_levels = ae.n_levels
 
-        # Project concatenated codes to embed_dim
+        # Project concatenated codes to embed_dim (for pixel-space diffusion)
         total_code_dim = ae.code_dim * ae.n_levels
         self.code_proj = nn.Linear(total_code_dim, embed_dim)
+
+        # Latent diffusion projections (for per-token code_dim input)
+        # These are used when diffusing in latent space with flattened level tokens
+        self.latent_code_proj = nn.Linear(ae.code_dim, embed_dim)
+        self.logsnr_proj = nn.Linear(1, embed_dim)
 
         # Mask cache
         self._mask_cache: Dict[Tuple[int, int], Tuple[List, List]] = {}
@@ -594,9 +746,14 @@ class SwiGLUPatchUnembedder(nn.Module):
         self.patch_size = ae.patch_size
         self.n_attn_layers = ae.n_layers
 
-        # Project from embed_dim back to codes
+        # Project from embed_dim back to codes (for pixel-space diffusion)
         total_code_dim = ae.code_dim * ae.n_levels
         self.code_unproj = nn.Linear(embedder.embed_dim, total_code_dim)
+
+        # Latent diffusion projections (for per-token code_dim output)
+        # These are used when diffusing in latent space with flattened level tokens
+        self.latent_code_unproj = nn.Linear(embedder.embed_dim, ae.code_dim)
+        self.logsnr_decoder = nn.Linear(embedder.embed_dim, 1)
 
         # Mask cache
         self._mask_cache: Dict[Tuple[int, int], List] = {}

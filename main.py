@@ -7,6 +7,11 @@ Usage:
     python main.py configs/multisnr_default.toml --mode factorized
     python main.py configs/multisnr_default.toml --steps 1000
 """
+# Force non-interactive matplotlib backend BEFORE any imports that might use pyplot
+# This prevents Tcl/Tk threading crashes when figures are GC'd from non-main thread
+import matplotlib
+matplotlib.use('Agg')
+
 import argparse
 import torch
 

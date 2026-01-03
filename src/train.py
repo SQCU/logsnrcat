@@ -293,11 +293,19 @@ def train_autoembed(components, config, iterator, logger=None):
     # Get loss function from config (stateless, config-driven)
     ae_loss_fn = get_ae_loss_fn(config)
     loss_type = sparse_ae_cfg['loss_type']
+    loss_schedule_cfg = sparse_ae_cfg.get('loss_schedule', {})
+    loss_schedule_enabled = isinstance(loss_schedule_cfg, dict) and loss_schedule_cfg.get('enabled', False)
 
     print(f"\n--- Training: Sparse AutoEncoder ---")
     print(f"    Levels: {sparse_ae.n_levels}, Code dim: {sparse_ae.code_dim}, "
           f"Sparsity k: {sparse_ae.k_per_patch}")
-    print(f"    Loss: {loss_type}")
+    if loss_schedule_enabled:
+        mse_start = loss_schedule_cfg.get('mse_start', 1.0)
+        bce_end = loss_schedule_cfg.get('bce_end', 0.9)
+        schedule_type = loss_schedule_cfg.get('schedule', 'linear')
+        print(f"    Loss: scheduled MSE→BCE ({schedule_type}), {mse_start:.0%} MSE → {bce_end:.0%} BCE")
+    else:
+        print(f"    Loss: {loss_type}")
 
     # Build AE module wrapper for optimizer
     # Wraps all AE-related parameters for unified optimizer handling
@@ -390,7 +398,8 @@ def train_autoembed(components, config, iterator, logger=None):
                 output = compute_ae_forward(sparse_ae, prepared)
 
                 # Stateless loss computation (pure reconstruction, no logsnr)
-                loss, stats = ae_loss_fn(output, prepared['images'])
+                # Pass step/total_steps for scheduled loss (ignored by non-scheduled losses)
+                loss, stats = ae_loss_fn(output, prepared['images'], step=i, total_steps=steps)
 
                 # Compute per-sample MSE for per-source tracking (no grad needed)
                 with torch.no_grad():
@@ -900,9 +909,10 @@ def train_latent_diffusion(
             super().__init__()
             self.sparse_ae = sparse_ae
             self.denoiser = main_model  # Main LDTformer as denoiser
-            self.code_proj = patch_emb.code_proj
+            # Use latent-specific projections (per-token, not concatenated)
+            self.latent_code_proj = patch_emb.latent_code_proj
             self.logsnr_proj = patch_emb.logsnr_proj
-            self.code_unproj = patch_unemb.code_unproj
+            self.latent_code_unproj = patch_unemb.latent_code_unproj
             self.logsnr_decoder = patch_unemb.logsnr_decoder
 
     latent_diff_module = LatentDiffusionModule(sparse_ae, model, patch_emb, patch_unemb)
@@ -1063,8 +1073,8 @@ def train_latent_diffusion(
                 target_v = alpha * noise - sigma * pre_quant_flat
 
                 # Project codes to model dim and add topology embedding
-                # Use model's code_proj for input projection
-                h = patch_emb.code_proj(noisy_codes)  # [B, N*L, model_dim]
+                # Use latent_code_proj for per-token (not concatenated) code projection
+                h = patch_emb.latent_code_proj(noisy_codes)  # [B, N*L, model_dim]
 
                 # Add logsnr conditioning
                 logsnr_features = patch_emb.logsnr_proj(logsnr_flat)  # [B, N*L, model_dim]
@@ -1078,8 +1088,8 @@ def train_latent_diffusion(
                     block_mask=latent_mask,
                 )
 
-                # Project back to code space
-                v_pred = patch_unemb.code_unproj(h)  # [B, N*L, code_dim]
+                # Project back to code space (per-token, not concatenated)
+                v_pred = patch_unemb.latent_code_unproj(h)  # [B, N*L, code_dim]
                 logsnr_pred = patch_unemb.logsnr_decoder(h)  # [B, N*L, 1]
 
                 # V-field loss in latent space
@@ -1145,7 +1155,9 @@ def train_latent_diffusion(
         if i % log_interval == 0:
             history.append({
                 'step': i,
+                'source': 'combined',  # Latent diffusion operates on mixed data
                 'type': 'latent_diff',
+                'loss': loss_v.item(),  # Primary loss for plotting consistency
                 'loss_v': loss_v.item(),
                 'loss_recon': loss_recon.item() if recon_weight > 0 else 0.0,
                 'loss_logsnr': loss_logsnr.item(),

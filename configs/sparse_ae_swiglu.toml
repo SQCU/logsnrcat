@@ -30,8 +30,8 @@ enabled = true
 n_kv_heads = 2         # 8 query heads / 2 kv heads = 4x sharing
 
 [training]
-ae_steps = 500
-steps = 0
+ae_steps = 1000
+steps = 1000
 lambda_coeff = 0.2
 mode = "naive"
 batch_size = 4
@@ -60,7 +60,7 @@ use_dedicated_stream = true
 # Sparse AE Configuration - SWIGLU VARIANT
 [training.sparse_ae]
 enabled = true
-latent_diffusion = false  # LatentDenoiser rejected - use main LDTformer for diffusion
+latent_diffusion = true  
 ae_type = "swiglu"     # <<< Changed: binary FSQ, per-patch sparsity, 2D RoPE
 n_levels = 6
 patch_size = 16
@@ -74,6 +74,18 @@ n_layers = 4
 # Loss function: cumulative_mse (reference impl), final_mse, or cumulative_mse_contrib
 loss_type = "final_mse"  # Reference uses final only, cumulative dilutes gradients by 1/n_levels
 
+# Loss schedule: lerp from MSE to BCE over training for sharper reconstructions
+# MSE early: smooth gradients for coarse structure
+# BCE late: pushes for sharp, committed predictions (helps checkerboards, sprites)
+[training.sparse_ae.loss_schedule]
+enabled = true
+mse_start = 1.0    # 100% MSE at start
+bce_start = 0.0    # 0% BCE at start
+mse_end = 0.1      # 10% MSE at end
+bce_end = 0.9      # 90% BCE at end
+schedule = "linear"  # "linear", "cosine", or "step"
+pct_switch = 0.8   # For "step" schedule: switch at this fraction
+
 # Attention configuration - sliding window for 3x3 neighborhood
 [training.sparse_ae.attention]
 mode = "sliding"       # <<< Changed: sliding window (3x3 neighborhood)
@@ -86,8 +98,8 @@ n_kv_heads = 2
 # Controls how AE codes are positioned in topology space for RnRoPE and SWA
 # Set diffusion_space = "latent" to enable latent-space diffusion with main LDTformer
 [training.sparse_ae.topology]
-diffusion_space = "pixel"        # "pixel" = patch embeddings, "latent" = AE codes
-include_level_dim = false        # Auto-enabled when diffusion_space = "latent"
+diffusion_space = "latent"        # "pixel" = patch embeddings, "latent" = AE codes
+include_level_dim = true        # Auto-enabled when diffusion_space = "latent"
 level_lambda = 0.5               # Cost of crossing levels: dist² += (lambda * level_dist)²
 level_scale = 1.0                # Scaling for level coords in RoPE frequencies
 vertical_attention_free = true   # Same-position cross-level attention always allowed

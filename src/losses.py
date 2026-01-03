@@ -125,6 +125,85 @@ def cumulative_mse_with_contribution(
 
 
 # =============================================================================
+# Scheduled MSE+BCE Loss
+# =============================================================================
+
+def scheduled_mse_bce_loss(
+    output: Dict[str, Any],
+    target: torch.Tensor,
+    step: int = 0,
+    total_steps: int = 1,
+    schedule_cfg: Optional[Dict[str, Any]] = None,
+    **kwargs
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Scheduled MSE+BCE loss that lerps from pure MSE to mostly BCE over training.
+
+    Early training: MSE provides smooth gradients for coarse structure.
+    Late training: BCE pushes for sharp, committed predictions.
+
+    Args:
+        output: Dict with 'recon' ([B, C, H, W]) in [0, 1]
+        target: [B, C, H, W] in [0, 1]
+        step: Current training step
+        total_steps: Total training steps
+        schedule_cfg: Dict with mse_start, mse_end, bce_start, bce_end, schedule type
+    """
+    if schedule_cfg is None:
+        schedule_cfg = {}
+
+    mse_start = schedule_cfg.get('mse_start', 1.0)
+    mse_end = schedule_cfg.get('mse_end', 0.1)
+    bce_start = schedule_cfg.get('bce_start', 0.0)
+    bce_end = schedule_cfg.get('bce_end', 0.9)
+    schedule_type = schedule_cfg.get('schedule', 'linear')
+    pct_switch = schedule_cfg.get('pct_switch', 0.8)
+
+    # Compute progress [0, 1]
+    progress = min(step / max(total_steps, 1), 1.0)
+
+    # Compute lerp factor based on schedule type
+    if schedule_type == 'linear':
+        t = progress
+    elif schedule_type == 'cosine':
+        import math
+        t = 0.5 * (1 - math.cos(math.pi * progress))
+    elif schedule_type == 'step':
+        t = 1.0 if progress >= pct_switch else 0.0
+    else:
+        t = progress  # fallback to linear
+
+    # Lerp weights
+    mse_weight = mse_start + t * (mse_end - mse_start)
+    bce_weight = bce_start + t * (bce_end - bce_start)
+
+    recon = output['recon']
+
+    # MSE loss
+    mse_loss = F.mse_loss(recon, target)
+
+    # BCE loss - must compute outside autocast (not autocast-safe)
+    # Clamp to avoid log(0)
+    with torch.amp.autocast(device_type='cuda', enabled=False):
+        recon_clamped = recon.float().clamp(1e-7, 1 - 1e-7)
+        target_float = target.float()
+        bce_loss = F.binary_cross_entropy(recon_clamped, target_float)
+
+    # Combined loss
+    loss = mse_weight * mse_loss + bce_weight * bce_loss
+
+    stats = {
+        'recon_loss': loss.detach(),
+        'mse_loss': mse_loss.detach(),
+        'bce_loss': bce_loss.detach(),
+        'mse_weight': mse_weight,
+        'bce_weight': bce_weight,
+        'sparsity': output['sparsity'].detach()
+    }
+    return loss, stats
+
+
+# =============================================================================
 # Denoising Loss Functions
 # =============================================================================
 
@@ -224,13 +303,36 @@ def get_ae_loss_fn(config: Dict[str, Any]) -> Callable:
     """
     Get AE loss function from config.
 
-    Looks at config['training']['sparse_ae']['loss_type'].
+    Looks at config['training']['sparse_ae']['loss_type'] and ['loss_schedule'].
+
+    If loss_schedule.enabled is True, returns a scheduled MSE+BCE loss function
+    that lerps from pure MSE to mostly BCE over training. The returned function
+    accepts step= and total_steps= kwargs.
 
     NOTE: FSQ autoencoder is a pure image compression network.
     logsnr prediction is the LDTformer denoiser's job, not the AE's.
     """
-    loss_type = config['training']['sparse_ae']['loss_type']
+    sparse_ae_cfg = config['training']['sparse_ae']
+    loss_type = sparse_ae_cfg['loss_type']
 
+    # Check if loss schedule is enabled
+    loss_schedule_cfg = sparse_ae_cfg.get('loss_schedule', {})
+    if isinstance(loss_schedule_cfg, dict) and loss_schedule_cfg.get('enabled', False):
+        # Return scheduled MSE+BCE loss with captured config
+        def scheduled_loss_wrapper(output, target, **kwargs):
+            # Extract step/total_steps before passing remaining kwargs
+            step = kwargs.pop('step', 0)
+            total_steps = kwargs.pop('total_steps', 1)
+            return scheduled_mse_bce_loss(
+                output, target,
+                step=step,
+                total_steps=total_steps,
+                schedule_cfg=loss_schedule_cfg,
+                **kwargs
+            )
+        return scheduled_loss_wrapper
+
+    # Fallback to standard loss registry
     if loss_type not in AE_LOSS_REGISTRY:
         raise ValueError(f"Unknown AE loss: {loss_type}. Available: {list(AE_LOSS_REGISTRY.keys())}")
 

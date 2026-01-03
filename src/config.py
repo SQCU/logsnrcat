@@ -295,6 +295,24 @@ class TopologyGeometryConfig(BaseModel):
     distance_metric: Literal["euclidean", "product_geodesic"] = "euclidean"
 
 
+class AELossScheduleConfig(BaseModel):
+    """Loss schedule for AE training - lerp from MSE to BCE over training.
+
+    Early training uses MSE for smooth gradients and coarse structure learning.
+    Late training shifts toward BCE to push for sharp, committed predictions.
+    """
+    enabled: bool = False
+    # Start weights (beginning of training)
+    mse_start: float = 1.0
+    bce_start: float = 0.0
+    # End weights (end of training)
+    mse_end: float = 0.1
+    bce_end: float = 0.9
+    # Schedule shape: "linear", "cosine", or "step" (switch at pct_switch)
+    schedule: Literal["linear", "cosine", "step"] = "linear"
+    pct_switch: float = 0.8  # For "step" schedule: switch at this fraction of training
+
+
 class SparseAEConfig(BaseModel):
     """Configuration for kmaze_ae sparse hierarchical autoencoder."""
     enabled: bool = False
@@ -312,6 +330,8 @@ class SparseAEConfig(BaseModel):
     # final_mse: MSE only on final reconstruction
     # cumulative_mse_contrib: MSE + penalty for levels that contribute too little
     loss_type: Literal["cumulative_mse", "final_mse", "cumulative_mse_contrib"] = "cumulative_mse"
+    # Loss schedule: lerp from MSE to BCE over training for sharper reconstructions
+    loss_schedule: AELossScheduleConfig = Field(default_factory=AELossScheduleConfig)
     n_layers: int = 4  # Transformer layers per encoder/decoder
     attention: AEAttentionConfig = Field(default_factory=AEAttentionConfig)
     # Latent diffusion training mode (uses [training].steps for step count)
