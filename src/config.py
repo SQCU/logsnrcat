@@ -313,6 +313,27 @@ class AELossScheduleConfig(BaseModel):
     pct_switch: float = 0.8  # For "step" schedule: switch at this fraction of training
 
 
+class DiffusionLossScheduleConfig(BaseModel):
+    """Loss schedule for diffusion (v-field) training - lerp from MSE to partial BCE.
+
+    Tests whether BCE gradients on sigmoid(v) find better v-fields than MSE.
+    Mild intervention: start with 100% MSE, lerp to ~90% MSE / 10% BCE.
+
+    For v-field targets: applies sigmoid(v_pred) and sigmoid(v_target) before BCE,
+    treating the velocity field as logits.
+    """
+    enabled: bool = False
+    # Start weights (beginning of diffusion training)
+    mse_start: float = 1.0
+    bce_start: float = 0.0
+    # End weights (end of diffusion training)
+    mse_end: float = 0.9
+    bce_end: float = 0.1
+    # Schedule shape: "linear", "cosine", or "step"
+    schedule: Literal["linear", "cosine", "step"] = "linear"
+    pct_switch: float = 0.8  # For "step" schedule
+
+
 class SparseAEConfig(BaseModel):
     """Configuration for kmaze_ae sparse hierarchical autoencoder."""
     enabled: bool = False
@@ -332,6 +353,8 @@ class SparseAEConfig(BaseModel):
     loss_type: Literal["cumulative_mse", "final_mse", "cumulative_mse_contrib"] = "cumulative_mse"
     # Loss schedule: lerp from MSE to BCE over training for sharper reconstructions
     loss_schedule: AELossScheduleConfig = Field(default_factory=AELossScheduleConfig)
+    # Diffusion (v-field) loss schedule: lerp from MSE to partial BCE during diffusion training
+    diffusion_loss_schedule: DiffusionLossScheduleConfig = Field(default_factory=DiffusionLossScheduleConfig)
     n_layers: int = 4  # Transformer layers per encoder/decoder
     attention: AEAttentionConfig = Field(default_factory=AEAttentionConfig)
     # Latent diffusion training mode (uses [training].steps for step count)

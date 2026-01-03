@@ -126,11 +126,16 @@ class SpanEmbedder:
         """Get or build cached mask for a given grid shape."""
         if grid_shape not in self._mask_cache:
             # Build mask using the encoder mask infrastructure
+            # Provide defaults for optional keys (full mode doesn't use window_size/n_registers)
+            mode = self.attn_config.get('mode', 'full')
+            # Map config mode names to build_encoder_mask mode names
+            if mode == 'sliding':
+                mode = 'local'
             self._mask_cache[grid_shape] = build_encoder_mask(
                 grid_shape=grid_shape,
-                window_size=self.attn_config['window_size'],
-                n_registers=self.attn_config['n_global_tokens'],
-                mode=self.attn_config['mode'],
+                window_size=self.attn_config.get('window_size', 4.0),
+                n_registers=self.attn_config.get('n_global_tokens', 0),
+                mode=mode,
                 device=device
             )
         return self._mask_cache[grid_shape]
@@ -332,11 +337,16 @@ class SpanUnembedder:
     ) -> Optional[BlockMask]:
         """Get or build cached mask for a given grid shape."""
         if grid_shape not in self._mask_cache:
+            # Provide defaults for optional keys (full mode doesn't use window_size/n_registers)
+            mode = self.attn_config.get('mode', 'full')
+            # Map config mode names to build_encoder_mask mode names
+            if mode == 'sliding':
+                mode = 'local'
             self._mask_cache[grid_shape] = build_encoder_mask(
                 grid_shape=grid_shape,
-                window_size=self.attn_config['window_size'],
-                n_registers=self.attn_config['n_global_tokens'],
-                mode=self.attn_config['mode'],
+                window_size=self.attn_config.get('window_size', 4.0),
+                n_registers=self.attn_config.get('n_global_tokens', 0),
+                mode=mode,
                 device=device
             )
         return self._mask_cache[grid_shape]

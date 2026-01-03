@@ -27,7 +27,7 @@ from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, PageTable
 from src.data_iterator import CompositeIterator
 from src.data_functional import get_tokenizer
 from src.train import train_autoembed, train_denoise, train_latent_diffusion
-from src.plotting import plot_multimetric_analysis, plot_ae_roundtrip, ExperimentLogger
+from src.plotting import plot_multimetric_analysis, plot_ae_roundtrip, plot_loss_schedule_analysis, ExperimentLogger
 import src.sample as sampler
 
 
@@ -99,8 +99,22 @@ def build_components(cfg, device):
             print("       (CUDA graph capture provides equivalent optimization)")
 
     # Wrap embedders in SpanEmbedder/SpanUnembedder
-    span_emb = SpanEmbedder(text_embed, patch_embedder)
-    span_unemb = SpanUnembedder(text_head, patch_unembedder)
+    # For latent diffusion (SwiGLU AE), the embedder has internal attention that needs
+    # proper mask config for batched processing during sampling/diagnostics
+    sparse_ae_cfg = cfg['training'].get('sparse_ae', {})
+    if sparse_ae_cfg.get('enabled', False):
+        # Use sparse AE's attention config for embedder mask building
+        emb_attn_config = sparse_ae_cfg.get('attention', {
+            'mode': 'sliding',
+            'window_size': 2,
+            'n_global_tokens': 0
+        })
+    else:
+        # Pixel diffusion: embedder has no attention, use full (won't be used)
+        emb_attn_config = {'mode': 'full', 'window_size': 0, 'n_global_tokens': 0}
+
+    span_emb = SpanEmbedder(text_embed, patch_embedder, attn_config=emb_attn_config)
+    span_unemb = SpanUnembedder(text_head, patch_unembedder, attn_config=emb_attn_config)
 
     # Page Table
     pt_cfg = cfg['page_table']
@@ -174,6 +188,13 @@ def main():
         # Save dataframe BEFORE plotting (crash safety)
         logger.save_dataframe(df_ae, f"history_ae_{cfg['training']['mode']}")
         plot_multimetric_analysis(df_ae, logger, f"multimetric_ae_{cfg['training']['mode']}")
+
+        # Loss schedule analysis (MSE/BCE compatibility) if scheduled loss was used
+        loss_schedule_cfg = cfg['training']['sparse_ae'].get('loss_schedule', {})
+        if isinstance(loss_schedule_cfg, dict) and loss_schedule_cfg.get('enabled', False):
+            print("Plotting MSE/BCE loss schedule analysis...")
+            plot_loss_schedule_analysis(df_ae, logger, f"loss_schedule_ae_{cfg['training']['mode']}")
+
         # AE reconstruction quality with round-trip analysis
         print("Plotting AE round-trip reconstruction...")
         for res in cfg['sampling']['resolutions'][:2]:

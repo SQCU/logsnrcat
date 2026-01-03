@@ -694,6 +694,33 @@ class SwiGLUPatchEmbedder(nn.Module):
             self._mask_cache[grid_shape] = self.ae.build_masks(grid_shape, device)
         return self._mask_cache[grid_shape]
 
+    def _pad_and_patch(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract patches for grid_shape computation (interface compatibility).
+
+        Unlike ContextualPatchEmbedder, SwiGLU uses simple non-overlapping patches
+        with no context window, so no padding is needed.
+
+        Args:
+            x: [C, H, W] or [B, C, H, W] input tensor
+        Returns:
+            patches: [C, GH, GW, P, P] or [B, C, GH, GW, P, P]
+        """
+        p = self.ae.patch_size
+        is_batched = x.dim() == 4
+
+        if is_batched:
+            B, C, H, W = x.shape
+            GH, GW = H // p, W // p
+            # Reshape to [B, C, GH, P, GW, P] then permute to [B, C, GH, GW, P, P]
+            patches = x.view(B, C, GH, p, GW, p).permute(0, 1, 2, 4, 3, 5)
+        else:
+            C, H, W = x.shape
+            GH, GW = H // p, W // p
+            # Reshape to [C, GH, P, GW, P] then permute to [C, GH, GW, P, P]
+            patches = x.view(C, GH, p, GW, p).permute(0, 1, 3, 2, 4)
+
+        return patches
+
     def forward(
         self,
         x: torch.Tensor,
@@ -754,6 +781,10 @@ class SwiGLUPatchUnembedder(nn.Module):
         # These are used when diffusing in latent space with flattened level tokens
         self.latent_code_unproj = nn.Linear(embedder.embed_dim, ae.code_dim)
         self.logsnr_decoder = nn.Linear(embedder.embed_dim, 1)
+        # Initialize logsnr output near zero for stability
+        with torch.no_grad():
+            self.logsnr_decoder.weight.zero_()
+            self.logsnr_decoder.bias.zero_()
 
         # Mask cache
         self._mask_cache: Dict[Tuple[int, int], List] = {}
@@ -777,7 +808,7 @@ class SwiGLUPatchUnembedder(nn.Module):
             block_mask: IGNORED
 
         Returns:
-            recon: [C, H, W] or [B, C, H, W] reconstructed images
+            recon: [C+1, H, W] or [B, C+1, H, W] - RGB + logsnr channel
         """
         single = z.dim() == 2
         if single:
@@ -787,6 +818,7 @@ class SwiGLUPatchUnembedder(nn.Module):
         GH, GW = shape if len(shape) == 2 else (1, L)
         grid_shape = (GH, GW)
         device = z.device
+        P = self.patch_size
 
         # Project to codes
         codes_cat = self.code_unproj(z)  # [B, L, total_code_dim]
@@ -796,8 +828,17 @@ class SwiGLUPatchUnembedder(nn.Module):
         codes_list = list(codes_cat.split(code_dim, dim=-1))
 
         decoder_masks = self._get_masks(grid_shape, device)
-        recon = self.ae.decode(codes_list, grid_shape, decoder_masks)
+        recon = self.ae.decode(codes_list, grid_shape, decoder_masks)  # [B, C, H, W]
+
+        # Decode logsnr from embeddings and reshape to spatial
+        logsnr_per_patch = self.logsnr_decoder(z)  # [B, L, 1]
+        logsnr_per_patch = logsnr_per_patch.reshape(B, GH, GW, 1).permute(0, 3, 1, 2)  # [B, 1, GH, GW]
+        # Upsample to match pixel resolution
+        logsnr_spatial = logsnr_per_patch.repeat_interleave(P, dim=2).repeat_interleave(P, dim=3)  # [B, 1, H, W]
+
+        # Concat RGB + logsnr to match expected [C+1, H, W] interface
+        recon_with_logsnr = torch.cat([recon, logsnr_spatial], dim=1)  # [B, C+1, H, W]
 
         if single:
-            return recon.squeeze(0)
-        return recon
+            return recon_with_logsnr.squeeze(0)
+        return recon_with_logsnr

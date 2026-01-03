@@ -24,6 +24,7 @@ from .optim_utils import (
     build_optimizer_for_role, print_role_optimizer_summary,
     collect_fp8_modules, FP8Muon, FP8SGD, FP8AdamW, FP8Linear,
 )
+from .losses import scheduled_mse_bce_velocity_loss
 
 # src/train.py - Add near top
 
@@ -460,7 +461,7 @@ def train_autoembed(components, config, iterator, logger=None):
                 if data['count'] > 0:
                     src_loss = data['loss_sum'] / data['count']
                     src_sparsity = data['sparsity_sum'] / data['count']
-                    history.append({
+                    entry = {
                         'step': i,
                         'source': src,
                         'type': 'latent',
@@ -468,7 +469,16 @@ def train_autoembed(components, config, iterator, logger=None):
                         'resolution': curr_res * curr_res,
                         'sparsity': src_sparsity,
                         'loss_logsnr': loss_stats_accum.get('logsnr_loss', 0.0)
-                    })
+                    }
+                    # Add MSE/BCE loss schedule fields when enabled
+                    if loss_schedule_enabled:
+                        entry['mse_loss'] = loss_stats_accum.get('mse_loss', 0.0)
+                        entry['bce_loss'] = loss_stats_accum.get('bce_loss', 0.0)
+                        entry['mse_weight'] = loss_stats_accum.get('mse_weight', 1.0)
+                        entry['bce_weight'] = loss_stats_accum.get('bce_weight', 0.0)
+                        # Compute lerp progress for analysis
+                        entry['lerp_t'] = i / max(steps - 1, 1)
+                    history.append(entry)
 
             # Progress bar shows batch-averaged loss
             loss_val = loss_stats_accum.get('recon_loss', total_loss.item())
@@ -897,6 +907,24 @@ def train_latent_diffusion(
     recon_weight = sparse_ae_cfg.get('ae_loss_weight', 0.1)
     logsnr_weight = sparse_ae_cfg.get('logsnr_loss_weight', 0.1)
 
+    # Diffusion loss schedule config (MSE -> partial BCE for v-field)
+    diffusion_loss_schedule = sparse_ae_cfg.get('diffusion_loss_schedule', {})
+    use_scheduled_v_loss = diffusion_loss_schedule.get('enabled', False)
+    if use_scheduled_v_loss:
+        print(f"\n--- Diffusion Loss Schedule ENABLED ---")
+        print(f"    V-field MSE: {diffusion_loss_schedule.get('mse_start', 1.0)} -> {diffusion_loss_schedule.get('mse_end', 0.9)}")
+        print(f"    V-field BCE: {diffusion_loss_schedule.get('bce_start', 0.0)} -> {diffusion_loss_schedule.get('bce_end', 0.1)}")
+
+    # AE loss schedule config (pinned at END values for reconstruction during diffusion)
+    ae_loss_schedule = sparse_ae_cfg.get('loss_schedule', {})
+    use_scheduled_recon_loss = ae_loss_schedule.get('enabled', False)
+    if use_scheduled_recon_loss:
+        # Pin at end values (warmup already lerped through the schedule)
+        recon_mse_weight = ae_loss_schedule.get('mse_end', 0.1)
+        recon_bce_weight = ae_loss_schedule.get('bce_end', 0.9)
+        print(f"    Recon MSE: {recon_mse_weight:.2f} (pinned)")
+        print(f"    Recon BCE: {recon_bce_weight:.2f} (pinned)")
+
     print(f"\n--- Training: Latent Diffusion (Main LDTformer) ---")
     print(f"    Steps: {steps}, n_levels: {n_levels}, code_dim: {code_dim}")
     print(f"    Level lambda: {level_lambda}, vertical_free: {vertical_free}")
@@ -1004,6 +1032,8 @@ def train_latent_diffusion(
             loss_v_accum = torch.tensor(0.0, device=device)
             loss_recon_accum = torch.tensor(0.0, device=device)
             loss_logsnr_accum = torch.tensor(0.0, device=device)
+            last_v_stats = None  # Track v-field stats from last group for logging
+            last_recon_stats = None  # Track recon stats from last group for logging
             n_latent = 0
 
             for grid_shape, group in latent_groups.items():
@@ -1093,8 +1123,19 @@ def train_latent_diffusion(
                 logsnr_pred = patch_unemb.logsnr_decoder(h)  # [B, N*L, 1]
 
                 # V-field loss in latent space
-                sq_err_v = (v_pred - target_v) ** 2
-                loss_v = sq_err_v.mean()
+                if use_scheduled_v_loss:
+                    loss_v, v_stats = scheduled_mse_bce_velocity_loss(
+                        v_pred, target_v,
+                        step=i,
+                        total_steps=steps,
+                        schedule_cfg=diffusion_loss_schedule,
+                        variance_tracker=variance_tracker,
+                        logsnr_map=logsnr_flat
+                    )
+                    last_v_stats = v_stats  # Track for logging
+                else:
+                    sq_err_v = (v_pred - target_v) ** 2
+                    loss_v = sq_err_v.mean()
                 loss_v_accum = loss_v_accum + loss_v * batch_size
 
                 # === RECONSTRUCTION: Unflatten, re-quantize and decode ===
@@ -1113,8 +1154,24 @@ def train_latent_diffusion(
                         prequant_pred_list, grid_shape, decoder_masks
                     )
 
-                    # Reconstruction loss vs original image
-                    recon_loss = F.mse_loss(cumulative_recon, imgs)
+                    # Reconstruction loss vs original image (scheduled MSE/BCE if enabled)
+                    if use_scheduled_recon_loss:
+                        recon_mse = F.mse_loss(cumulative_recon, imgs)
+                        # BCE requires values in (0, 1) - clamp for safety
+                        with torch.amp.autocast(device_type='cuda', enabled=False):
+                            recon_clamped = cumulative_recon.float().clamp(1e-7, 1 - 1e-7)
+                            imgs_clamped = imgs.float().clamp(1e-7, 1 - 1e-7)
+                            recon_bce = F.binary_cross_entropy(recon_clamped, imgs_clamped)
+                        recon_loss = recon_mse_weight * recon_mse + recon_bce_weight * recon_bce
+                        last_recon_stats = {
+                            'mse_loss': recon_mse.detach(),
+                            'bce_loss': recon_bce.detach(),
+                            'mse_weight': recon_mse_weight,
+                            'bce_weight': recon_bce_weight
+                        }
+                    else:
+                        recon_loss = F.mse_loss(cumulative_recon, imgs)
+                        last_recon_stats = None
                     loss_recon_accum = loss_recon_accum + recon_loss * batch_size
 
                 # LogSNR prediction loss
@@ -1153,21 +1210,44 @@ def train_latent_diffusion(
 
         # Logging
         if i % log_interval == 0:
-            history.append({
+            # Compute mean logsnr for SNR binning plots (use middle of schedule as proxy)
+            mean_logsnr = (config['training']['schedule_bounds'][0] + config['training']['schedule_bounds'][1]) / 2
+            entry = {
                 'step': i,
-                'source': 'combined',  # Latent diffusion operates on mixed data
-                'type': 'latent_diff',
+                'source': 'latent_diff',  # Distinct source for latent diffusion
+                'type': 'latent',  # Must be 'latent' for plot_multimetric_analysis compatibility
                 'loss': loss_v.item(),  # Primary loss for plotting consistency
+                'logsnr': mean_logsnr,  # Required for SNR binning plots
                 'loss_v': loss_v.item(),
                 'loss_recon': loss_recon.item() if recon_weight > 0 else 0.0,
                 'loss_logsnr': loss_logsnr.item(),
                 'loss_total': total_loss.item(),
                 'resolution': curr_res * curr_res
-            })
+            }
+            # Add v-field BCE schedule stats if enabled
+            if use_scheduled_v_loss and last_v_stats is not None:
+                # Use same column names as train_autoembed for plotting compatibility
+                entry['mse_loss'] = float(last_v_stats['mse_loss'])
+                entry['bce_loss'] = float(last_v_stats['bce_loss'])
+                entry['mse_weight'] = last_v_stats['mse_weight']
+                entry['bce_weight'] = last_v_stats['bce_weight']
+                entry['lerp_t'] = i / max(steps - 1, 1)
+            # Add recon BCE schedule stats if enabled (pinned at AE end values)
+            if use_scheduled_recon_loss and last_recon_stats is not None:
+                entry['recon_mse_loss'] = float(last_recon_stats['mse_loss'])
+                entry['recon_bce_loss'] = float(last_recon_stats['bce_loss'])
+                entry['recon_mse_weight'] = last_recon_stats['mse_weight']
+                entry['recon_bce_weight'] = last_recon_stats['bce_weight']
+            history.append(entry)
 
-            pbar.set_postfix({
+            postfix = {
                 'v': f'{loss_v.item():.4f}',
                 'rec': f'{loss_recon.item():.4f}' if recon_weight > 0 else 'N/A'
-            })
+            }
+            if use_scheduled_v_loss and last_v_stats is not None:
+                postfix['v_bce'] = f'{last_v_stats["bce_weight"]:.2f}'
+            if use_scheduled_recon_loss and last_recon_stats is not None:
+                postfix['r_bce'] = f'{last_recon_stats["bce_weight"]:.2f}'
+            pbar.set_postfix(postfix)
 
     return pd.DataFrame(history)

@@ -204,6 +204,102 @@ def scheduled_mse_bce_loss(
 
 
 # =============================================================================
+# Scheduled MSE+BCE Velocity Loss (for diffusion v-field training)
+# =============================================================================
+
+def scheduled_mse_bce_velocity_loss(
+    v_pred: torch.Tensor,
+    v_target: torch.Tensor,
+    step: int = 0,
+    total_steps: int = 1,
+    schedule_cfg: Optional[Dict[str, Any]] = None,
+    variance_tracker=None,
+    **kwargs
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Scheduled MSE+BCE loss for v-field prediction.
+
+    Unlike image reconstruction where targets are in [0,1], v-field targets
+    are continuous (unbounded). We apply sigmoid to both pred and target
+    before BCE, treating the v-field as logits.
+
+    This tests whether BCE gradients on sigmoid(v) find better v-fields than MSE.
+
+    Args:
+        v_pred: [B, L, D] or [B, C, H, W] predicted velocity field
+        v_target: Same shape as v_pred, target velocity field
+        step: Current training step
+        total_steps: Total training steps
+        schedule_cfg: Dict with mse_start, mse_end, bce_start, bce_end, schedule type
+        variance_tracker: Optional for adaptive weighting (applied to MSE component)
+    """
+    if schedule_cfg is None:
+        schedule_cfg = {}
+
+    mse_start = schedule_cfg.get('mse_start', 1.0)
+    mse_end = schedule_cfg.get('mse_end', 0.9)
+    bce_start = schedule_cfg.get('bce_start', 0.0)
+    bce_end = schedule_cfg.get('bce_end', 0.1)
+    schedule_type = schedule_cfg.get('schedule', 'linear')
+    pct_switch = schedule_cfg.get('pct_switch', 0.8)
+
+    # Compute progress [0, 1]
+    progress = min(step / max(total_steps, 1), 1.0)
+
+    # Compute lerp factor based on schedule type
+    if schedule_type == 'linear':
+        t = progress
+    elif schedule_type == 'cosine':
+        import math
+        t = 0.5 * (1 - math.cos(math.pi * progress))
+    elif schedule_type == 'step':
+        t = 1.0 if progress >= pct_switch else 0.0
+    else:
+        t = progress  # fallback to linear
+
+    # Lerp weights
+    mse_weight = mse_start + t * (mse_end - mse_start)
+    bce_weight = bce_start + t * (bce_end - bce_start)
+
+    # MSE loss (with optional variance tracking)
+    sq_err = (v_pred - v_target) ** 2
+    if variance_tracker is not None:
+        # Need logsnr_map for variance tracker - get from kwargs if provided
+        logsnr_map = kwargs.get('logsnr_map')
+        if logsnr_map is not None:
+            variance_tracker.update(logsnr_map, sq_err)
+            weights = variance_tracker.get_weight_map(logsnr_map, sq_err.shape)
+            mse_loss = (sq_err * weights).mean()
+        else:
+            mse_loss = sq_err.mean()
+    else:
+        mse_loss = sq_err.mean()
+
+    # BCE loss - apply sigmoid to treat v as logits
+    # Must compute outside autocast for numerical stability
+    with torch.amp.autocast(device_type='cuda', enabled=False):
+        v_pred_prob = torch.sigmoid(v_pred.float())
+        v_target_prob = torch.sigmoid(v_target.float())
+        # Clamp to avoid log(0)
+        v_pred_clamped = v_pred_prob.clamp(1e-7, 1 - 1e-7)
+        v_target_clamped = v_target_prob.clamp(1e-7, 1 - 1e-7)
+        bce_loss = F.binary_cross_entropy(v_pred_clamped, v_target_clamped)
+
+    # Combined loss
+    loss = mse_weight * mse_loss + bce_weight * bce_loss
+
+    stats = {
+        'loss': loss.detach(),
+        'mse_loss': mse_loss.detach(),
+        'bce_loss': bce_loss.detach(),
+        'mse_weight': mse_weight,
+        'bce_weight': bce_weight,
+        'loss_unweighted': sq_err.mean().detach(),
+    }
+    return loss, stats
+
+
+# =============================================================================
 # Denoising Loss Functions
 # =============================================================================
 

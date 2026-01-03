@@ -301,6 +301,131 @@ def plot_multimetric_analysis(df, logger, stringy="multimetric_analysis"):
     plt.tight_layout()
     logger.save_figure(fig, stringy)
 
+
+def plot_loss_schedule_analysis(df, logger, name="loss_schedule_analysis"):
+    """
+    Analyze MSE vs BCE loss compatibility during scheduled loss training.
+
+    Shows how each loss component changes as the optimization target lerps
+    from pure MSE to mostly BCE, revealing whether the tasks are compatible
+    (both decrease together) or conflicting (one rises as other falls).
+
+    Args:
+        df: DataFrame with columns: step, mse_loss, bce_loss, mse_weight, bce_weight, lerp_t
+        logger: ExperimentLogger for saving figures
+        name: Output filename prefix
+    """
+    if df.empty:
+        return
+
+    # Check if required columns exist
+    required_cols = ['mse_loss', 'bce_loss', 'lerp_t']
+    if not all(col in df.columns for col in required_cols):
+        print(f"[plot_loss_schedule_analysis] Missing required columns. Have: {list(df.columns)}")
+        return
+
+    # Filter for valid data
+    df_valid = df[df['mse_loss'].notna() & df['bce_loss'].notna()].copy()
+    if df_valid.empty:
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. Raw loss values over training (top-left)
+    ax = axes[0, 0]
+    steps = df_valid.groupby('step').agg({'mse_loss': 'mean', 'bce_loss': 'mean'})
+
+    ax.plot(steps.index, steps['mse_loss'].rolling(20, min_periods=1).mean(),
+            label='MSE Loss', color='blue', linewidth=2)
+    ax.plot(steps.index, steps['bce_loss'].rolling(20, min_periods=1).mean(),
+            label='BCE Loss', color='red', linewidth=2)
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Loss Value')
+    ax.set_title('Raw Loss Components Over Training')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+
+    # 2. Loss vs lerp_t (top-right) - shows d_loss / d_lerp
+    ax = axes[0, 1]
+    lerp_bins = np.linspace(0, 1, 21)
+    df_valid['lerp_bin'] = pd.cut(df_valid['lerp_t'], bins=lerp_bins)
+
+    lerp_stats = df_valid.groupby('lerp_bin', observed=True).agg({
+        'mse_loss': ['mean', 'std'],
+        'bce_loss': ['mean', 'std']
+    })
+
+    bin_centers = [(b.left + b.right) / 2 for b in lerp_stats.index]
+
+    ax.errorbar(bin_centers, lerp_stats['mse_loss']['mean'],
+                yerr=lerp_stats['mse_loss']['std'],
+                label='MSE', color='blue', fmt='-o', capsize=3, alpha=0.8)
+    ax.errorbar(bin_centers, lerp_stats['bce_loss']['mean'],
+                yerr=lerp_stats['bce_loss']['std'],
+                label='BCE', color='red', fmt='-s', capsize=3, alpha=0.8)
+    ax.set_xlabel('Lerp Progress (t: 0=pure MSE → 1=mostly BCE)')
+    ax.set_ylabel('Loss Value')
+    ax.set_title('d_loss / d_lerp_t (Loss vs Schedule Progress)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 3. Weighted contributions (bottom-left)
+    ax = axes[1, 0]
+    if 'mse_weight' in df_valid.columns and 'bce_weight' in df_valid.columns:
+        df_valid['weighted_mse'] = df_valid['mse_loss'] * df_valid['mse_weight']
+        df_valid['weighted_bce'] = df_valid['bce_loss'] * df_valid['bce_weight']
+
+        weighted_stats = df_valid.groupby('step').agg({
+            'weighted_mse': 'mean', 'weighted_bce': 'mean'
+        })
+
+        ax.stackplot(weighted_stats.index,
+                     weighted_stats['weighted_mse'].rolling(20, min_periods=1).mean(),
+                     weighted_stats['weighted_bce'].rolling(20, min_periods=1).mean(),
+                     labels=['w_mse × MSE', 'w_bce × BCE'],
+                     colors=['lightblue', 'lightcoral'], alpha=0.7)
+        ax.plot(weighted_stats.index,
+                (weighted_stats['weighted_mse'] + weighted_stats['weighted_bce']).rolling(20, min_periods=1).mean(),
+                'k--', label='Total Loss', linewidth=2)
+        ax.set_xlabel('Training Step')
+        ax.set_ylabel('Weighted Loss')
+        ax.set_title('Weighted Loss Contributions (Stacked)')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'Weights not available', ha='center', va='center', transform=ax.transAxes)
+
+    # 4. Compatibility scatter (bottom-right) - MSE vs BCE at each step
+    ax = axes[1, 1]
+    scatter = ax.scatter(df_valid['mse_loss'], df_valid['bce_loss'],
+                         c=df_valid['lerp_t'], cmap='viridis',
+                         alpha=0.5, s=10)
+    plt.colorbar(scatter, ax=ax, label='Lerp Progress (t)')
+    ax.set_xlabel('MSE Loss')
+    ax.set_ylabel('BCE Loss')
+    ax.set_title('MSE vs BCE Compatibility\n(Diagonal = correlated tasks)')
+    ax.grid(True, alpha=0.3)
+
+    # Add correlation coefficient
+    if len(df_valid) > 2:
+        corr = df_valid['mse_loss'].corr(df_valid['bce_loss'])
+        ax.text(0.05, 0.95, f'ρ = {corr:.3f}', transform=ax.transAxes,
+                fontsize=12, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+    # Print summary statistics
+    print(f"\n[Loss Schedule Analysis]")
+    print(f"  Steps: {df_valid['step'].min()} → {df_valid['step'].max()}")
+    print(f"  MSE: {df_valid['mse_loss'].mean():.4f} ± {df_valid['mse_loss'].std():.4f}")
+    print(f"  BCE: {df_valid['bce_loss'].mean():.4f} ± {df_valid['bce_loss'].std():.4f}")
+    if len(df_valid) > 2:
+        print(f"  Correlation (ρ): {corr:.3f} {'(compatible)' if corr > 0.5 else '(potentially conflicting)' if corr < 0 else '(weakly related)'}")
+
+
 def plot_dset_reconstruction(result_dict, logger, name="reconstruction", show_map=False, show_error=False):
     # Expect lists of tensors, potentially of mixed resolution
     x0s = result_dict["x0"]

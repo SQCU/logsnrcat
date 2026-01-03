@@ -27,11 +27,11 @@ mlp_depth = 2
 # GQA configuration for main transformer
 [model.gqa]
 enabled = true
-n_kv_heads = 2         # 8 query heads / 2 kv heads = 4x sharing
+n_kv_heads = 4         # 8 query heads / 2 kv heads = 4x sharing
 
 [training]
-ae_steps = 1000
-steps = 1000
+ae_steps = 250
+steps = 250
 lambda_coeff = 0.2
 mode = "naive"
 batch_size = 4
@@ -85,6 +85,17 @@ mse_end = 0.1      # 10% MSE at end
 bce_end = 0.9      # 90% BCE at end
 schedule = "linear"  # "linear", "cosine", or "step"
 pct_switch = 0.8   # For "step" schedule: switch at this fraction
+
+# Diffusion loss schedule: lerp from MSE to partial BCE for v-field prediction
+# Tests whether BCE gradients on sigmoid(v) find better v-fields than pure MSE
+# Mild intervention: mostly MSE, lerp to small BCE component
+[training.sparse_ae.diffusion_loss_schedule]
+enabled = true
+mse_start = 1.0    # 100% MSE at start
+bce_start = 0.0    # 0% BCE at start
+mse_end = 0.9      # 90% MSE at end
+bce_end = 0.1      # 10% BCE at end
+schedule = "linear"
 
 # Attention configuration - sliding window for 3x3 neighborhood
 [training.sparse_ae.attention]
