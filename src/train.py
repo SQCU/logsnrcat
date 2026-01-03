@@ -991,6 +991,7 @@ def train_latent_diffusion(
         variance_tracker = None
 
     history = []
+    deferred_sample_stats = []  # Per-sample stats for SNR binning
     use_amp = dtype in (torch.bfloat16, torch.float16)
     scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
     log_interval = config['logging']['log_interval']
@@ -1180,6 +1181,27 @@ def train_latent_diffusion(
 
                 n_latent += batch_size
 
+                # Collect per-sample stats for SNR binning (defer sync to logging time)
+                # Match train_denoise pattern: keep tensors, convert at logging time
+                with torch.no_grad():
+                    # Per-sample mean logsnr: [B]
+                    per_sample_logsnr = logsnr_flat.mean(dim=1).squeeze(-1)
+                    # Per-sample v-field MSE: [B]
+                    per_sample_loss = ((v_pred - target_v) ** 2).mean(dim=(1, 2))
+                    # Resolution is same for all samples in this group
+                    res = curr_res * curr_res
+
+                    for b_idx in range(batch_size):
+                        block = group[b_idx][0]  # (block, img, lsnr) tuple
+                        deferred_sample_stats.append({
+                            'step': i,
+                            'source': getattr(block, 'source', 'unknown'),
+                            'type': 'latent',
+                            'loss_tensor': per_sample_loss[b_idx].detach(),
+                            'logsnr_tensor': per_sample_logsnr[b_idx].detach(),
+                            'resolution': res,
+                        })
+
             if n_latent == 0:
                 continue
 
@@ -1208,37 +1230,37 @@ def train_latent_diffusion(
             fp8_optimizer.step()
             fp8_optimizer.zero_grad()
 
-        # Logging
+        # Logging - per-sample entries for proper SNR binning
+        # Match train_denoise pattern: convert tensors to floats at logging time
         if i % log_interval == 0:
-            # Compute mean logsnr for SNR binning plots (use middle of schedule as proxy)
-            mean_logsnr = (config['training']['schedule_bounds'][0] + config['training']['schedule_bounds'][1]) / 2
-            entry = {
-                'step': i,
-                'source': 'latent_diff',  # Distinct source for latent diffusion
-                'type': 'latent',  # Must be 'latent' for plot_multimetric_analysis compatibility
-                'loss': loss_v.item(),  # Primary loss for plotting consistency
-                'logsnr': mean_logsnr,  # Required for SNR binning plots
-                'loss_v': loss_v.item(),
-                'loss_recon': loss_recon.item() if recon_weight > 0 else 0.0,
-                'loss_logsnr': loss_logsnr.item(),
-                'loss_total': total_loss.item(),
-                'resolution': curr_res * curr_res
-            }
-            # Add v-field BCE schedule stats if enabled
-            if use_scheduled_v_loss and last_v_stats is not None:
-                # Use same column names as train_autoembed for plotting compatibility
-                entry['mse_loss'] = float(last_v_stats['mse_loss'])
-                entry['bce_loss'] = float(last_v_stats['bce_loss'])
-                entry['mse_weight'] = last_v_stats['mse_weight']
-                entry['bce_weight'] = last_v_stats['bce_weight']
-                entry['lerp_t'] = i / max(steps - 1, 1)
-            # Add recon BCE schedule stats if enabled (pinned at AE end values)
-            if use_scheduled_recon_loss and last_recon_stats is not None:
-                entry['recon_mse_loss'] = float(last_recon_stats['mse_loss'])
-                entry['recon_bce_loss'] = float(last_recon_stats['bce_loss'])
-                entry['recon_mse_weight'] = last_recon_stats['mse_weight']
-                entry['recon_bce_weight'] = last_recon_stats['bce_weight']
-            history.append(entry)
+            for stat in deferred_sample_stats:
+                converted = {'step': stat['step'], 'source': stat['source'], 'type': stat['type']}
+
+                # Handle tensor -> float conversion for all *_tensor keys
+                for key in list(stat.keys()):
+                    if key.endswith('_tensor'):
+                        base_key = key[:-7]  # Remove '_tensor' suffix
+                        val = stat[key]
+                        converted[base_key] = val.item() if isinstance(val, torch.Tensor) else val
+                    elif key not in ('step', 'source', 'type'):
+                        converted[key] = stat[key]
+
+                # Add v-field BCE schedule stats if enabled
+                if use_scheduled_v_loss and last_v_stats is not None:
+                    converted['mse_loss'] = float(last_v_stats['mse_loss'])
+                    converted['bce_loss'] = float(last_v_stats['bce_loss'])
+                    converted['mse_weight'] = last_v_stats['mse_weight']
+                    converted['bce_weight'] = last_v_stats['bce_weight']
+                    converted['lerp_t'] = i / max(steps - 1, 1)
+                # Add recon BCE schedule stats if enabled
+                if use_scheduled_recon_loss and last_recon_stats is not None:
+                    converted['recon_mse_loss'] = float(last_recon_stats['mse_loss'])
+                    converted['recon_bce_loss'] = float(last_recon_stats['bce_loss'])
+                    converted['recon_mse_weight'] = last_recon_stats['mse_weight']
+                    converted['recon_bce_weight'] = last_recon_stats['bce_weight']
+
+                history.append(converted)
+            deferred_sample_stats.clear()
 
             postfix = {
                 'v': f'{loss_v.item():.4f}',
