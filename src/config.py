@@ -209,8 +209,9 @@ class ParameterTargetingConfig(BaseModel):
         default_factory=lambda: ['sparse_ae', 'encoders', 'decoders', 'level_logsnr']
     )
     # Patterns for FSQ-adjacent params -> AdamW (sigmoid STE attenuates gradients)
+    # Note: code_proj inside encoders still matches, latent_code_proj/unproj are the wrapper projections
     fsq_patterns: List[str] = Field(
-        default_factory=lambda: ['code_proj', 'code_unproj', 'fsq', 'sparsity', 'dim_logits', 'level_values', 'attn_gate', 'logsnr']
+        default_factory=lambda: ['code_proj', 'latent_code_proj', 'latent_code_unproj', 'fsq', 'sparsity', 'dim_logits', 'level_values', 'attn_gate', 'logsnr']
     )
 
 
@@ -342,10 +343,24 @@ class SparseAEConfig(BaseModel):
     patch_size: int = 16
     hidden_dim: int = 256
     code_dim: int = 128
-    k_per_patch: int = 4  # Sparsity control: keep k of code_dim dims
+    # Sparsity mode: per_level = same dims active for all patches (learned), per_patch = content-dependent
+    # per_level is more stable, per_patch is more expressive but prone to collapse
+    sparsity_mode: Literal["per_level", "per_patch"] = "per_level"
+    # Wavelet subspace routing: partitions code_dim into wavelet and amplitude subspaces
+    # Sparsity pattern across subspaces encodes pathway selection (no sigmoid gating needed)
+    wavelet_gating: bool = False  # Enable subspace-routed encoder/decoder
+    n_wavelet_dims: Optional[int] = None  # Wavelet subspace size (default: code_dim // 2)
+    # Entropy regularization to prevent subspace collapse (all codes routing to one subspace)
+    routing_entropy_weight: float = 0.0  # Weight for entropy regularization (0 = disabled)
+    k_per_patch: int = 4  # Sparsity control: final k (keep k of code_dim dims)
+    # K-annealing: exponential decay from k_start to k_per_patch over k_anneal_steps
+    # Curriculum: start with more active dims (easier task), progressively constrain
+    k_start: Optional[int] = None  # Starting k (if None, no annealing - use k_per_patch)
+    k_anneal_steps: int = 2000  # Steps over which to anneal k
     residual_scale: float = 2.0
     fourier_dim: int = 16
     ae_loss_weight: float = 0.1  # Weight for AE loss in joint training
+    logsnr_loss_weight: float = 0.1  # Weight for logsnr prediction in joint training
     # Loss function type for AE training
     # cumulative_mse: average MSE across all level reconstructions (reference impl)
     # final_mse: MSE only on final reconstruction
@@ -418,6 +433,16 @@ class TrainingConfig(BaseModel):
     sparse_ae: SparseAEConfig = Field(default_factory=SparseAEConfig)
     graph_capture: GraphCaptureConfig = Field(default_factory=GraphCaptureConfig)
 
+
+class SubspaceSensitivityConfig(BaseModel):
+    """Configuration for wavelet/amplitude subspace sensitivity sweep."""
+    enabled: bool = False  # Run sensitivity sweep after AE training
+    ablation_rates: List[float] = Field(default_factory=lambda: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
+    n_trials: int = 5  # Stochastic trials per ablation rate (averaged)
+    n_samples: int = 16  # Number of images to evaluate
+    resolutions: List[int] = Field(default_factory=lambda: [64, 128])  # Resolutions to test
+
+
 class SamplingConfig(BaseModel):
     num_samples: int = 8
     steps: int = 50
@@ -430,6 +455,8 @@ class SamplingConfig(BaseModel):
     sweep_range: Tuple[float, float] = (2.0, -4.0)
     # Custom eval queries (loaded from eval_configs)
     queries: List[Dict[str, Any]] = Field(default_factory=list)
+    # Subspace sensitivity sweep config (for wavelet-gating FSQ AE)
+    subspace_sensitivity: SubspaceSensitivityConfig = Field(default_factory=SubspaceSensitivityConfig)
  
 
 class PageTableConfig(BaseModel):
@@ -439,10 +466,18 @@ class PageTableConfig(BaseModel):
     max_logical_blocks: int = 1024
 
 
+class EvalServerConfig(BaseModel):
+    """Configuration for eval server integration (network-yeet weights)."""
+    enabled: bool = False  # Yeet weights to eval server at end of training
+    url: str = "http://localhost:8421"  # Eval server URL
+    health_check: bool = True  # Query health after yeet to verify transfer
+
+
 class LoggingConfig(BaseModel):
     output_dir: Path = Path("./experiments_mix")
     log_interval: int = 100
     sample_after_training: bool = True
+    eval_server: EvalServerConfig = Field(default_factory=EvalServerConfig)
 
 # =============================================================================
 # Root Config

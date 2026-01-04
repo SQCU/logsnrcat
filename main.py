@@ -27,7 +27,11 @@ from src.model import coolerLDTformerZC, SpanEmbedder, SpanUnembedder, PageTable
 from src.data_iterator import CompositeIterator
 from src.data_functional import get_tokenizer
 from src.train import train_autoembed, train_denoise, train_latent_diffusion
-from src.plotting import plot_multimetric_analysis, plot_ae_roundtrip, plot_loss_schedule_analysis, ExperimentLogger
+from src.plotting import (
+    plot_multimetric_analysis, plot_ae_roundtrip, plot_loss_schedule_analysis,
+    plot_subspace_sensitivity, plot_subspace_sensitivity_heatmap,
+    plot_subspace_sensitivity_exemplars, ExperimentLogger
+)
 import src.sample as sampler
 
 
@@ -201,6 +205,56 @@ def main():
             plot_ae_roundtrip(components, val_iterator, logger,
                               name=f"ae_roundtrip_{res}", n_samples=8, resolution=res)
 
+        # Subspace sensitivity sweep (for wavelet-gating FSQ AE)
+        sens_cfg = cfg['sampling']['subspace_sensitivity']
+        if sens_cfg['enabled'] and cfg['training']['sparse_ae'].get('wavelet_gating', False):
+            print("\nRunning subspace sensitivity sweep...")
+            model = components[0]  # coolerLDTformerZC
+            if hasattr(model, 'sparse_ae') and model.sparse_ae is not None:
+                results_by_res = {}
+                for res in sens_cfg['resolutions']:
+                    print(f"  Sensitivity sweep at resolution {res}...")
+                    # Get batch of images for evaluation
+                    # ContextBlocks are heterogeneous by design - filter to target resolution
+                    blocks = val_iterator.generate_batch_list(
+                        batch_size=sens_cfg['n_samples'] * 4,  # Over-generate to filter
+                        resolution=res
+                    )
+                    # Filter to blocks matching target resolution and stack
+                    matching = [b.content for b in blocks
+                                if b.content.shape[-1] == res and b.content.shape[-2] == res]
+                    if len(matching) < sens_cfg['n_samples']:
+                        print(f"    Warning: only {len(matching)} blocks at {res}px (wanted {sens_cfg['n_samples']})")
+                    images = torch.stack(matching[:sens_cfg['n_samples']]).to(cfg['device'])
+
+                    # Run sensitivity sweep - must use same autocast as training
+                    use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
+                    with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+                        sweep_results = model.sparse_ae.subspace_sensitivity_sweep(
+                            images=images,
+                            ablation_rates=sens_cfg['ablation_rates'],
+                            n_trials=sens_cfg['n_trials']
+                        )
+                    results_by_res[res] = sweep_results
+
+                    # Plot individual resolution results
+                    plot_subspace_sensitivity(sweep_results, logger,
+                                              name=f"subspace_sensitivity_{res}")
+
+                    # Plot visual exemplars showing what ablation looks like
+                    plot_subspace_sensitivity_exemplars(
+                        model.sparse_ae, images, logger,
+                        ablation_rates=[0.0, 0.25, 0.5, 0.75, 1.0],
+                        name=f"subspace_exemplars_{res}",
+                        dtype=dtype
+                    )
+
+                # Plot cross-resolution heatmap if multiple resolutions
+                if len(results_by_res) > 1:
+                    plot_subspace_sensitivity_heatmap(results_by_res, logger,
+                                                      name="subspace_sensitivity_heatmap")
+                print("  Sensitivity sweep complete.")
+
     # Use latent diffusion if sparse AE is enabled with latent_diffusion=true
     sparse_ae_cfg = cfg['training'].get('sparse_ae', {})
     use_latent_diffusion = (
@@ -221,7 +275,13 @@ def main():
         logger.save_dataframe(df_train, f"history_denoise_{cfg['training']['mode']}")
     # Plot diffusion training metrics
     plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg['training']['mode']}")
-    
+
+    # Loss schedule analysis for latent diffusion (v-field MSE/BCE compatibility)
+    if use_latent_diffusion and not df_train.empty:
+        diffusion_loss_schedule = sparse_ae_cfg.get('diffusion_loss_schedule', {})
+        if isinstance(diffusion_loss_schedule, dict) and diffusion_loss_schedule.get('enabled', False):
+            print("Plotting diffusion loss schedule analysis...")
+            plot_loss_schedule_analysis(df_train, logger, f"loss_schedule_diffusion_{cfg['training']['mode']}")
 
     # --- Sampling & Evaluation ---
     if cfg['logging']['sample_after_training']:
@@ -299,6 +359,26 @@ def main():
                                 print(f"Block {i} (Latent): shape={b.content.shape}")
                     except Exception as e:
                         print(f"    Error running queries: {e}")
+
+    # --- Eval Server Integration ---
+    eval_server_cfg = cfg['logging']['eval_server']
+    if eval_server_cfg['enabled']:
+        from src.eval_server import yeet_to_server, query_health
+
+        print(f"\nYeeting weights to eval server at {eval_server_cfg['url']}...")
+        model = components[0]  # coolerLDTformerZC
+        yeet_success = yeet_to_server(model, eval_server_cfg['url'])
+
+        if yeet_success and eval_server_cfg['health_check']:
+            health = query_health(eval_server_cfg['url'])
+            print(f"\n[Eval Server Health Check]")
+            print(f"  Status: {health.get('status', 'unknown')}")
+            print(f"  Weights loaded: {health.get('weights_loaded', False)}")
+            print(f"  Params: {health.get('params', 0):,}")
+            if not health.get('weights_loaded'):
+                print(f"  WARNING: Weights not confirmed on server!")
+        elif not yeet_success:
+            print(f"  WARNING: Failed to yeet weights to eval server")
 
     print(f"\nDone! Results in {logger.run_dir}")
 

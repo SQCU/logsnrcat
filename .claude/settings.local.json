@@ -5,7 +5,9 @@
       "Bash(python analyze_throughput.py:*)",
       "Bash(python3:*)",
       "Bash(iconv:*)",
-      "Bash(.venv/Scripts/python.exe:*)"
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(curl:*)",
+      "Bash(/mnt/f/dox/repos/ai/logsnrcat/.venv/Scripts/python.exe:*)"
     ]
   }
 }

@@ -914,3 +914,643 @@ def plot_ae_diagnostic(diagnostics: list, logger, name: str = "ae_diagnostic"):
 
     plt.tight_layout()
     logger.save_figure(fig, name)
+
+
+# =============================================================================
+# Subspace Routing Debug Plots
+# =============================================================================
+
+def plot_subspace_routing_stats(df, logger, name="subspace_routing"):
+    """
+    Plot wavelet vs amplitude subspace activation over training.
+
+    Shows the relative contribution/activation of wavelet vs amplitude
+    subspaces as training progresses.
+
+    Args:
+        df: DataFrame with columns: step, wav_active_mean, amp_active_mean, routing_entropy_mean
+        logger: ExperimentLogger for saving figures
+        name: Output filename prefix
+    """
+    if df.empty:
+        return
+
+    # Check for required columns
+    required = ['step', 'wav_active_mean', 'amp_active_mean']
+    if not all(col in df.columns for col in required):
+        print(f"[plot_subspace_routing_stats] Missing columns. Have: {list(df.columns)}")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # 1. Subspace activations over training (top-left)
+    ax = axes[0, 0]
+    steps = df.groupby('step').agg({
+        'wav_active_mean': 'mean',
+        'amp_active_mean': 'mean'
+    })
+    ax.plot(steps.index, steps['wav_active_mean'].rolling(20, min_periods=1).mean(),
+            label='Wavelet Active', color='blue', linewidth=2)
+    ax.plot(steps.index, steps['amp_active_mean'].rolling(20, min_periods=1).mean(),
+            label='Amplitude Active', color='red', linewidth=2)
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Mean Active Dims')
+    ax.set_title('Subspace Activation Over Training')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 2. Ratio of wav/(wav+amp) (top-right)
+    ax = axes[0, 1]
+    total = steps['wav_active_mean'] + steps['amp_active_mean']
+    ratio = steps['wav_active_mean'] / (total + 1e-7)
+    ax.plot(steps.index, ratio.rolling(20, min_periods=1).mean(), color='purple', linewidth=2)
+    ax.axhline(0.5, color='gray', linestyle='--', alpha=0.5, label='Balanced (0.5)')
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Wavelet Fraction')
+    ax.set_title('Wavelet/(Wavelet+Amplitude) Ratio')
+    ax.set_ylim(0, 1)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 3. Routing entropy if available (bottom-left)
+    ax = axes[1, 0]
+    if 'routing_entropy_mean' in df.columns:
+        entropy = df.groupby('step')['routing_entropy_mean'].mean()
+        ax.plot(entropy.index, entropy.rolling(20, min_periods=1).mean(),
+                color='green', linewidth=2)
+        ax.set_xlabel('Training Step')
+        ax.set_ylabel('Routing Entropy')
+        ax.set_title('Subspace Routing Entropy\n(Higher = More Balanced)')
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'Routing entropy not available',
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title('Routing Entropy')
+
+    # 4. Stacked area chart (bottom-right)
+    ax = axes[1, 1]
+    ax.stackplot(steps.index,
+                 steps['wav_active_mean'].rolling(20, min_periods=1).mean(),
+                 steps['amp_active_mean'].rolling(20, min_periods=1).mean(),
+                 labels=['Wavelet', 'Amplitude'],
+                 colors=['lightblue', 'lightcoral'], alpha=0.7)
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Active Dims (Stacked)')
+    ax.set_title('Subspace Contribution (Stacked)')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+
+def plot_residual_level_reconstructions(
+    original: torch.Tensor,
+    level_recons: list,
+    logger,
+    name="residual_levels",
+    n_samples: int = 4
+):
+    """
+    Visualize reconstructions using first k residual levels.
+
+    Shows how reconstruction quality improves as more levels are added.
+
+    Args:
+        original: [B, C, H, W] original images
+        level_recons: list of [B, C, H, W] cumulative reconstructions per level
+        logger: ExperimentLogger for saving figures
+        name: Output filename prefix
+        n_samples: Number of samples to show (will use min(n_samples, batch_size))
+    """
+    n_levels = len(level_recons)
+    B = original.shape[0]
+    n_show = min(n_samples, B)
+
+    fig, axes = plt.subplots(n_show, n_levels + 2, figsize=(2 * (n_levels + 2), 2 * n_show))
+    if n_show == 1:
+        axes = axes.reshape(1, -1)
+
+    for i in range(n_show):
+        # Original
+        orig_img = original[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        axes[i, 0].imshow(orig_img)
+        axes[i, 0].axis('off')
+        if i == 0:
+            axes[i, 0].set_title('Original', fontsize=9)
+
+        # Per-level cumulative reconstruction
+        for lv, recon in enumerate(level_recons):
+            recon_img = recon[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+            axes[i, lv + 1].imshow(recon_img)
+            axes[i, lv + 1].axis('off')
+            if i == 0:
+                axes[i, lv + 1].set_title(f'Level 0-{lv}', fontsize=9)
+
+        # Final error map
+        final_recon = level_recons[-1][i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        error = ((orig_img - final_recon) ** 2).mean(axis=2)
+        axes[i, -1].imshow(error, cmap='inferno', vmin=0, vmax=0.05)
+        axes[i, -1].axis('off')
+        if i == 0:
+            axes[i, -1].set_title('Final Error', fontsize=9)
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+
+def plot_subspace_ablation(
+    original: torch.Tensor,
+    full_recon: torch.Tensor,
+    wav_only_recon: torch.Tensor,
+    amp_only_recon: torch.Tensor,
+    logger,
+    name="subspace_ablation",
+    n_samples: int = 4
+):
+    """
+    Visualize subspace ablation: what happens when we knock out wav/amp pathways.
+
+    Shows:
+    - Original
+    - Full reconstruction (both subspaces)
+    - Wavelet-only (amplitude ablated)
+    - Amplitude-only (wavelet ablated)
+    - Error maps for each
+
+    Args:
+        original: [B, C, H, W] original images
+        full_recon: [B, C, H, W] full reconstruction
+        wav_only_recon: [B, C, H, W] reconstruction with amplitude ablated
+        amp_only_recon: [B, C, H, W] reconstruction with wavelet ablated
+        logger: ExperimentLogger
+        name: Output filename prefix
+        n_samples: Number of samples to show
+    """
+    B = original.shape[0]
+    n_show = min(n_samples, B)
+
+    fig, axes = plt.subplots(n_show, 7, figsize=(14, 2 * n_show))
+    if n_show == 1:
+        axes = axes.reshape(1, -1)
+
+    for i in range(n_show):
+        orig = original[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        full = full_recon[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        wav = wav_only_recon[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        amp = amp_only_recon[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+
+        # Original
+        axes[i, 0].imshow(orig)
+        axes[i, 0].axis('off')
+        if i == 0:
+            axes[i, 0].set_title('Original', fontsize=9)
+
+        # Full reconstruction
+        axes[i, 1].imshow(full)
+        axes[i, 1].axis('off')
+        if i == 0:
+            axes[i, 1].set_title('Full Recon', fontsize=9)
+
+        # Full error
+        full_err = ((orig - full) ** 2).mean(axis=2)
+        axes[i, 2].imshow(full_err, cmap='inferno', vmin=0, vmax=0.05)
+        axes[i, 2].axis('off')
+        if i == 0:
+            axes[i, 2].set_title('Full Error', fontsize=9)
+
+        # Wavelet-only (amp ablated)
+        axes[i, 3].imshow(wav)
+        axes[i, 3].axis('off')
+        if i == 0:
+            axes[i, 3].set_title('Wav Only\n(Amp Ablated)', fontsize=9)
+
+        # Wav error
+        wav_err = ((orig - wav) ** 2).mean(axis=2)
+        axes[i, 4].imshow(wav_err, cmap='inferno', vmin=0, vmax=0.1)
+        axes[i, 4].axis('off')
+        if i == 0:
+            axes[i, 4].set_title('Wav Error', fontsize=9)
+
+        # Amplitude-only (wav ablated)
+        axes[i, 5].imshow(amp)
+        axes[i, 5].axis('off')
+        if i == 0:
+            axes[i, 5].set_title('Amp Only\n(Wav Ablated)', fontsize=9)
+
+        # Amp error
+        amp_err = ((orig - amp) ** 2).mean(axis=2)
+        axes[i, 6].imshow(amp_err, cmap='inferno', vmin=0, vmax=0.1)
+        axes[i, 6].axis('off')
+        if i == 0:
+            axes[i, 6].set_title('Amp Error', fontsize=9)
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+
+def plot_subspace_contributions(
+    original: torch.Tensor,
+    recon: torch.Tensor,
+    wav_contribution: torch.Tensor,
+    amp_contribution: torch.Tensor,
+    logger,
+    name="subspace_contributions",
+    n_samples: int = 4
+):
+    """
+    Visualize the individual subspace contributions to reconstruction.
+
+    Shows:
+    - Original
+    - Combined reconstruction
+    - Wavelet pathway contribution (may have negative values, show as heatmap)
+    - Amplitude pathway contribution
+    - Difference between pathways
+
+    Args:
+        original: [B, C, H, W] original images
+        recon: [B, C, H, W] combined reconstruction
+        wav_contribution: [B, C, H, W] wavelet pathway output (before sum)
+        amp_contribution: [B, C, H, W] amplitude pathway output (before sum)
+        logger: ExperimentLogger
+        name: Output filename prefix
+        n_samples: Number of samples to show
+    """
+    B = original.shape[0]
+    n_show = min(n_samples, B)
+
+    fig, axes = plt.subplots(n_show, 6, figsize=(12, 2 * n_show))
+    if n_show == 1:
+        axes = axes.reshape(1, -1)
+
+    for i in range(n_show):
+        orig = original[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        rec = recon[i].detach().cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+        wav = wav_contribution[i].detach().cpu().permute(1, 2, 0).numpy()
+        amp = amp_contribution[i].detach().cpu().permute(1, 2, 0).numpy()
+
+        # Original
+        axes[i, 0].imshow(orig)
+        axes[i, 0].axis('off')
+        if i == 0:
+            axes[i, 0].set_title('Original', fontsize=9)
+
+        # Reconstruction
+        axes[i, 1].imshow(rec)
+        axes[i, 1].axis('off')
+        if i == 0:
+            axes[i, 1].set_title('Recon', fontsize=9)
+
+        # Wavelet contribution (normalize for visualization)
+        wav_mag = np.abs(wav).mean(axis=2)
+        im = axes[i, 2].imshow(wav_mag, cmap='Blues')
+        axes[i, 2].axis('off')
+        if i == 0:
+            axes[i, 2].set_title('Wav |contrib|', fontsize=9)
+
+        # Amplitude contribution
+        amp_mag = np.abs(amp).mean(axis=2)
+        axes[i, 3].imshow(amp_mag, cmap='Reds')
+        axes[i, 3].axis('off')
+        if i == 0:
+            axes[i, 3].set_title('Amp |contrib|', fontsize=9)
+
+        # Ratio: wav/(wav+amp)
+        total = wav_mag + amp_mag + 1e-7
+        ratio = wav_mag / total
+        axes[i, 4].imshow(ratio, cmap='coolwarm', vmin=0, vmax=1)
+        axes[i, 4].axis('off')
+        if i == 0:
+            axes[i, 4].set_title('Wav Ratio', fontsize=9)
+
+        # Error
+        error = ((orig - rec) ** 2).mean(axis=2)
+        axes[i, 5].imshow(error, cmap='inferno', vmin=0, vmax=0.05)
+        axes[i, 5].axis('off')
+        if i == 0:
+            axes[i, 5].set_title('Error', fontsize=9)
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+
+def plot_subspace_sensitivity(
+    sweep_results,#: Dict[str, Any],
+    logger,
+    name="subspace_sensitivity"
+):
+    """
+    Plot subspace ablation sensitivity curves (d_mse / d_ablation).
+
+    Visualizes how reconstruction MSE degrades as we stochastically ablate
+    different proportions of wavelet vs amplitude subspace dimensions.
+
+    Args:
+        sweep_results: Dict from SwiGLUFSQAutoencoder.subspace_sensitivity_sweep() with:
+            - ablation_rates: list of float ablation rates [0.0, 0.1, ..., 1.0]
+            - mse_baseline: float, reconstruction MSE with no ablation
+            - mse_wav_ablated: list of MSE values when ablating wavelet dims at each rate
+            - mse_amp_ablated: list of MSE values when ablating amplitude dims at each rate
+            - mse_both_ablated: list of MSE values when ablating both at each rate
+            - d_mse_d_wav: list of gradient estimates (MSE increase per ablation rate)
+            - d_mse_d_amp: list of gradient estimates
+        logger: ExperimentLogger for saving figures
+        name: Output filename prefix
+    """
+    rates = np.array(sweep_results['ablation_rates'])
+    mse_baseline = sweep_results['mse_baseline']
+    mse_wav = np.array(sweep_results['mse_wav_ablated'])
+    mse_amp = np.array(sweep_results['mse_amp_ablated'])
+    mse_both = np.array(sweep_results['mse_both_ablated'])
+    # Note: d_mse_d_wav/d_mse_d_amp from sweep may have wrong length; compute derivatives locally
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    # 1. MSE vs Ablation Rate (top-left)
+    ax = axes[0, 0]
+    ax.axhline(mse_baseline, color='gray', linestyle='--', alpha=0.7, label=f'Baseline ({mse_baseline:.4f})')
+    ax.plot(rates, mse_wav, 'b-o', markersize=4, linewidth=2, label='Wavelet Ablated')
+    ax.plot(rates, mse_amp, 'r-s', markersize=4, linewidth=2, label='Amplitude Ablated')
+    ax.plot(rates, mse_both, 'g-^', markersize=4, linewidth=2, label='Both Ablated')
+    ax.set_xlabel('Ablation Rate')
+    ax.set_ylabel('Reconstruction MSE')
+    ax.set_title('MSE vs Subspace Ablation Rate')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+
+    # 2. Normalized MSE (relative to baseline) (top-right)
+    ax = axes[0, 1]
+    ax.axhline(1.0, color='gray', linestyle='--', alpha=0.7, label='Baseline (1.0)')
+    norm_wav = mse_wav / (mse_baseline + 1e-8)
+    norm_amp = mse_amp / (mse_baseline + 1e-8)
+    norm_both = mse_both / (mse_baseline + 1e-8)
+    ax.plot(rates, norm_wav, 'b-o', markersize=4, linewidth=2, label='Wavelet')
+    ax.plot(rates, norm_amp, 'r-s', markersize=4, linewidth=2, label='Amplitude')
+    ax.plot(rates, norm_both, 'g-^', markersize=4, linewidth=2, label='Both')
+    ax.set_xlabel('Ablation Rate')
+    ax.set_ylabel('MSE / Baseline MSE')
+    ax.set_title('Relative MSE Degradation')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+
+    # 3. d_MSE / d_ablation gradient curves (bottom-left)
+    ax = axes[1, 0]
+    # Use midpoint rates for gradient display (gradients are between points)
+    mid_rates = (rates[:-1] + rates[1:]) / 2 if len(rates) > 1 else rates
+    # Compute derivatives from MSE values (more reliable than pre-computed d_mse_d_*)
+    # This ensures length matches mid_rates (n-1 elements from n points)
+    d_rates = np.diff(rates)
+    d_wav_computed = np.diff(mse_wav) / (d_rates + 1e-8)
+    d_amp_computed = np.diff(mse_amp) / (d_rates + 1e-8)
+    ax.plot(mid_rates, d_wav_computed, 'b-o', markersize=4, linewidth=2, label='d(MSE)/d(wav_ablation)')
+    ax.plot(mid_rates, d_amp_computed, 'r-s', markersize=4, linewidth=2, label='d(MSE)/d(amp_ablation)')
+    ax.axhline(0, color='gray', linestyle='-', alpha=0.3)
+    ax.set_xlabel('Ablation Rate')
+    ax.set_ylabel('d(MSE) / d(Ablation)')
+    ax.set_title('MSE Sensitivity to Ablation\n(Gradient: Higher = More Sensitive)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+
+    # 4. Summary statistics (bottom-right)
+    ax = axes[1, 1]
+    ax.axis('off')
+
+    # Calculate summary metrics
+    # Area under MSE curve (trapezoid integration)
+    # np.trapezoid replaces deprecated np.trapz in NumPy 2.0+
+    auc_wav = np.trapezoid(mse_wav - mse_baseline, rates)
+    auc_amp = np.trapezoid(mse_amp - mse_baseline, rates)
+    auc_both = np.trapezoid(mse_both - mse_baseline, rates)
+
+    # Max gradient (peak sensitivity) - use computed derivatives
+    max_d_wav = np.max(d_wav_computed) if len(d_wav_computed) > 0 else 0
+    max_d_amp = np.max(d_amp_computed) if len(d_amp_computed) > 0 else 0
+
+    # Mean gradient
+    mean_d_wav = np.mean(d_wav_computed) if len(d_wav_computed) > 0 else 0
+    mean_d_amp = np.mean(d_amp_computed) if len(d_amp_computed) > 0 else 0
+
+    # MSE at full ablation
+    full_wav = mse_wav[-1] if len(mse_wav) > 0 else 0
+    full_amp = mse_amp[-1] if len(mse_amp) > 0 else 0
+    full_both = mse_both[-1] if len(mse_both) > 0 else 0
+
+    # Relative importance: ratio of AUC
+    total_auc = auc_wav + auc_amp + 1e-8
+    wav_importance = auc_wav / total_auc
+    amp_importance = auc_amp / total_auc
+
+    summary_text = f"""
+    Subspace Sensitivity Summary
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    Baseline MSE: {mse_baseline:.6f}
+
+    MSE at Full Ablation (rate=1.0):
+      Wavelet ablated:   {full_wav:.6f}  (+{(full_wav/mse_baseline - 1)*100:.1f}%)
+      Amplitude ablated: {full_amp:.6f}  (+{(full_amp/mse_baseline - 1)*100:.1f}%)
+      Both ablated:      {full_both:.6f}  (+{(full_both/mse_baseline - 1)*100:.1f}%)
+
+    Area Under Curve (MSE degradation):
+      Wavelet:   {auc_wav:.6f}  ({wav_importance*100:.1f}%)
+      Amplitude: {auc_amp:.6f}  ({amp_importance*100:.1f}%)
+      Both:      {auc_both:.6f}
+
+    Gradient Statistics (d_MSE / d_ablation):
+      Wavelet   - Mean: {mean_d_wav:.6f}, Max: {max_d_wav:.6f}
+      Amplitude - Mean: {mean_d_amp:.6f}, Max: {max_d_amp:.6f}
+
+    Interpretation:
+      {"Wavelet subspace more critical" if wav_importance > 0.55 else
+       "Amplitude subspace more critical" if amp_importance > 0.55 else
+       "Both subspaces roughly equal importance"}
+    """
+
+    ax.text(0.05, 0.95, summary_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+
+def plot_subspace_sensitivity_heatmap(
+    sweep_results_by_resolution,#: Dict[int, Dict[str, Any]],
+    logger,
+    name="subspace_sensitivity_heatmap"
+):
+    """
+    Plot sensitivity heatmap across multiple resolutions.
+
+    Compares how subspace importance varies with image resolution.
+
+    Args:
+        sweep_results_by_resolution: Dict mapping resolution -> sweep_results
+        logger: ExperimentLogger
+        name: Output filename prefix
+    """
+    resolutions = sorted(sweep_results_by_resolution.keys())
+    n_res = len(resolutions)
+
+    if n_res == 0:
+        print("[plot_subspace_sensitivity_heatmap] No data to plot")
+        return
+
+    # Get ablation rates from first result
+    first_result = sweep_results_by_resolution[resolutions[0]]
+    rates = np.array(first_result['ablation_rates'])
+    n_rates = len(rates)
+
+    # Build heatmaps: [n_res, n_rates]
+    wav_heatmap = np.zeros((n_res, n_rates))
+    amp_heatmap = np.zeros((n_res, n_rates))
+
+    for i, res in enumerate(resolutions):
+        result = sweep_results_by_resolution[res]
+        baseline = result['mse_baseline']
+        # Normalize by baseline for comparability across resolutions
+        wav_heatmap[i, :] = (np.array(result['mse_wav_ablated']) - baseline) / (baseline + 1e-8)
+        amp_heatmap[i, :] = (np.array(result['mse_amp_ablated']) - baseline) / (baseline + 1e-8)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Wavelet sensitivity heatmap
+    ax = axes[0]
+    im = ax.imshow(wav_heatmap, aspect='auto', cmap='Blues',
+                   extent=[rates[0], rates[-1], resolutions[-1], resolutions[0]])
+    ax.set_xlabel('Ablation Rate')
+    ax.set_ylabel('Resolution')
+    ax.set_title('Wavelet Ablation Sensitivity\n(Relative MSE Increase)')
+    ax.set_yticks(resolutions)
+    plt.colorbar(im, ax=ax, label='(MSE - baseline) / baseline')
+
+    # Amplitude sensitivity heatmap
+    ax = axes[1]
+    im = ax.imshow(amp_heatmap, aspect='auto', cmap='Reds',
+                   extent=[rates[0], rates[-1], resolutions[-1], resolutions[0]])
+    ax.set_xlabel('Ablation Rate')
+    ax.set_ylabel('Resolution')
+    ax.set_title('Amplitude Ablation Sensitivity\n(Relative MSE Increase)')
+    ax.set_yticks(resolutions)
+    plt.colorbar(im, ax=ax, label='(MSE - baseline) / baseline')
+
+    plt.tight_layout()
+    logger.save_figure(fig, name)
+
+
+def plot_subspace_sensitivity_exemplars(
+    ae,
+    images: "torch.Tensor",
+    logger,
+    ablation_rates: list = [0.0, 0.25, 0.5, 0.75, 1.0],
+    name: str = "subspace_sensitivity_exemplars",
+    dtype: "torch.dtype" = None
+):
+    """
+    Plot visual exemplars of subspace ablation effects.
+
+    Shows actual reconstructions at different ablation rates to build
+    intuition for what each subspace (wavelet vs amplitude) encodes.
+
+    Grid layout:
+        Rows: different images (n_samples)
+        Columns: Original | Baseline | Wav@25% | Wav@50% | ... | Amp@25% | Amp@50% | ...
+
+    Args:
+        ae: SwiGLUFSQAutoencoder with decode_with_ablation() method
+        images: [B, C, H, W] tensor of images to reconstruct
+        logger: ExperimentLogger
+        ablation_rates: List of ablation rates to visualize
+        name: Output filename prefix
+        dtype: torch dtype for autocast (bf16/fp16/fp32)
+    """
+    import torch
+
+    if not getattr(ae, 'wavelet_gating', False):
+        print(f"[{name}] Skipping - AE doesn't have wavelet_gating enabled")
+        return
+
+    n_samples = min(4, images.shape[0])  # Show up to 4 exemplars
+    n_rates = len(ablation_rates)
+
+    # Columns: Original, Baseline (no ablation), then wav@rates, then amp@rates
+    n_cols = 2 + 2 * n_rates  # orig + baseline + wav_rates + amp_rates
+
+    fig, axes = plt.subplots(n_samples, n_cols, figsize=(2.5 * n_cols, 2.5 * n_samples))
+    if n_samples == 1:
+        axes = axes[np.newaxis, :]
+
+    # Compute grid shape from images
+    p = ae.patch_size
+    H, W = images.shape[2], images.shape[3]
+    grid_shape = (H // p, W // p)
+
+    # Autocast context - model weights are in training dtype
+    if dtype is None:
+        dtype = torch.bfloat16  # Default assumption
+    use_amp = dtype in (torch.bfloat16, torch.float16)
+
+    with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+        # Build masks once
+        encoder_masks, decoder_masks = ae.build_masks(grid_shape, images.device)
+
+        # Encode once
+        codes = ae.encode(images[:n_samples], grid_shape=grid_shape,
+                          encoder_masks=encoder_masks, decoder_masks=decoder_masks)
+
+        # Baseline reconstruction (no ablation)
+        baseline_recon = ae.decode(codes, grid_shape, decoder_masks)
+
+        for row in range(n_samples):
+            col = 0
+
+            # Original image
+            img_np = images[row].permute(1, 2, 0).float().cpu().numpy()
+            img_np = np.clip(img_np, 0, 1)
+            axes[row, col].imshow(img_np)
+            axes[row, col].set_title('Original' if row == 0 else '')
+            axes[row, col].axis('off')
+            col += 1
+
+            # Baseline (no ablation)
+            recon_np = baseline_recon[row].permute(1, 2, 0).float().cpu().numpy()
+            recon_np = np.clip(recon_np, 0, 1)
+            axes[row, col].imshow(recon_np)
+            axes[row, col].set_title('Baseline' if row == 0 else '')
+            axes[row, col].axis('off')
+            col += 1
+
+            # Wavelet ablations (use deterministic=True for reproducible visuals)
+            for rate in ablation_rates:
+                recon = ae.decode_with_ablation(
+                    codes, grid_shape, ablate_wavelet=rate, ablate_amplitude=0.0,
+                    decoder_masks=decoder_masks, deterministic=True
+                )
+                recon_np = recon[row].permute(1, 2, 0).float().cpu().numpy()
+                recon_np = np.clip(recon_np, 0, 1)
+                axes[row, col].imshow(recon_np)
+                axes[row, col].set_title(f'Wav {int(rate*100)}%' if row == 0 else '')
+                axes[row, col].axis('off')
+                col += 1
+
+            # Amplitude ablations
+            for rate in ablation_rates:
+                recon = ae.decode_with_ablation(
+                    codes, grid_shape, ablate_wavelet=0.0, ablate_amplitude=rate,
+                    decoder_masks=decoder_masks, deterministic=True
+                )
+                recon_np = recon[row].permute(1, 2, 0).float().cpu().numpy()
+                recon_np = np.clip(recon_np, 0, 1)
+                axes[row, col].imshow(recon_np)
+                axes[row, col].set_title(f'Amp {int(rate*100)}%' if row == 0 else '')
+                axes[row, col].axis('off')
+                col += 1
+
+    plt.suptitle('Subspace Ablation Exemplars\n(Wavelet = frequency/texture | Amplitude = intensity/color)',
+                 fontsize=12, y=1.02)
+    plt.tight_layout()
+    logger.save_figure(fig, name)

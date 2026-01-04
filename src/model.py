@@ -407,6 +407,9 @@ class coolerLDTformerZC(nn.Module):
                 if 'window_size' not in attn_cfg:
                     attn_cfg['window_size'] = 2  # Euclidean dist² ≤ 4 covers 3x3
 
+                sparsity_mode = sparse_ae_config['sparsity_mode']
+                wavelet_gating = sparse_ae_config['wavelet_gating']
+                n_wavelet_dims = sparse_ae_config['n_wavelet_dims']  # None = code_dim // 2
                 self.sparse_ae = SwiGLUFSQAutoencoder(
                     n_levels=sparse_ae_config['n_levels'],
                     patch_size=sparse_ae_config['patch_size'],
@@ -415,15 +418,20 @@ class coolerLDTformerZC(nn.Module):
                     k_per_patch=sparse_ae_config['k_per_patch'],
                     residual_scale=sparse_ae_config['residual_scale'],
                     n_layers=sparse_ae_config['n_layers'],
-                    attn_config=attn_cfg
+                    attn_config=attn_cfg,
+                    sparsity_mode=sparsity_mode,
+                    wavelet_gating=wavelet_gating,
+                    n_wavelet_dims=n_wavelet_dims
                 )
 
                 self.patch_embedder = SwiGLUPatchEmbedder(self.sparse_ae, embed_dim=dim)
                 self.patch_unembedder = SwiGLUPatchUnembedder(self.sparse_ae, self.patch_embedder)
 
+                wavelet_str = f", wavelet={n_wavelet_dims or 'half'}" if wavelet_gating else ""
                 print(f"[Model] Using SwiGLU AE: {sparse_ae_config['n_levels']} levels, "
                       f"code_dim={sparse_ae_config['code_dim']}, "
                       f"k={sparse_ae_config['k_per_patch']}, "
+                      f"sparsity={sparsity_mode}{wavelet_str}, "
                       f"attn={attn_cfg['mode']}")
 
             else:

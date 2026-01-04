@@ -216,19 +216,22 @@ class SpanEmbedder:
         return torch.cat(all_embeds, dim=0), span_objects, content_hashes
 
     def _embed_batched(self, context_blocks: List[ContextBlock]) -> Tuple[torch.Tensor, List[Span], List[int]]:
-        """Batched embedding with attention - groups images by grid_shape."""
+        """Batched embedding with attention - groups images by spatial grid_shape.
+
+        Note: For latent diffusion (SwiGLU AE), the embedder returns (GH, GW, n_levels) shape,
+        but we group by (GH, GW) for batching efficiency. The full shape is stored in Span.shape.
+        """
         # Separate text and latent blocks, tracking original indices
         text_blocks = []  # (original_idx, block)
+        # Group by spatial (GH, GW) for batching - full shape stored in Span later
         latent_groups: Dict[Tuple[int, int], List[Tuple[int, ContextBlock]]] = {}
 
         for i, block in enumerate(context_blocks):
             if block.type == 'text':
                 text_blocks.append((i, block))
             elif block.type == 'latent':
-                # Compute grid_shape for grouping
+                # Compute spatial grid_shape for grouping (2D even if embedder returns 3D)
                 img = block.content
-                # Use a dummy logsnr to get grid_shape via _pad_and_patch
-                dummy_logsnr = torch.zeros(1, img.shape[-2], img.shape[-1], device=img.device)
                 patches = self.patch_emb._pad_and_patch(img)
                 if img.dim() == 4:  # batched
                     grid_shape = (patches.shape[2], patches.shape[3])
@@ -411,11 +414,13 @@ class SpanUnembedder:
         """Batched decoding with attention - groups latent spans by grid_shape."""
         device = z.device
 
-        # Group latent spans by grid_shape
+        # Group latent spans by spatial grid_shape (GH, GW), ignoring n_levels dimension
+        # Shape can be (GH, GW) for pixel diffusion or (GH, GW, n_levels) for latent diffusion
         latent_groups: Dict[Tuple[int, int], List[Tuple[int, Span]]] = {}
         for i, span in enumerate(spans):
             if span.type == 'latent':
-                grid_shape = span.shape
+                # Extract spatial (GH, GW) for grouping - works for both 2D and 3D shapes
+                grid_shape = span.shape[:2] if len(span.shape) >= 2 else span.shape
                 if grid_shape not in latent_groups:
                     latent_groups[grid_shape] = []
                 latent_groups[grid_shape].append((i, span))
@@ -434,6 +439,7 @@ class SpanUnembedder:
                 span_idx, span = group[0]
                 z_span = z[span.start_idx:span.end_idx]
                 mask = self._get_cached_mask(grid_shape, device)
+                # Pass full span.shape (may be 2D or 3D) to unembedder
                 reconstruction = self.patch_unembed(z_span, span.shape, block_mask=mask)
 
                 if span.original_shape is not None:
@@ -443,7 +449,7 @@ class SpanUnembedder:
                 results[span_idx]['image_vpreds'] = reconstruction[:-1]
                 results[span_idx]['image_logsnrs'] = reconstruction[-1:]
             else:
-                # Batch multiple spans with same grid_shape
+                # Batch multiple spans with same spatial grid_shape
                 span_embeddings = []
                 for span_idx, span in group:
                     z_span = z[span.start_idx:span.end_idx]
@@ -451,7 +457,9 @@ class SpanUnembedder:
 
                 z_batch = torch.stack(span_embeddings, dim=0)  # [B, L, D]
                 mask = self._get_cached_mask(grid_shape, device)
-                reconstructions = self.patch_unembed(z_batch, grid_shape, block_mask=mask)  # [B, C+1, H, W]
+                # Use first span's shape (all have same grid but include n_levels if 3D)
+                batch_shape = group[0][1].shape
+                reconstructions = self.patch_unembed(z_batch, batch_shape, block_mask=mask)  # [B, C+1, H, W]
 
                 # Scatter results back
                 for batch_idx, (span_idx, span) in enumerate(group):

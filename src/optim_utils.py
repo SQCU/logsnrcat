@@ -1074,14 +1074,15 @@ def classify_parameters(
     if norm_patterns is None:
         norm_patterns = ['norm', 'ln', 'layernorm', 'rmsnorm']
     if fsq_patterns is None:
-        # code_proj: feeds into sigmoid FSQ (gradient attenuated by sigmoid')
+        # code_proj: inside encoders, feeds into sigmoid FSQ (gradient attenuated by sigmoid')
+        # latent_code_proj/unproj: wrapper projections for latent diffusion
         # fsq: the quantization module itself
         # sparsity: sparse masking zeros most gradients
         # dim_logits: topk selection has zero gradient (now has MoE STE but still heterogeneous)
         # attn_gate: post-attention sigmoid gate
         # logsnr: small auxiliary heads, not worth orthogonalizing
-        fsq_patterns = ['code_proj', 'code_unproj', 'fsq', 'sparsity', 'dim_logits',
-                        'attn_gate', 'logsnr']
+        fsq_patterns = ['code_proj', 'latent_code_proj', 'latent_code_unproj', 'fsq',
+                        'sparsity', 'dim_logits', 'attn_gate', 'logsnr']
     if ae_patterns is None:
         # All AE components should use AdamW, not Muon
         # - sparse_ae: the full autoencoder (encoders, decoders)

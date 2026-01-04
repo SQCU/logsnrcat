@@ -70,22 +70,24 @@ class PerDimSparsity(nn.Module):
         # Gate predictor: from latent to gate logits
         self.gate_proj = nn.Linear(code_dim, code_dim)
 
-    def forward(self, latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, latent: torch.Tensor, k_override: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             latent: (B, N, code_dim) - pre-quantization latent
+            k_override: optional override for k (for k-annealing during training)
         Returns:
             sparse_latent: (B, N, code_dim) with ~95% zeros
             gate_weights: (B, N, code_dim) soft weights for logging
         """
         B, N, D = latent.shape
+        k = k_override if k_override is not None else self.k
 
         # Predict gate from latent
         gate_logits = self.gate_proj(latent)  # (B, N, D)
         gate_weights = torch.sigmoid(gate_logits)  # (B, N, D)
 
         # Top-k per patch
-        _, topk_idx = gate_weights.topk(self.k, dim=-1)  # (B, N, k)
+        _, topk_idx = gate_weights.topk(k, dim=-1)  # (B, N, k)
 
         # Create hard mask
         hard_mask = torch.zeros_like(gate_weights)
@@ -117,13 +119,15 @@ class SparseLevelEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor, logsnr_patches: torch.Tensor,
                 grid_shape: Optional[Tuple[int, int]] = None,
-                block_masks: Optional[list] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                block_masks: Optional[list] = None,
+                k_override: Optional[int] = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, N, patch_dim) - patch features
             logsnr_patches: (B, N, 1) - per-patch logsnr values
             grid_shape: (H, W) spatial grid dimensions for attention masks
             block_masks: Optional pre-built masks to avoid inductor issues
+            k_override: optional override for k (for k-annealing during training)
         Returns:
             sparse_codes: (B, N, code_dim) with ~95% zeros
             gate_weights: (B, N, code_dim) soft weights for logging
@@ -142,7 +146,7 @@ class SparseLevelEncoder(nn.Module):
         codes = self.fsq(pre_quant)
 
         # Then apply sparsity (mask after FSQ so zeros stay zero)
-        sparse_codes, gate_weights = self.sparsity(codes)
+        sparse_codes, gate_weights = self.sparsity(codes, k_override=k_override)
 
         return sparse_codes, gate_weights, pre_quant
 
@@ -339,7 +343,8 @@ class SparsePerDimFSQAutoencoder(nn.Module):
 
     def forward(self, images: torch.Tensor, logsnr_map: Optional[torch.Tensor] = None,
                 encoder_masks: Optional[list] = None, decoder_masks: Optional[list] = None,
-                grid_shape: Optional[Tuple[int, int]] = None) -> dict:
+                grid_shape: Optional[Tuple[int, int]] = None,
+                k_override: Optional[int] = None) -> dict:
         """
         Forward pass with per-level logsnr handling.
 
@@ -350,6 +355,7 @@ class SparsePerDimFSQAutoencoder(nn.Module):
             decoder_masks: Optional pre-built decoder masks (built outside compile)
             grid_shape: Optional (GH, GW) grid dimensions. If None, computed from images.
                        Pass this from OUTSIDE compile to avoid symbolic shape issues.
+            k_override: Optional override for k sparsity (for k-annealing during training)
         Returns:
             dict with recon, level_recons, codes, gate_weights, sparsity,
             logsnr_preds (per-level), level_logsnrs (input logsnr per level)
@@ -400,7 +406,8 @@ class SparsePerDimFSQAutoencoder(nn.Module):
             dec_mask = decoder_masks[level] if decoder_masks is not None else None
 
             codes, gate_weights, _ = self.encoders[level](
-                residual, level_logsnr, grid_shape=grid_shape, block_masks=enc_mask
+                residual, level_logsnr, grid_shape=grid_shape, block_masks=enc_mask,
+                k_override=k_override
             )
             codes_list.append(codes)
             all_gate_weights.append(gate_weights)

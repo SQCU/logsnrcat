@@ -30,8 +30,8 @@ enabled = true
 n_kv_heads = 4         # 8 query heads / 2 kv heads = 4x sharing
 
 [training]
-ae_steps = 1000
-steps = 1000
+ae_steps = 250
+steps = 250
 lambda_coeff = 0.2
 mode = "naive"
 batch_size = 4
@@ -60,13 +60,26 @@ use_dedicated_stream = true
 # Sparse AE Configuration - SWIGLU VARIANT
 [training.sparse_ae]
 enabled = true
-latent_diffusion = true  
-ae_type = "swiglu"     # <<< Changed: binary FSQ, per-patch sparsity, 2D RoPE
+latent_diffusion = true
+ae_type = "swiglu"     # <<< Changed: binary FSQ, 2D RoPE
 n_levels = 7
 patch_size = 16
 hidden_dim = 256
 code_dim = 128
-k_per_patch = 6        # Each patch selects its own top-4 dims (~97% sparsity)
+# Sparsity mode: per_level = same dims active for all patches (stable), per_patch = content-dependent (prone to collapse)
+sparsity_mode = "per_level"  # per_level is more stable than per_patch
+# Wavelet subspace routing: partitions code_dim into wavelet and amplitude subspaces
+# Sparsity pattern across subspaces encodes pathway selection (no sigmoid gating needed)
+wavelet_gating = true  # Enable subspace-routed encoder/decoder
+# n_wavelet_dims = 64  # Wavelet subspace size (default: code_dim // 2 = 64)
+# Entropy regularization to prevent subspace collapse (all codes routing to one subspace)
+# Higher weight = stronger push for balanced subspace usage
+routing_entropy_weight = 0.01  # Gentle regularization (0 = disabled)
+k_per_patch = 9        # Final k: top-6 dims active (~95% sparsity)
+# K-annealing: exponential decay from k_start to k_per_patch over k_anneal_steps
+# Curriculum: start with more active dims (easier task), progressively constrain
+k_start = 32           # Start with 32 active dims (easier reconstruction)
+k_anneal_steps = 250  # Anneal to k_per_patch=6 over 5000 steps
 residual_scale = 2.0
 fourier_dim = 16
 ae_loss_weight = 0.1   # Weight for AE loss in joint training (not used in standalone AE warmup)
@@ -81,8 +94,8 @@ loss_type = "final_mse"  # Reference uses final only, cumulative dilutes gradien
 enabled = true
 mse_start = 1.0    # 100% MSE at start
 bce_start = 0.0    # 0% BCE at start
-mse_end = 0.8      # 10% MSE at end
-bce_end = 0.2      # 90% BCE at end
+mse_end = 0.95      # 10% MSE at end
+bce_end = 0.05      # 90% BCE at end
 schedule = "linear"  # "linear", "cosine", or "step"
 pct_switch = 0.8   # For "step" schedule: switch at this fraction
 
@@ -93,8 +106,8 @@ pct_switch = 0.8   # For "step" schedule: switch at this fraction
 enabled = true
 mse_start = 1.0    # 100% MSE at start
 bce_start = 0.0    # 0% BCE at start
-mse_end = 0.9      # 90% MSE at end
-bce_end = 0.1      # 10% BCE at end
+mse_end = 0.95      # 90% MSE at end
+bce_end = 0.05      # 10% BCE at end
 schedule = "linear"
 
 # Attention configuration - sliding window for 3x3 neighborhood
@@ -161,7 +174,7 @@ state_dtype = "bf16"  # bf16 for momentum buffer (no v term = numerically stable
 [training.optimizer.adamw]
 lr = 3e-4
 weight_decay = 0.1
-max_lr = 3e-5
+max_lr = 3e-4
 betas = [0.9, 0.95]
 # state_dtype = fp32 (always, PyTorch enforces this)
 
@@ -191,7 +204,7 @@ fsq_patterns = ["code_proj", "code_unproj", "fsq", "sparsity", "dim_logits", "le
 [training.ae_optimizer]
 lr = 3e-4
 weight_decay = 0.1
-max_lr = 3e-5
+max_lr = 3e-4
 pct_start = 0.1
 
 [sampling]
@@ -203,6 +216,15 @@ enable_sweep = false
 sweep_count = 4
 sweep_length = 4
 sweep_range = [5.0, 1.0]
+
+# Subspace sensitivity sweep: evaluates how much wavelet vs amplitude subspaces
+# contribute to reconstruction quality by stochastically ablating each
+[sampling.subspace_sensitivity]
+enabled = true
+ablation_rates = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+n_trials = 5      # Stochastic trials per rate (averaged)
+n_samples = 16    # Images to evaluate per resolution
+resolutions = [64, 128]  # Resolutions to test
 
 # Page table sized for actual workload:
 # base_cost = (64/4)² × 16 = 4096 tokens/batch
@@ -218,10 +240,16 @@ output_dir = "./experiments_swiglu_ae"  # <<< Changed
 log_interval = 1
 sample_after_training = true
 
+# Eval server integration - yeet weights at end of training
+[logging.eval_server]
+enabled = true
+url = "http://localhost:8421"
+health_check = true
+
 # Dataset mix - Fractal-heavy for AE warmup (same as sparse_ae_fractal)
 [dataset_mix.fractal_main]
 type = "fractal"
-ratio = 0.5
+ratio = 0.2
 noise_mode = "uniform"
 [dataset_mix.fractal_main.params]
 seed = 42
@@ -236,7 +264,7 @@ max_snr = 5.0
 
 [dataset_mix.fractal_split]
 type = "fractal"
-ratio = 0.5
+ratio = 0.2
 noise_mode = "split"
 [dataset_mix.fractal_split.params]
 seed = 123
@@ -265,7 +293,7 @@ angle_range_deg = 30.0
 
 [dataset_mix.torus_baseline]
 type = "torus"
-ratio = 0.3
+ratio = 0.2
 noise_mode = "split"
 [dataset_mix.torus_baseline.params]
 seed = 789
@@ -279,7 +307,7 @@ angle_range_deg = 45.0
 # Sparse sprite atlas - pixel art with logit-biased sampling
 [dataset_mix.sprite_atlas]
 type = "sprite_atlas"
-ratio = 1.0
+ratio = 2.0
 noise_mode = "uniform"
 [dataset_mix.sprite_atlas.params]
 data_dir = "data/infinite_fusion"
@@ -290,9 +318,9 @@ adjustment_mode = "additive"
 temperature = 1.0
 seed = 42
 [dataset_mix.sprite_atlas.params.sampling_config.adjustments]
-"134" = 0.1              # Head ID 134 +0.1
-"*.134" = 0.1            # Body ID 134 +0.1
-"procedural:*" = -0.1    # Procedural sprites -0.1 (prefer custom/base)
+"134" = 1.1              # Head ID 134 +0.1
+"*.134" = 1.1            # Body ID 134 +0.1
+"procedural:*" = -1.1    # Procedural sprites -0.1 (prefer custom/base)
 [dataset_mix.sprite_atlas.params.render_config]
 res_scaling = "do_not"
 background_mode = "solid_random"  # Uniform color per sample (not noise)

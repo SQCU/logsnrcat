@@ -125,6 +125,42 @@ def cumulative_mse_with_contribution(
 
 
 # =============================================================================
+# K-Annealing Schedule (for sparsity curriculum)
+# =============================================================================
+
+def get_k_for_step(
+    step: int,
+    k_start: int,
+    k_end: int,
+    anneal_steps: int
+) -> int:
+    """
+    Compute current k for sparsity annealing.
+
+    Exponential decay from k_start to k_end over anneal_steps.
+    Curriculum: start with more active dims (easier task), progressively constrain.
+
+    From reference: k = k_start * ((k_end / k_start) ** t)
+
+    Args:
+        step: Current training step
+        k_start: Starting k (more active dims)
+        k_end: Final k (target sparsity)
+        anneal_steps: Steps over which to anneal
+
+    Returns:
+        Current k value (integer, clamped to k_end minimum)
+    """
+    if k_start is None or k_start <= k_end:
+        return k_end
+
+    t = min(step / max(anneal_steps, 1), 1.0)
+    # Exponential interpolation: k_start * (k_end/k_start)^t
+    k = k_start * ((k_end / k_start) ** t)
+    return max(int(round(k)), k_end)
+
+
+# =============================================================================
 # Scheduled MSE+BCE Loss
 # =============================================================================
 
@@ -330,6 +366,7 @@ def scheduled_mse_bce_velocity_loss(
 
     # MSE loss (with optional variance tracking)
     sq_err = (v_pred - v_target) ** 2
+    weights = None
     if variance_tracker is not None:
         # Need logsnr_map for variance tracker - get from kwargs if provided
         logsnr_map = kwargs.get('logsnr_map')
@@ -363,6 +400,16 @@ def scheduled_mse_bce_velocity_loss(
         'bce_weight': bce_weight,
         'loss_unweighted': sq_err.mean().detach(),
     }
+
+    # Add variance tracker stats when active
+    if weights is not None:
+        with torch.no_grad():
+            stats['weight_mean'] = weights.mean().detach()
+            stats['weight_min'] = weights.min().detach()
+            stats['weight_max'] = weights.max().detach()
+            # loss_var = weight range as proxy for correction magnitude
+            stats['loss_var'] = (weights.max() - weights.min()).detach()
+
     return loss, stats
 
 
@@ -480,8 +527,8 @@ def get_ae_loss_fn(config: Dict[str, Any]) -> Callable:
     loss_type = sparse_ae_cfg['loss_type']
 
     # Check if loss schedule is enabled
-    loss_schedule_cfg = sparse_ae_cfg.get('loss_schedule', {})
-    if isinstance(loss_schedule_cfg, dict) and loss_schedule_cfg.get('enabled', False):
+    loss_schedule_cfg = sparse_ae_cfg['loss_schedule']
+    if loss_schedule_cfg['enabled']:
         # Use CUMULATIVE variant: applies MSE+BCE to each level independently
         # This avoids BCE gradient interference between residual levels
         def scheduled_loss_wrapper(output, target, **kwargs):
@@ -602,7 +649,8 @@ def prepare_ae_batch(
 
 def compute_ae_forward(
     ae_model: nn.Module,
-    prepared: Dict[str, Any]
+    prepared: Dict[str, Any],
+    k_override: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Run AE forward pass and return uniform output dict.
@@ -616,6 +664,7 @@ def compute_ae_forward(
     Args:
         ae_model: The sparse AE model
         prepared: Dict from prepare_ae_batch()
+        k_override: Optional override for k sparsity (for k-annealing during training)
 
     Returns:
         Dict with uniform keys: 'recon', 'level_recons', 'codes', 'sparsity', ...
@@ -626,7 +675,8 @@ def compute_ae_forward(
         prepared['images'],
         encoder_masks=encoder_masks,
         decoder_masks=decoder_masks,
-        grid_shape=prepared['grid_shape']
+        grid_shape=prepared['grid_shape'],
+        k_override=k_override
     )
 
     return output

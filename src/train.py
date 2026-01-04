@@ -259,12 +259,12 @@ def train_autoembed(components, config, iterator, logger=None):
     No transformer, no noise injection - pure AE reconstruction.
 
     KEY DESIGN: Calls sparse_ae.forward() DIRECTLY (not through wrapper projections).
-    The wrapper projections (code_proj, code_unproj) exist for main transformer interface,
-    not for AE training. Training through them adds an information bottleneck.
+    The wrapper projections (latent_code_proj/unproj) are trained later in latent diffusion,
+    not during AE warmup. AE warmup focuses solely on reconstruction quality.
 
     Loss functions are stateless and config-driven via src/losses.py.
     """
-    from .losses import get_ae_loss_fn, group_blocks_by_grid, prepare_ae_batch, compute_ae_forward
+    from .losses import get_ae_loss_fn, group_blocks_by_grid, prepare_ae_batch, compute_ae_forward, get_k_for_step
 
     config = sanitize_config(config)
 
@@ -294,12 +294,24 @@ def train_autoembed(components, config, iterator, logger=None):
     # Get loss function from config (stateless, config-driven)
     ae_loss_fn = get_ae_loss_fn(config)
     loss_type = sparse_ae_cfg['loss_type']
-    loss_schedule_cfg = sparse_ae_cfg.get('loss_schedule', {})
-    loss_schedule_enabled = isinstance(loss_schedule_cfg, dict) and loss_schedule_cfg.get('enabled', False)
+    loss_schedule_cfg = sparse_ae_cfg['loss_schedule']
+    loss_schedule_enabled = loss_schedule_cfg['enabled']
+
+    # K-annealing config
+    k_start = sparse_ae_cfg.get('k_start')
+    k_end = sparse_ae_cfg['k_per_patch']  # Final k
+    k_anneal_steps = sparse_ae_cfg['k_anneal_steps']
+    k_annealing_enabled = k_start is not None and k_start > k_end
+
+    # Subspace routing entropy regularization (only when wavelet_gating=True)
+    routing_entropy_weight = sparse_ae_cfg['routing_entropy_weight']
+    wavelet_gating = sparse_ae_cfg['wavelet_gating']
 
     print(f"\n--- Training: Sparse AutoEncoder ---")
     print(f"    Levels: {sparse_ae.n_levels}, Code dim: {sparse_ae.code_dim}, "
           f"Sparsity k: {sparse_ae.k_per_patch}")
+    if k_annealing_enabled:
+        print(f"    K-annealing: {k_start} -> {k_end} over {k_anneal_steps} steps")
     if loss_schedule_enabled:
         mse_start = loss_schedule_cfg.get('mse_start', 1.0)
         bce_end = loss_schedule_cfg.get('bce_end', 0.9)
@@ -307,19 +319,22 @@ def train_autoembed(components, config, iterator, logger=None):
         print(f"    Loss: scheduled MSE→BCE ({schedule_type}), {mse_start:.0%} MSE → {bce_end:.0%} BCE")
     else:
         print(f"    Loss: {loss_type}")
+    if wavelet_gating and routing_entropy_weight > 0:
+        print(f"    Entropy regularization: weight={routing_entropy_weight}")
 
     # Build AE module wrapper for optimizer
-    # Wraps all AE-related parameters for unified optimizer handling
-    # NOTE: We train sparse_ae directly but ALSO train projection layers
-    # (they're used later during joint training with main transformer)
+    # Wraps AE and projection layers for unified optimizer handling
+    # NOTE: latent_code_proj/unproj are trained later in latent diffusion,
+    # but we include them here so they're part of the same model checkpoint
     class AEModule(nn.Module):
         """Wrapper to expose all AE parameters for optimizer."""
         def __init__(self, sparse_ae, patch_emb, patch_unemb):
             super().__init__()
             self.sparse_ae = sparse_ae
-            self.code_proj = patch_emb.code_proj
-            self.code_unproj = patch_unemb.code_unproj
-            # logsnr projection is optional - SwiGLU variant is pure compression (no logsnr)
+            # Per-token projections (trained in latent diffusion phase)
+            self.latent_code_proj = patch_emb.latent_code_proj
+            self.latent_code_unproj = patch_unemb.latent_code_unproj
+            # LogSNR conditioning/decoding
             if hasattr(patch_emb, 'logsnr_proj'):
                 self.logsnr_proj = patch_emb.logsnr_proj
             if hasattr(patch_unemb, 'logsnr_decoder'):
@@ -389,6 +404,9 @@ def train_autoembed(components, config, iterator, logger=None):
             per_source_losses = {}  # Track per-source losses for meaningful plots
             n_latent = 0
 
+            # Compute current k for k-annealing (None if disabled)
+            current_k = get_k_for_step(i, k_start, k_end, k_anneal_steps) if k_annealing_enabled else None
+
             for grid_shape, group in latent_groups.items():
                 # Prepare batched inputs
                 prepared = prepare_ae_batch(group, sparse_ae, device)
@@ -396,11 +414,21 @@ def train_autoembed(components, config, iterator, logger=None):
                 batch_sources = prepared['sources']
 
                 # DIRECT AE forward (no wrapper projection bottleneck!)
-                output = compute_ae_forward(sparse_ae, prepared)
+                output = compute_ae_forward(sparse_ae, prepared, k_override=current_k)
 
                 # Stateless loss computation (pure reconstruction, no logsnr)
                 # Pass step/total_steps for scheduled loss (ignored by non-scheduled losses)
                 loss, stats = ae_loss_fn(output, prepared['images'], step=i, total_steps=steps)
+
+                # Entropy regularization for subspace routing (wavelet_gating only)
+                # High entropy = balanced subspace usage = good, so we SUBTRACT entropy
+                if wavelet_gating and routing_entropy_weight > 0 and 'routing_entropy_mean' in output:
+                    entropy_loss = -routing_entropy_weight * output['routing_entropy_mean']
+                    loss = loss + entropy_loss
+                    stats['entropy_loss'] = entropy_loss.item()
+                    stats['routing_entropy'] = output['routing_entropy_mean'].item()
+                    stats['wav_active'] = output['wav_active_mean'].item()
+                    stats['amp_active'] = output['amp_active_mean'].item()
 
                 # Compute per-sample MSE for per-source tracking (no grad needed)
                 with torch.no_grad():
@@ -478,15 +506,21 @@ def train_autoembed(components, config, iterator, logger=None):
                         entry['bce_weight'] = loss_stats_accum.get('bce_weight', 0.0)
                         # Compute lerp progress for analysis
                         entry['lerp_t'] = i / max(steps - 1, 1)
+                    # Add k-annealing field when enabled
+                    if k_annealing_enabled:
+                        entry['current_k'] = current_k
                     history.append(entry)
 
             # Progress bar shows batch-averaged loss
             loss_val = loss_stats_accum.get('recon_loss', total_loss.item())
             sparsity_val = loss_stats_accum.get('sparsity', 0.0)
-            pbar.set_postfix({
+            postfix = {
                 'recon': f'{loss_val:.4f}',
                 'sparse': f'{sparsity_val:.1%}'
-            })
+            }
+            if k_annealing_enabled:
+                postfix['k'] = current_k
+            pbar.set_postfix(postfix)
 
     # --- End of training: collect reconstruction samples for visualization ---
     if logger is not None and steps > 0:
@@ -878,8 +912,8 @@ def train_latent_diffusion(
         return pd.DataFrame()
 
     # Check topology config - must be "latent" mode
-    topo_cfg = sparse_ae_cfg.get('topology', {})
-    diffusion_space = topo_cfg.get('diffusion_space', 'pixel')
+    topo_cfg = sparse_ae_cfg['topology']
+    diffusion_space = topo_cfg['diffusion_space']
     if diffusion_space != 'latent':
         print(f"\n--- Skipping latent diffusion (diffusion_space = '{diffusion_space}', expected 'latent') ---")
         return pd.DataFrame()
@@ -895,33 +929,33 @@ def train_latent_diffusion(
     code_dim = sparse_ae.code_dim
 
     # Topology geometry config
-    level_lambda = topo_cfg.get('level_lambda', 0.5)
-    level_scale = topo_cfg.get('level_scale', 1.0)
-    vertical_free = topo_cfg.get('vertical_attention_free', True)
+    level_lambda = topo_cfg['level_lambda']
+    level_scale = topo_cfg['level_scale']
+    vertical_free = topo_cfg['vertical_attention_free']
     window_size = config['model']['window_size']
 
     # Training params from [training]
     steps = config['training']['steps']
     bs = config['training']['batch_size']
     lambda_coeff = config['training']['lambda_coeff']
-    recon_weight = sparse_ae_cfg.get('ae_loss_weight', 0.1)
-    logsnr_weight = sparse_ae_cfg.get('logsnr_loss_weight', 0.1)
+    recon_weight = sparse_ae_cfg['ae_loss_weight']
+    logsnr_weight = sparse_ae_cfg['logsnr_loss_weight']
 
     # Diffusion loss schedule config (MSE -> partial BCE for v-field)
-    diffusion_loss_schedule = sparse_ae_cfg.get('diffusion_loss_schedule', {})
-    use_scheduled_v_loss = diffusion_loss_schedule.get('enabled', False)
+    diffusion_loss_schedule = sparse_ae_cfg['diffusion_loss_schedule']
+    use_scheduled_v_loss = diffusion_loss_schedule['enabled']
     if use_scheduled_v_loss:
         print(f"\n--- Diffusion Loss Schedule ENABLED ---")
-        print(f"    V-field MSE: {diffusion_loss_schedule.get('mse_start', 1.0)} -> {diffusion_loss_schedule.get('mse_end', 0.9)}")
-        print(f"    V-field BCE: {diffusion_loss_schedule.get('bce_start', 0.0)} -> {diffusion_loss_schedule.get('bce_end', 0.1)}")
+        print(f"    V-field MSE: {diffusion_loss_schedule['mse_start']} -> {diffusion_loss_schedule['mse_end']}")
+        print(f"    V-field BCE: {diffusion_loss_schedule['bce_start']} -> {diffusion_loss_schedule['bce_end']}")
 
     # AE loss schedule config (pinned at END values for reconstruction during diffusion)
-    ae_loss_schedule = sparse_ae_cfg.get('loss_schedule', {})
-    use_scheduled_recon_loss = ae_loss_schedule.get('enabled', False)
+    ae_loss_schedule = sparse_ae_cfg['loss_schedule']
+    use_scheduled_recon_loss = ae_loss_schedule['enabled']
     if use_scheduled_recon_loss:
         # Pin at end values (warmup already lerped through the schedule)
-        recon_mse_weight = ae_loss_schedule.get('mse_end', 0.1)
-        recon_bce_weight = ae_loss_schedule.get('bce_end', 0.9)
+        recon_mse_weight = ae_loss_schedule['mse_end']
+        recon_bce_weight = ae_loss_schedule['bce_end']
         print(f"    Recon MSE: {recon_mse_weight:.2f} (pinned)")
         print(f"    Recon BCE: {recon_bce_weight:.2f} (pinned)")
 
@@ -1193,14 +1227,23 @@ def train_latent_diffusion(
 
                     for b_idx in range(batch_size):
                         block = group[b_idx][0]  # (block, img, lsnr) tuple
-                        deferred_sample_stats.append({
+                        stat_entry = {
                             'step': i,
                             'source': getattr(block, 'source', 'unknown'),
                             'type': 'latent',
                             'loss_tensor': per_sample_loss[b_idx].detach(),
                             'logsnr_tensor': per_sample_logsnr[b_idx].detach(),
                             'resolution': res,
-                        })
+                        }
+                        # Add variance-tracker stats if available (from last_v_stats)
+                        if use_scheduled_v_loss and last_v_stats is not None:
+                            if 'loss_unweighted' in last_v_stats:
+                                stat_entry['loss_unweighted_tensor'] = last_v_stats['loss_unweighted']
+                            if 'weight_mean' in last_v_stats:
+                                stat_entry['weight_mean_tensor'] = last_v_stats['weight_mean']
+                            if 'loss_var' in last_v_stats:
+                                stat_entry['loss_var_tensor'] = last_v_stats['loss_var']
+                        deferred_sample_stats.append(stat_entry)
 
             if n_latent == 0:
                 continue
@@ -1268,6 +1311,9 @@ def train_latent_diffusion(
             }
             if use_scheduled_v_loss and last_v_stats is not None:
                 postfix['v_bce'] = f'{last_v_stats["bce_weight"]:.2f}'
+                # Show variance correction if active
+                if 'weight_mean' in last_v_stats:
+                    postfix['w_μ'] = f'{float(last_v_stats["weight_mean"]):.2f}'
             if use_scheduled_recon_loss and last_recon_stats is not None:
                 postfix['r_bce'] = f'{last_recon_stats["bce_weight"]:.2f}'
             pbar.set_postfix(postfix)
