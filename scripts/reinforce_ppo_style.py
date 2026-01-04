@@ -48,7 +48,13 @@ def main():
     parser.add_argument("--mse-weight", type=float, default=0.0, help="Reconstruction MSE weight (alternative to trust region)")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--vaporeon", action="store_true")
+    parser.add_argument("--run-id", type=str, default=None, help="Run identifier for output files")
     args = parser.parse_args()
+
+    # Auto-generate run ID if not provided
+    if args.run_id is None:
+        import datetime
+        args.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"Connecting to eval server at http://{args.host}:{args.port}...")
     health = requests.get(f"http://{args.host}:{args.port}/health").json()
@@ -144,7 +150,7 @@ vaporeon_config = {
     "sampling_config": {
         "split": "all", "mode": "uniform_sprites",
         "adjustment_mode": "additive", "temperature": 1.0, "seed": 42,
-        "adjustments": {"134": 10.0, "*.134": 10.0}
+        "adjustments": {"134": 1.0, "*.134": 1.0}
     },
     "render_config": {"res_scaling": "do_not", "background_mode": "solid_random", "jitter": True}
 }
@@ -161,7 +167,8 @@ n_lora_params = sum(p.numel() for p in lora_params)
 f"LoRA layers wrapped: {{len(ctx._lora_layers)}} layers, {{n_lora_params}} params (rank={args.lora_rank})"
 '''
 
-    print(f"\nSetting up LoRA on projection layers (rank={args.lora_rank})...")
+    print(f"\nRun ID: {args.run_id}")
+    print(f"Setting up LoRA on projection layers (rank={args.lora_rank})...")
     result = eval_code(setup_code, args.host, args.port)
     if not result['success']:
         print(f"ERROR: {result['error']}")
@@ -435,7 +442,7 @@ ctx._compare_images = {
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     suffix = "_vaporeon" if args.vaporeon else ""
-    output_path = output_dir / f"reinforce_ppo_style{suffix}.png"
+    output_path = output_dir / f"reinforce_ppo_{args.run_id}{suffix}.png"
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -471,7 +478,7 @@ ctx._compare_images = {
         plt.suptitle('Before/After LoRA Policy Optimization', fontsize=12)
         plt.tight_layout()
 
-        compare_path = output_dir / f"reinforce_ppo_compare{suffix}.png"
+        compare_path = output_dir / f"reinforce_ppo_{args.run_id}_compare{suffix}.png"
         plt.savefig(compare_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Saved comparison to: {compare_path}")
