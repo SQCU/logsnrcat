@@ -124,13 +124,13 @@ for step in range(n_steps):
                                encoder_masks=encoder_masks, decoder_masks=decoder_masks)
         codes_list = [c.detach() for c in codes_list]
 
-    # Apply adapters (with gradients)
-    codes_adapted = []
-    for codes in codes_list:
-        codes_bf16 = codes.to(torch.bfloat16)
-        adapted = codes_bf16 + lora_enc(codes_bf16)
-        adapted = adapted + lora_dec(adapted)
-        codes_adapted.append(adapted)
+    # Apply adapters (with gradients) - keep in bf16
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        codes_adapted = []
+        for codes in codes_list:
+            adapted = codes + lora_enc(codes)
+            adapted = adapted + lora_dec(adapted)
+            codes_adapted.append(adapted)
 
     # Decode under three conditions
     with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
