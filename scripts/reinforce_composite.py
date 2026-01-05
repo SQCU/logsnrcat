@@ -60,7 +60,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import sys
-import traceback
 
 # === Logging Tee ===
 class LogTee:
@@ -78,7 +77,9 @@ class LogTee:
     def close(self):
         self.logfile.close()
 
-log_path = "/tmp/reinforce_{run_id}.log"
+import tempfile
+import os
+log_path = os.path.join(tempfile.gettempdir(), "reinforce_{args.run_id}.log")
 _log_tee = LogTee(log_path)
 sys.stdout = _log_tee
 
@@ -86,9 +87,6 @@ def _cleanup_tee():
     global _log_tee
     sys.stdout = _log_tee.stdout
     _log_tee.close()
-
-# Wrap everything in try/finally to ensure cleanup
-try:
 
 # === LoRA Implementation ===
 
@@ -259,20 +257,33 @@ run_id = "{args.run_id}"
 print(f"=== Composite REINFORCE run_id={{run_id}} ===")
 print(f"Log file: {{log_path}}")
 
-# Target modules for LoRA injection (decoder-only for reconstruction task)
-# Targeting: attention projections, MLP layers, and code embedding layers
+# Target modules for LoRA injection (encoder + decoder)
+# Targeting: attention projections, MLP layers, and code projection layers
 lora_targets = [
-    # Decoder attention
-    "decoders.0.transformer.layers",  # catches q_proj, k_proj, v_proj, out_proj
+    # Encoder transformers
+    "encoders.0.transformer.layers",
+    "encoders.1.transformer.layers",
+    # Encoder code projections
+    "encoders.0.wav_code_proj",
+    "encoders.0.amp_code_proj",
+    "encoders.1.wav_code_proj",
+    "encoders.1.amp_code_proj",
+    # Encoder input projections
+    "encoders.0.amplitude_proj",
+    "encoders.0.wavelet_proj",
+    "encoders.1.amplitude_proj",
+    "encoders.1.wavelet_proj",
+    # Decoder transformers
+    "decoders.0.transformer.layers",
     "decoders.1.transformer.layers",
-    # Decoder code embeddings (directly affect reconstruction)
+    # Decoder code embeddings
     "decoders.0.wav_embed",
     "decoders.0.amp_embed",
     "decoders.1.wav_embed",
     "decoders.1.amp_embed",
 ]
 
-print(f"Injecting LoRA (rank={args.lora_rank}) into decoder modules...")
+print(f"Injecting LoRA (rank={args.lora_rank}) into encoder + decoder modules...")
 lora_modules = inject_lora(ae, lora_targets, rank={args.lora_rank}, scale=1.0)
 lora_params = get_lora_params(lora_modules)
 print(f"Total LoRA modules: {{len(lora_modules)}}, params: {{sum(p.numel() for p in lora_params)}}")
@@ -570,14 +581,8 @@ ctx._composite_result = {{
 ctx._lora_modules = lora_modules
 ctx._composite_history = history
 
-except Exception as e:
-    print(f"\\n!!! EXCEPTION !!!")
-    print(traceback.format_exc())
-    ctx._composite_error = str(e)
-    raise
-finally:
-    print(f"\\n=== Run complete. Log saved to: {{log_path}} ===")
-    _cleanup_tee()
+print(f"\\n=== Run complete. Log saved to: {{log_path}} ===")
+_cleanup_tee()
 '''
 
     print(f"\nSubmitting {args.steps}-step composite REINFORCE to server...")
