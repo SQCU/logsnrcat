@@ -32,6 +32,18 @@ def eval_code(code: str, host: str, port: int, timeout: int = 120) -> dict:
     return resp.json()
 
 
+def format_error(error) -> str:
+    """Format error from eval server (handles both string and dict formats)."""
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        msg = f"{error.get('type', 'Error')}: {error.get('message', 'Unknown error')}"
+        if error.get('traceback'):
+            msg += f"\n{error['traceback']}"
+        return msg
+    return str(error)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Probe histogram divergence")
     parser.add_argument("--host", default=DEFAULT_HOST)

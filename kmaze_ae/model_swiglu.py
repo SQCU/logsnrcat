@@ -384,6 +384,11 @@ class SwiGLUEncoder(nn.Module):
     Sparsity modes:
     - "per_level": LevelSparsity - same dims active for all patches (learned, stable)
     - "per_patch": PerDimSparsity - content-dependent per-patch selection (expressive, prone to collapse)
+
+    Wavelet subspace routing (optional, wavelet_gating=True):
+    - Input: raw patches AND DWT coefficients, each projected to hidden_dim // 2, concatenated
+    - Code space: partitioned into wavelet and amplitude subspaces
+    - Sparsity pattern across subspaces encodes reconstruction pathway
     """
     def __init__(
         self,
@@ -393,20 +398,54 @@ class SwiGLUEncoder(nn.Module):
         k_per_patch: int = 4,
         n_layers: int = 4,
         attn_config: Optional[Dict[str, Any]] = None,
-        sparsity_mode: str = "per_level"
+        sparsity_mode: str = "per_level",
+        wavelet_gating: bool = False,
+        patch_size: int = 16,
+        n_wavelet_dims: Optional[int] = None
     ):
         super().__init__()
-        self.input_proj = nn.Linear(patch_dim, hidden_dim)
+        self.wavelet_gating = wavelet_gating
+        self.patch_size = patch_size
+        self.code_dim = code_dim
+        self.n_wavelet_dims = n_wavelet_dims or code_dim // 2
+        self.n_amplitude_dims = code_dim - self.n_wavelet_dims
+
+        # Input projection: dual path if wavelet_gating, single otherwise
+        if wavelet_gating:
+            self.amplitude_proj = nn.Linear(patch_dim, hidden_dim // 2)
+            self.wavelet_proj = nn.Linear(patch_dim, hidden_dim // 2)
+            self.input_proj = None  # Not used
+        else:
+            self.input_proj = nn.Linear(patch_dim, hidden_dim)
+            self.amplitude_proj = None
+            self.wavelet_proj = None
+
         self.transformer = TransformerEncoder(hidden_dim, n_layers=n_layers, attn_config=attn_config)
-        self.code_proj = nn.Linear(hidden_dim, code_dim)
+
+        # Code projection: dual if wavelet_gating (separate subspaces), single otherwise
+        if wavelet_gating:
+            self.wav_code_proj = nn.Linear(hidden_dim, self.n_wavelet_dims)
+            self.amp_code_proj = nn.Linear(hidden_dim, self.n_amplitude_dims)
+            self.code_proj = None  # Not used
+        else:
+            self.code_proj = nn.Linear(hidden_dim, code_dim)
+            self.wav_code_proj = None
+            self.amp_code_proj = None
+
         self.fsq = BinaryFSQ()
         self.sparsity_mode = sparsity_mode
 
-        # Create sparsity module based on mode
-        if sparsity_mode == "per_level":
-            self.sparsity = LevelSparsity(code_dim, k_per_patch)
-        else:  # per_patch
-            self.sparsity = PerDimSparsity(code_dim, k_per_patch)
+        # Create sparsity module based on mode and wavelet_gating
+        if wavelet_gating:
+            if sparsity_mode == "per_level":
+                self.sparsity = SubspaceSparsity(code_dim, k_per_patch, self.n_wavelet_dims)
+            else:  # per_patch
+                self.sparsity = SubspacePerPatchSparsity(code_dim, k_per_patch, self.n_wavelet_dims)
+        else:
+            if sparsity_mode == "per_level":
+                self.sparsity = LevelSparsity(code_dim, k_per_patch)
+            else:  # per_patch
+                self.sparsity = PerDimSparsity(code_dim, k_per_patch)
 
     def forward(
         self,
@@ -424,17 +463,32 @@ class SwiGLUEncoder(nn.Module):
 
         Returns:
             sparse_codes: [B, N, code_dim] sparse binary codes in {-1, +1, 0}
-            gate_weights: [B, N, code_dim] soft weights for logging
+            gate_weights: [B, N, code_dim] or [code_dim] soft weights for logging
         """
-        h = self.input_proj(patches)
+        # Input projection: dual path with concat if wavelet_gating
+        if self.wavelet_gating:
+            wavelet_coeffs = batch_dwt2d(patches, self.patch_size)
+            h_amp = self.amplitude_proj(patches)       # [B, N, hidden_dim // 2]
+            h_wav = self.wavelet_proj(wavelet_coeffs)  # [B, N, hidden_dim // 2]
+            h = torch.cat([h_amp, h_wav], dim=-1)      # [B, N, hidden_dim]
+        else:
+            h = self.input_proj(patches)
+
         h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-        logits = self.code_proj(h)
+
+        # Code projection: dual with concat if wavelet_gating
+        if self.wavelet_gating:
+            wav_logits = self.wav_code_proj(h)  # [B, N, n_wavelet_dims]
+            amp_logits = self.amp_code_proj(h)  # [B, N, n_amplitude_dims]
+            logits = torch.cat([wav_logits, amp_logits], dim=-1)  # [B, N, code_dim]
+        else:
+            logits = self.code_proj(h)
 
         # Binary FSQ: sigmoid -> threshold -> STE -> normalize to [-1, +1]
         codes = self.fsq(logits)
         codes = codes * 2 - 1  # {0, 1} -> {-1, +1}
 
-        # Per-patch sparsity: each patch independently selects top-k dims
+        # Sparsity (subspace-aware if wavelet_gating)
         sparse_codes, gate_weights = self.sparsity(codes, k_override=k_override)
 
         return sparse_codes, gate_weights
@@ -457,18 +511,33 @@ class SwiGLUEncoder(nn.Module):
 
         Returns:
             sparse_codes: [B, N, code_dim] sparse binary codes in {-1, +1, 0}
-            gate_weights: [B, N, code_dim] soft weights for logging
+            gate_weights: [B, N, code_dim] or [code_dim] soft weights for logging
             pre_quant: [B, N, code_dim] continuous logits before FSQ quantization
         """
-        h = self.input_proj(patches)
+        # Input projection: dual path with concat if wavelet_gating
+        if self.wavelet_gating:
+            wavelet_coeffs = batch_dwt2d(patches, self.patch_size)
+            h_amp = self.amplitude_proj(patches)
+            h_wav = self.wavelet_proj(wavelet_coeffs)
+            h = torch.cat([h_amp, h_wav], dim=-1)
+        else:
+            h = self.input_proj(patches)
+
         h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-        logits = self.code_proj(h)
+
+        # Code projection: dual with concat if wavelet_gating
+        if self.wavelet_gating:
+            wav_logits = self.wav_code_proj(h)
+            amp_logits = self.amp_code_proj(h)
+            logits = torch.cat([wav_logits, amp_logits], dim=-1)
+        else:
+            logits = self.code_proj(h)
 
         # Binary FSQ: sigmoid -> threshold -> STE -> normalize to [-1, +1]
         codes = self.fsq(logits)
         codes = codes * 2 - 1  # {0, 1} -> {-1, +1}
 
-        # Per-patch sparsity: each patch independently selects top-k dims
+        # Sparsity (subspace-aware if wavelet_gating)
         sparse_codes, gate_weights = self.sparsity(codes, k_override=k_override)
 
         return sparse_codes, gate_weights, logits
@@ -478,6 +547,12 @@ class SwiGLUDecoder(nn.Module):
     """
     Decoder: codes -> transformer -> SwiGLU neighbor -> patches.
     NO logsnr prediction.
+
+    Wavelet subspace routing (optional, wavelet_gating=True):
+    - Codes split into wavelet and amplitude subspaces
+    - Each subspace embeds to hidden_dim // 2, concatenated
+    - Dual output heads: wav_head -> IDWT -> pixels, amp_head -> pixels
+    - Output = wav_pixels + amp_pixels (sum of pathways)
     """
     def __init__(
         self,
@@ -485,13 +560,41 @@ class SwiGLUDecoder(nn.Module):
         hidden_dim: int,
         patch_dim: int,
         n_layers: int = 4,
-        attn_config: Optional[Dict[str, Any]] = None
+        attn_config: Optional[Dict[str, Any]] = None,
+        wavelet_gating: bool = False,
+        patch_size: int = 16,
+        n_wavelet_dims: Optional[int] = None
     ):
         super().__init__()
-        self.input_proj = nn.Linear(code_dim, hidden_dim)
+        self.wavelet_gating = wavelet_gating
+        self.patch_size = patch_size
+        self.patch_dim = patch_dim
+        self.code_dim = code_dim
+        self.n_wavelet_dims = n_wavelet_dims or code_dim // 2
+        self.n_amplitude_dims = code_dim - self.n_wavelet_dims
+
+        # Input embedding: dual path if wavelet_gating
+        if wavelet_gating:
+            self.wav_embed = nn.Linear(self.n_wavelet_dims, hidden_dim // 2)
+            self.amp_embed = nn.Linear(self.n_amplitude_dims, hidden_dim // 2)
+            self.input_proj = None  # Not used
+        else:
+            self.input_proj = nn.Linear(code_dim, hidden_dim)
+            self.wav_embed = None
+            self.amp_embed = None
+
         self.transformer = TransformerDecoder(hidden_dim, n_layers=n_layers, attn_config=attn_config)
         self.neighbor_head = SwiGLUNeighborHead(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, patch_dim)
+
+        # Output projection: dual if wavelet_gating
+        if wavelet_gating:
+            self.wav_head = nn.Linear(hidden_dim, patch_dim)  # -> IDWT -> pixels
+            self.amp_head = nn.Linear(hidden_dim, patch_dim)  # -> pixels directly
+            self.output_proj = None  # Not used
+        else:
+            self.output_proj = nn.Linear(hidden_dim, patch_dim)
+            self.wav_head = None
+            self.amp_head = None
 
     def forward(
         self,
@@ -508,11 +611,138 @@ class SwiGLUDecoder(nn.Module):
         Returns:
             patches: [B, N, patch_dim] reconstructed patches
         """
-        h = self.input_proj(codes)
+        # Input embedding: dual path with concat if wavelet_gating
+        if self.wavelet_gating:
+            wav_codes = codes[..., :self.n_wavelet_dims]
+            amp_codes = codes[..., self.n_wavelet_dims:]
+            h_wav = self.wav_embed(wav_codes)   # [B, N, hidden_dim // 2]
+            h_amp = self.amp_embed(amp_codes)   # [B, N, hidden_dim // 2]
+            h = torch.cat([h_wav, h_amp], dim=-1)  # [B, N, hidden_dim]
+        else:
+            h = self.input_proj(codes)
+
         h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
         h = self.neighbor_head(h, grid_shape)
-        patches = self.output_proj(h)
+
+        # Output: dual pathway if wavelet_gating
+        if self.wavelet_gating:
+            wav_coeffs = self.wav_head(h)
+            amp_pixels = self.amp_head(h)
+            wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
+            patches = wav_pixels + amp_pixels  # Sum of pathways
+        else:
+            patches = self.output_proj(h)
+
         return patches
+
+    def forward_with_contributions(
+        self,
+        codes: torch.Tensor,
+        grid_shape: Tuple[int, int],
+        block_masks: Optional[List] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass returning individual subspace contributions for visualization.
+        Only meaningful when wavelet_gating=True.
+
+        Returns:
+            patches: [B, N, patch_dim] combined reconstruction
+            wav_pixels: [B, N, patch_dim] wavelet pathway contribution
+            amp_pixels: [B, N, patch_dim] amplitude pathway contribution
+        """
+        if not self.wavelet_gating:
+            patches = self.forward(codes, grid_shape, block_masks)
+            return patches, patches, torch.zeros_like(patches)
+
+        wav_codes = codes[..., :self.n_wavelet_dims]
+        amp_codes = codes[..., self.n_wavelet_dims:]
+        h_wav = self.wav_embed(wav_codes)
+        h_amp = self.amp_embed(amp_codes)
+        h = torch.cat([h_wav, h_amp], dim=-1)
+
+        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
+        h = self.neighbor_head(h, grid_shape)
+
+        wav_coeffs = self.wav_head(h)
+        amp_pixels = self.amp_head(h)
+        wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
+        patches = wav_pixels + amp_pixels
+
+        return patches, wav_pixels, amp_pixels
+
+    def forward_ablated(
+        self,
+        codes: torch.Tensor,
+        grid_shape: Tuple[int, int],
+        ablate_wavelet: float = 0.0,
+        ablate_amplitude: float = 0.0,
+        block_masks: Optional[List] = None,
+        deterministic: bool = False
+    ) -> torch.Tensor:
+        """
+        Forward with stochastic subspace ablation (dropout-style knockout).
+        Only meaningful when wavelet_gating=True.
+
+        Args:
+            codes: [B, N, code_dim] sparse quantized codes
+            grid_shape: (GH, GW)
+            ablate_wavelet: rate [0,1] of zeroing wavelet codes
+            ablate_amplitude: rate [0,1] of zeroing amplitude codes
+            block_masks: optional attention masks
+            deterministic: if True, zero fixed fraction; if False, Bernoulli per-element
+
+        Returns:
+            patches: [B, N, patch_dim] reconstruction with ablated subspace(s)
+        """
+        if not self.wavelet_gating:
+            return self.forward(codes, grid_shape, block_masks)
+
+        wav_codes = codes[..., :self.n_wavelet_dims].clone()
+        amp_codes = codes[..., self.n_wavelet_dims:].clone()
+
+        # Apply ablation
+        if ablate_wavelet > 0:
+            if deterministic:
+                n_zero = int(self.n_wavelet_dims * ablate_wavelet)
+                if n_zero > 0:
+                    mask = torch.ones(self.n_wavelet_dims, device=codes.device)
+                    mask[:n_zero] = 0
+                    perm = torch.randperm(self.n_wavelet_dims, device=codes.device)
+                    mask = mask[perm]
+                    wav_codes = wav_codes * mask
+            elif ablate_wavelet >= 1.0:
+                wav_codes = torch.zeros_like(wav_codes)
+            else:
+                mask = torch.bernoulli(torch.full_like(wav_codes, 1 - ablate_wavelet))
+                wav_codes = wav_codes * mask
+
+        if ablate_amplitude > 0:
+            if deterministic:
+                n_zero = int(self.n_amplitude_dims * ablate_amplitude)
+                if n_zero > 0:
+                    mask = torch.ones(self.n_amplitude_dims, device=codes.device)
+                    mask[:n_zero] = 0
+                    perm = torch.randperm(self.n_amplitude_dims, device=codes.device)
+                    mask = mask[perm]
+                    amp_codes = amp_codes * mask
+            elif ablate_amplitude >= 1.0:
+                amp_codes = torch.zeros_like(amp_codes)
+            else:
+                mask = torch.bernoulli(torch.full_like(amp_codes, 1 - ablate_amplitude))
+                amp_codes = amp_codes * mask
+
+        h_wav = self.wav_embed(wav_codes)
+        h_amp = self.amp_embed(amp_codes)
+        h = torch.cat([h_wav, h_amp], dim=-1)
+
+        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
+        h = self.neighbor_head(h, grid_shape)
+
+        wav_coeffs = self.wav_head(h)
+        amp_pixels = self.amp_head(h)
+        wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
+
+        return wav_pixels + amp_pixels
 
 
 # =============================================================================
@@ -667,312 +897,6 @@ class SubspacePerPatchSparsity(nn.Module):
         return sparse_codes, gate_weights
 
 
-class SubspaceRoutedEncoder(nn.Module):
-    """
-    Encoder with subspace-partitioned codes for wavelet/amplitude routing.
-
-    Architecture:
-    - Patches get both raw and DWT features as concatenated input
-    - Transformer processes combined features
-    - Codes are partitioned: first n_wavelet_dims = wavelet, rest = amplitude
-    - Sparsity pattern across subspaces determines reconstruction pathway
-
-    No sigmoid gating - the discrete sparsity IS the router.
-    """
-    def __init__(
-        self,
-        patch_dim: int,
-        hidden_dim: int,
-        code_dim: int,
-        k_per_patch: int = 4,
-        n_layers: int = 4,
-        attn_config: Optional[Dict[str, Any]] = None,
-        sparsity_mode: str = "per_level",
-        patch_size: int = 16,
-        n_wavelet_dims: Optional[int] = None
-    ):
-        super().__init__()
-        self.patch_size = patch_size
-        self.patch_dim = patch_dim
-        self.code_dim = code_dim
-        self.n_wavelet_dims = n_wavelet_dims or code_dim // 2
-        self.n_amplitude_dims = code_dim - self.n_wavelet_dims
-
-        # Dual input projections to separate hidden subspaces
-        # Each projects to hidden_dim, then we sum (not concat) to keep dim stable
-        self.amplitude_proj = nn.Linear(patch_dim, hidden_dim)
-        self.wavelet_proj = nn.Linear(patch_dim, hidden_dim)
-
-        self.transformer = TransformerEncoder(hidden_dim, n_layers=n_layers, attn_config=attn_config)
-
-        # Separate code projections for each subspace
-        self.wav_code_proj = nn.Linear(hidden_dim, self.n_wavelet_dims)
-        self.amp_code_proj = nn.Linear(hidden_dim, self.n_amplitude_dims)
-
-        self.fsq = BinaryFSQ()
-        self.sparsity_mode = sparsity_mode
-
-        # Subspace-aware sparsity (respects sparsity_mode)
-        if sparsity_mode == "per_level":
-            self.sparsity = SubspaceSparsity(code_dim, k_per_patch, self.n_wavelet_dims)
-        else:  # per_patch
-            self.sparsity = SubspacePerPatchSparsity(code_dim, k_per_patch, self.n_wavelet_dims)
-
-    def forward(
-        self,
-        patches: torch.Tensor,
-        grid_shape: Tuple[int, int],
-        block_masks: Optional[List] = None,
-        k_override: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            sparse_codes: [B, N, code_dim]
-            soft_weights: [code_dim] sparsity weights
-
-        Note: Routing stats available via self.sparsity.last_routing_stats after forward.
-        """
-        B, N, D = patches.shape
-
-        # Fixed DWT preprocessing
-        wavelet_coeffs = batch_dwt2d(patches, self.patch_size)
-
-        # Project both to hidden_dim and sum
-        h_amp = self.amplitude_proj(patches)
-        h_wav = self.wavelet_proj(wavelet_coeffs)
-        h = h_amp + h_wav  # Sum, not blend - both contribute
-
-        # Transformer
-        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-
-        # Project to separate code subspaces, then concatenate
-        wav_logits = self.wav_code_proj(h)  # [B, N, n_wavelet_dims]
-        amp_logits = self.amp_code_proj(h)  # [B, N, n_amplitude_dims]
-        logits = torch.cat([wav_logits, amp_logits], dim=-1)  # [B, N, code_dim]
-
-        # Binary FSQ
-        codes = self.fsq(logits)
-        codes = codes * 2 - 1  # {0, 1} -> {-1, +1}
-
-        # Subspace-aware sparsity (routing stats stored in self.sparsity.last_routing_stats)
-        sparse_codes, soft_weights = self.sparsity(codes, k_override=k_override)
-
-        return sparse_codes, soft_weights
-
-    def forward_with_prequant(
-        self,
-        patches: torch.Tensor,
-        grid_shape: Tuple[int, int],
-        block_masks: Optional[List] = None,
-        k_override: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Forward with pre-quantization logits for latent diffusion."""
-        B, N, D = patches.shape
-        wavelet_coeffs = batch_dwt2d(patches, self.patch_size)
-        h = self.amplitude_proj(patches) + self.wavelet_proj(wavelet_coeffs)
-        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-        wav_logits = self.wav_code_proj(h)
-        amp_logits = self.amp_code_proj(h)
-        logits = torch.cat([wav_logits, amp_logits], dim=-1)
-        codes = self.fsq(logits)
-        codes = codes * 2 - 1
-        sparse_codes, soft_weights = self.sparsity(codes, k_override=k_override)
-        return sparse_codes, soft_weights, logits
-
-
-class SubspaceRoutedDecoder(nn.Module):
-    """
-    Decoder with subspace-partitioned dual reconstruction pathways.
-
-    Architecture:
-    - Codes are split into wavelet and amplitude subspaces
-    - Each subspace gets its own embedding projection
-    - Embeddings are summed (not blended) for transformer processing
-    - Dual output heads: wav_head → IDWT → pixels, amp_head → pixels
-    - Output = wav_pixels + amp_pixels (SUM, not blend)
-
-    When a subspace has all-zero codes, its contribution naturally vanishes.
-    No sigmoid gating needed - sparsity pattern IS the routing signal.
-    """
-    def __init__(
-        self,
-        code_dim: int,
-        hidden_dim: int,
-        patch_dim: int,
-        n_layers: int = 4,
-        attn_config: Optional[Dict[str, Any]] = None,
-        patch_size: int = 16,
-        n_wavelet_dims: Optional[int] = None
-    ):
-        super().__init__()
-        self.patch_size = patch_size
-        self.patch_dim = patch_dim
-        self.code_dim = code_dim
-        self.n_wavelet_dims = n_wavelet_dims or code_dim // 2
-        self.n_amplitude_dims = code_dim - self.n_wavelet_dims
-
-        # Separate embedding projections per subspace
-        self.wav_embed = nn.Linear(self.n_wavelet_dims, hidden_dim)
-        self.amp_embed = nn.Linear(self.n_amplitude_dims, hidden_dim)
-
-        self.transformer = TransformerDecoder(hidden_dim, n_layers=n_layers, attn_config=attn_config)
-        self.neighbor_head = SwiGLUNeighborHead(hidden_dim)
-
-        # Dual output heads
-        self.wav_head = nn.Linear(hidden_dim, patch_dim)  # → IDWT → pixels
-        self.amp_head = nn.Linear(hidden_dim, patch_dim)  # → pixels directly
-
-    def forward(
-        self,
-        codes: torch.Tensor,
-        grid_shape: Tuple[int, int],
-        block_masks: Optional[List] = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            codes: [B, N, code_dim] sparse quantized codes
-
-        Returns:
-            patches: [B, N, patch_dim] reconstructed patches (sum of pathways)
-        """
-        # Split codes into subspaces
-        wav_codes = codes[..., :self.n_wavelet_dims]
-        amp_codes = codes[..., self.n_wavelet_dims:]
-
-        # Embed each subspace and sum
-        h_wav = self.wav_embed(wav_codes)
-        h_amp = self.amp_embed(amp_codes)
-        h = h_wav + h_amp  # Sum embeddings
-
-        # Shared transformer and neighbor head
-        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-        h = self.neighbor_head(h, grid_shape)
-
-        # Dual pathway prediction
-        wav_coeffs = self.wav_head(h)
-        amp_pixels = self.amp_head(h)
-
-        # Wavelet pathway: fixed IDWT
-        wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
-
-        # SUM not blend - sparsity pattern determines contribution magnitudes
-        patches = wav_pixels + amp_pixels
-
-        return patches
-
-    def forward_with_contributions(
-        self,
-        codes: torch.Tensor,
-        grid_shape: Tuple[int, int],
-        block_masks: Optional[List] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass returning individual subspace contributions for visualization.
-
-        Returns:
-            patches: [B, N, patch_dim] combined reconstruction
-            wav_pixels: [B, N, patch_dim] wavelet pathway contribution
-            amp_pixels: [B, N, patch_dim] amplitude pathway contribution
-        """
-        wav_codes = codes[..., :self.n_wavelet_dims]
-        amp_codes = codes[..., self.n_wavelet_dims:]
-
-        h_wav = self.wav_embed(wav_codes)
-        h_amp = self.amp_embed(amp_codes)
-        h = h_wav + h_amp
-
-        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-        h = self.neighbor_head(h, grid_shape)
-
-        wav_coeffs = self.wav_head(h)
-        amp_pixels = self.amp_head(h)
-        wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
-
-        patches = wav_pixels + amp_pixels
-        return patches, wav_pixels, amp_pixels
-
-    def forward_ablated(
-        self,
-        codes: torch.Tensor,
-        grid_shape: Tuple[int, int],
-        ablate_wavelet: float = 0.0,
-        ablate_amplitude: float = 0.0,
-        block_masks: Optional[List] = None,
-        deterministic: bool = False
-    ) -> torch.Tensor:
-        """
-        Forward with stochastic subspace ablation (dropout-style knockout).
-
-        Args:
-            codes: [B, N, code_dim] sparse quantized codes
-            grid_shape: (GH, GW)
-            ablate_wavelet: probability [0,1] of zeroing wavelet codes per-element
-                           (or fraction to zero if deterministic=True)
-            ablate_amplitude: probability [0,1] of zeroing amplitude codes per-element
-            block_masks: optional attention masks
-            deterministic: if True, zero out exactly ablate_* fraction of dims uniformly
-                          if False, use Bernoulli dropout per-element
-
-        Returns:
-            patches: [B, N, patch_dim] reconstruction with ablated subspace(s)
-        """
-        wav_codes = codes[..., :self.n_wavelet_dims]
-        amp_codes = codes[..., self.n_wavelet_dims:]
-
-        # Apply stochastic ablation
-        if ablate_wavelet > 0:
-            if deterministic:
-                # Zero out fixed fraction of dims (same mask for all samples)
-                n_zero = int(self.n_wavelet_dims * ablate_wavelet)
-                if n_zero > 0:
-                    mask = torch.ones(self.n_wavelet_dims, device=codes.device)
-                    mask[:n_zero] = 0
-                    # Shuffle to randomize which dims are zeroed
-                    perm = torch.randperm(self.n_wavelet_dims, device=codes.device)
-                    mask = mask[perm]
-                    wav_codes = wav_codes * mask
-            elif ablate_wavelet >= 1.0:
-                wav_codes = torch.zeros_like(wav_codes)
-            else:
-                # Bernoulli dropout per-element
-                mask = torch.bernoulli(torch.full_like(wav_codes, 1 - ablate_wavelet))
-                wav_codes = wav_codes * mask
-
-        if ablate_amplitude > 0:
-            if deterministic:
-                n_zero = int(self.n_amplitude_dims * ablate_amplitude)
-                if n_zero > 0:
-                    mask = torch.ones(self.n_amplitude_dims, device=codes.device)
-                    mask[:n_zero] = 0
-                    perm = torch.randperm(self.n_amplitude_dims, device=codes.device)
-                    mask = mask[perm]
-                    amp_codes = amp_codes * mask
-            elif ablate_amplitude >= 1.0:
-                amp_codes = torch.zeros_like(amp_codes)
-            else:
-                mask = torch.bernoulli(torch.full_like(amp_codes, 1 - ablate_amplitude))
-                amp_codes = amp_codes * mask
-
-        h_wav = self.wav_embed(wav_codes)
-        h_amp = self.amp_embed(amp_codes)
-        h = h_wav + h_amp
-
-        h = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
-        h = self.neighbor_head(h, grid_shape)
-
-        wav_coeffs = self.wav_head(h)
-        amp_pixels = self.amp_head(h)
-        wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
-
-        patches = wav_pixels + amp_pixels
-        return patches
-
-
-# Legacy aliases for backwards compatibility
-WaveletGatedEncoder = SubspaceRoutedEncoder
-WaveletGatedDecoder = SubspaceRoutedDecoder
-
-
 # =============================================================================
 # Main Autoencoder
 # =============================================================================
@@ -1036,29 +960,24 @@ class SwiGLUFSQAutoencoder(nn.Module):
                 'random_min_p': 0.0
             }
 
-        # Per-level encoder/decoder - choose wavelet-gated or standard
-        if wavelet_gating:
-            self.encoders = nn.ModuleList([
-                WaveletGatedEncoder(self.patch_dim, hidden_dim, code_dim, k_per_patch,
-                                   n_layers, attn_config, sparsity_mode, patch_size,
-                                   n_wavelet_dims=n_wavelet_dims)
-                for _ in range(n_levels)
-            ])
-            self.decoders = nn.ModuleList([
-                WaveletGatedDecoder(code_dim, hidden_dim, self.patch_dim, n_layers,
-                                   attn_config, patch_size, n_wavelet_dims=n_wavelet_dims)
-                for _ in range(n_levels)
-            ])
-        else:
-            self.encoders = nn.ModuleList([
-                SwiGLUEncoder(self.patch_dim, hidden_dim, code_dim, k_per_patch,
-                             n_layers, attn_config, sparsity_mode)
-                for _ in range(n_levels)
-            ])
-            self.decoders = nn.ModuleList([
-                SwiGLUDecoder(code_dim, hidden_dim, self.patch_dim, n_layers, attn_config)
-                for _ in range(n_levels)
-            ])
+        # Per-level encoder/decoder - wavelet_gating is passed as parameter
+        self.encoders = nn.ModuleList([
+            SwiGLUEncoder(
+                self.patch_dim, hidden_dim, code_dim, k_per_patch,
+                n_layers, attn_config, sparsity_mode,
+                wavelet_gating=wavelet_gating, patch_size=patch_size,
+                n_wavelet_dims=n_wavelet_dims
+            )
+            for _ in range(n_levels)
+        ])
+        self.decoders = nn.ModuleList([
+            SwiGLUDecoder(
+                code_dim, hidden_dim, self.patch_dim, n_layers, attn_config,
+                wavelet_gating=wavelet_gating, patch_size=patch_size,
+                n_wavelet_dims=n_wavelet_dims
+            )
+            for _ in range(n_levels)
+        ])
 
         wavelet_str = f", wavelet=True, n_wav_dims={n_wavelet_dims or code_dim // 2}" if wavelet_gating else ""
         print(f"[SwiGLUFSQAutoencoder] {n_levels} levels, code_dim={code_dim}, k={k_per_patch}, sparsity={sparsity_mode}{wavelet_str}")

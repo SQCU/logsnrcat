@@ -35,11 +35,25 @@ def eval_code(code: str, host: str, port: int, timeout: int = 180) -> dict:
     return resp.json()
 
 
+def format_error(error) -> str:
+    """Format error from eval server (handles both string and dict formats)."""
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        msg = f"{error.get('type', 'Error')}: {error.get('message', 'Unknown error')}"
+        if error.get('traceback'):
+            msg += f"\n{error['traceback']}"
+        if error.get('locals'):
+            msg += f"\nLocals: {error['locals']}"
+        return msg
+    return str(error)
+
+
 def main():
     parser = argparse.ArgumentParser(description="PPO-style REINFORCE histogram trainer")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--steps", type=int, default=100, help="Training steps")
+    parser.add_argument("--steps", type=int, default=200, help="Training steps")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--resolution", type=int, default=64)
     parser.add_argument("--lora-rank", type=int, default=8, help="LoRA adapter rank")
@@ -49,6 +63,8 @@ def main():
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--vaporeon", action="store_true")
     parser.add_argument("--run-id", type=str, default=None, help="Run identifier for output files")
+    parser.add_argument("--double-ae", action="store_true", help="Super-REINFORCE: double autoencoding for rollout-style optimization")
+    parser.add_argument("--double-weight", type=float, default=1.0, help="Weight for double-AE loss")
     args = parser.parse_args()
 
     # Auto-generate run ID if not provided
@@ -171,7 +187,7 @@ f"LoRA layers wrapped: {{len(ctx._lora_layers)}} layers, {{n_lora_params}} param
     print(f"Setting up LoRA on projection layers (rank={args.lora_rank})...")
     result = eval_code(setup_code, args.host, args.port)
     if not result['success']:
-        print(f"ERROR: {result['error']}")
+        print(f"ERROR: {format_error(result['error'])}")
         return
     print(f"  {result['result']}")
 
@@ -185,6 +201,8 @@ batch_size = {args.batch_size}
 resolution = {args.resolution}
 kl_weight = {args.kl_weight}
 mse_weight = {args.mse_weight}
+double_ae = {args.double_ae}
+double_weight = {args.double_weight}
 
 # Get batch
 blocks = ctx._rl_iterator.generate_batch_list(batch_size=batch_size * 4, resolution=resolution)
@@ -219,6 +237,14 @@ with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
     recon_lora = ae.decode(codes_lora, grid_shape, decoder_masks)
     codes_lora_flat = torch.cat([c.view(c.shape[0], -1) for c in codes_lora], dim=1).float()
     recon_lora = recon_lora.float()
+
+    # === Super-REINFORCE: Double autoencoding (policy rollout) ===
+    recon_double = None
+    if double_ae:
+        # Encode the reconstruction again
+        codes_double = ae.encode(recon_lora.to(torch.bfloat16), grid_shape=grid_shape,
+                                  encoder_masks=encoder_masks, decoder_masks=decoder_masks)
+        recon_double = ae.decode(codes_double, grid_shape, decoder_masks).float()
 
 # === Compute reward (histogram divergence) ===
 def compute_js_divergence(imgs, recons, n_bins=32):
@@ -290,6 +316,16 @@ recon_mse = F.mse_loss(recon_lora, images)
 reward_weight = 1.0 + max(0, advantage * 2.0)
 loss = reward_weight * hist_loss + kl_weight * (kl_codes + mse_ref) + mse_weight * recon_mse
 
+# Super-REINFORCE: penalize double-AE round trip error
+double_mse_val = 0.0
+double_hist_val = 0.0
+if double_ae and recon_double is not None:
+    double_mse = F.mse_loss(recon_double, images)
+    double_hist = soft_histogram_loss(recon_double, images)
+    loss = loss + double_weight * (double_mse + double_hist)
+    double_mse_val = double_mse.item()
+    double_hist_val = double_hist.item()
+
 loss.backward()
 ctx._lora_optimizer.step()
 
@@ -303,35 +339,51 @@ ctx._rl_history["loss"].append(loss.item())
 ctx._rl_history["kl_codes"].append(kl_codes.item())
 ctx._rl_history["mse_ref"].append(mse_ref.item())
 ctx._rl_history["hist_loss"].append(hist_loss.item())
+if "double_mse" not in ctx._rl_history:
+    ctx._rl_history["double_mse"] = []
+    ctx._rl_history["double_hist"] = []
+ctx._rl_history["double_mse"].append(double_mse_val)
+ctx._rl_history["double_hist"].append(double_hist_val)
 
 ctx._last_step_result = {{
     "step": step_num, "reward": reward, "mse": mse, "js_div": js_div,
     "loss": loss.item(), "kl_codes": kl_codes.item(), "mse_ref": mse_ref.item(),
-    "hist_loss": hist_loss.item(), "advantage": advantage
+    "hist_loss": hist_loss.item(), "advantage": advantage,
+    "double_mse": double_mse_val, "double_hist": double_hist_val
 }}
 '''
 
-    print(f"\nTraining for {args.steps} steps (KL weight={args.kl_weight})...")
-    print("-" * 85)
-    print(f"{'Step':>6} {'Reward':>10} {'JS Div':>10} {'MSE':>10} {'KL Codes':>10} {'MSE Ref':>10} {'Adv':>8}")
-    print("-" * 85)
+    mode = "Super-REINFORCE (double-AE)" if args.double_ae else "PPO-style"
+    print(f"\nTraining for {args.steps} steps ({mode}, KL={args.kl_weight}, MSE={args.mse_weight})...")
+    if args.double_ae:
+        print(f"  Double-AE weight: {args.double_weight}")
+    print("-" * 95)
+    header = f"{'Step':>6} {'Reward':>10} {'JS Div':>10} {'MSE':>10} {'KL Codes':>10} {'MSE Ref':>10}"
+    if args.double_ae:
+        header += f" {'Dbl MSE':>10}"
+    header += f" {'Adv':>8}"
+    print(header)
+    print("-" * 95)
 
     for step in range(args.steps):
         result = eval_code(train_step_code, args.host, args.port)
         if not result['success']:
-            print(f"ERROR at step {step}: {result['error']}")
+            print(f"ERROR at step {step}: {format_error(result['error'])}")
             break
 
         fetch = eval_code("ctx._last_step_result", args.host, args.port)
         if not fetch['success']:
-            print(f"ERROR fetching step result: {fetch['error']}")
+            print(f"ERROR fetching step result: {format_error(fetch['error'])}")
             break
 
         metrics = fetch['result']
         if step % 10 == 0 or step == args.steps - 1:
-            print(f"{metrics['step']:>6} {metrics['reward']:>10.4f} {metrics['js_div']:>10.4f} "
-                  f"{metrics['mse']:>10.6f} {metrics['kl_codes']:>10.6f} {metrics['mse_ref']:>10.6f} "
-                  f"{metrics['advantage']:>+8.4f}")
+            line = (f"{metrics['step']:>6} {metrics['reward']:>10.4f} {metrics['js_div']:>10.4f} "
+                    f"{metrics['mse']:>10.6f} {metrics['kl_codes']:>10.6f} {metrics['mse_ref']:>10.6f}")
+            if args.double_ae:
+                line += f" {metrics.get('double_mse', 0):>10.6f}"
+            line += f" {metrics['advantage']:>+8.4f}"
+            print(line)
 
     # Generate before/after comparison images
     print("\nGenerating before/after comparison...")
@@ -383,7 +435,7 @@ ctx._compare_images = {
             print(f"Warning: Comparison data not in expected format")
             compare_data = None
     else:
-        print(f"Warning: Could not generate comparison: {result['error']}")
+        print(f"Warning: Could not generate comparison: {format_error(result['error'])}")
         compare_data = None
 
     # Fetch training history and plot
@@ -448,34 +500,88 @@ ctx._compare_images = {
 
     print(f"\nSaved training plot to: {output_path}")
 
-    # Save before/after comparison image
+    # Save before/after comparison image with histogram ribbons
     if compare_data is not None:
-        fig2, axes2 = plt.subplots(4, 3, figsize=(9, 12))
+        def make_color_ribbon(img, height=64, width=16, n_bins=32):
+            """Create a color ribbon showing histogram distribution.
+
+            Colors that appear more frequently occupy more vertical space.
+            """
+            # img is [C, H, W] in range [0, 1]
+            ribbon = np.zeros((height, width, 3))
+
+            # Compute color histogram by binning each pixel's RGB
+            img_hwc = np.transpose(img, (1, 2, 0))  # [H, W, C]
+            pixels = img_hwc.reshape(-1, 3)  # [N, 3]
+
+            # Bin each channel to reduce colors
+            binned = (np.clip(pixels, 0, 1) * (n_bins - 1)).astype(int)
+
+            # Count unique colors
+            color_counts = {}
+            for p in binned:
+                key = tuple(p)
+                color_counts[key] = color_counts.get(key, 0) + 1
+
+            # Sort by frequency
+            sorted_colors = sorted(color_counts.items(), key=lambda x: -x[1])
+
+            # Fill ribbon proportionally
+            total = sum(c for _, c in sorted_colors)
+            y = 0
+            for (r, g, b), count in sorted_colors:
+                h = max(1, int(height * count / total))
+                if y + h > height:
+                    h = height - y
+                # Convert bin back to color
+                color = np.array([r, g, b]) / (n_bins - 1)
+                ribbon[y:y+h, :, :] = color
+                y += h
+                if y >= height:
+                    break
+
+            return ribbon
+
+        # 4 rows, 6 columns: [orig, ribbon, baseline, ribbon, policy, ribbon]
+        fig2, axes2 = plt.subplots(4, 6, figsize=(12, 12),
+                                    gridspec_kw={'width_ratios': [4, 1, 4, 1, 4, 1]})
 
         original = np.array(compare_data['original'])
         baseline = np.array(compare_data['baseline'])
         policy = np.array(compare_data['policy'])
 
         for i in range(4):
-            # Original
+            # Original + ribbon
             img_orig = np.transpose(original[i], (1, 2, 0))
             axes2[i, 0].imshow(np.clip(img_orig, 0, 1))
             axes2[i, 0].set_title('Original' if i == 0 else '')
             axes2[i, 0].axis('off')
 
-            # Baseline (no LoRA)
-            img_base = np.transpose(baseline[i], (1, 2, 0))
-            axes2[i, 1].imshow(np.clip(img_base, 0, 1))
-            axes2[i, 1].set_title('Baseline (no LoRA)' if i == 0 else '')
+            ribbon_orig = make_color_ribbon(original[i])
+            axes2[i, 1].imshow(ribbon_orig)
             axes2[i, 1].axis('off')
 
-            # Policy (with LoRA)
-            img_policy = np.transpose(policy[i], (1, 2, 0))
-            axes2[i, 2].imshow(np.clip(img_policy, 0, 1))
-            axes2[i, 2].set_title('Policy (with LoRA)' if i == 0 else '')
+            # Baseline + ribbon
+            img_base = np.transpose(baseline[i], (1, 2, 0))
+            axes2[i, 2].imshow(np.clip(img_base, 0, 1))
+            axes2[i, 2].set_title('Baseline' if i == 0 else '')
             axes2[i, 2].axis('off')
 
-        plt.suptitle('Before/After LoRA Policy Optimization', fontsize=12)
+            ribbon_base = make_color_ribbon(baseline[i])
+            axes2[i, 3].imshow(ribbon_base)
+            axes2[i, 3].axis('off')
+
+            # Policy + ribbon
+            img_policy = np.transpose(policy[i], (1, 2, 0))
+            axes2[i, 4].imshow(np.clip(img_policy, 0, 1))
+            axes2[i, 4].set_title('Policy (LoRA)' if i == 0 else '')
+            axes2[i, 4].axis('off')
+
+            ribbon_policy = make_color_ribbon(policy[i])
+            axes2[i, 5].imshow(ribbon_policy)
+            axes2[i, 5].axis('off')
+
+        plt.suptitle('Before/After LoRA Policy Optimization (with color histograms)', fontsize=12)
         plt.tight_layout()
 
         compare_path = output_dir / f"reinforce_ppo_{args.run_id}_compare{suffix}.png"

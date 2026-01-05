@@ -35,6 +35,18 @@ def eval_code(code: str, host: str, port: int, timeout: int = 180) -> dict:
     return resp.json()
 
 
+def format_error(error) -> str:
+    """Format error from eval server (handles both string and dict formats)."""
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        msg = f"{error.get('type', 'Error')}: {error.get('message', 'Unknown error')}"
+        if error.get('traceback'):
+            msg += f"\n{error['traceback']}"
+        return msg
+    return str(error)
+
+
 def main():
     parser = argparse.ArgumentParser(description="REINFORCE histogram trainer")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -89,7 +101,11 @@ ctx._lora_optimizer = torch.optim.Adam(
 )
 
 # Setup iterator
-{"" if not args.vaporeon else '''
+'''
+
+    # Build iterator setup code conditionally (outside f-string)
+    if args.vaporeon:
+        iterator_setup = '''
 from src.sprite_atlas import SpriteAtlasIterator
 vaporeon_config = {
     "data_dir": "data/infinite_fusion",
@@ -101,8 +117,13 @@ vaporeon_config = {
     "render_config": {"res_scaling": "do_not", "background_mode": "solid_random", "jitter": True}
 }
 ctx._rl_iterator = SpriteAtlasIterator(ctx.device, vaporeon_config)
-'''}
-{"ctx._rl_iterator = ctx.iterator" if not args.vaporeon else ""}
+'''
+    else:
+        iterator_setup = '''
+ctx._rl_iterator = ctx.iterator
+'''
+
+    setup_code += iterator_setup + f'''
 
 # Training history
 ctx._rl_history = {{"step": [], "reward": [], "mse": [], "js_div": [], "loss": []}}
@@ -114,7 +135,7 @@ f"LoRA adapters ready: {{n_adapter_params}} params (rank={args.lora_rank})"
     print(f"\nSetting up LoRA adapters (rank={args.lora_rank})...")
     result = eval_code(setup_code, args.host, args.port)
     if not result['success']:
-        print(f"ERROR: {result['error']}")
+        print(f"ERROR: {format_error(result['error'])}")
         return
     print(f"  {result['result']}")
 
@@ -281,13 +302,13 @@ ctx._last_step_result = {{"step": step_num, "reward": reward, "mse": mse, "js_di
     for step in range(args.steps):
         result = eval_code(train_step_code, args.host, args.port)
         if not result['success']:
-            print(f"ERROR at step {step}: {result['error']}")
+            print(f"ERROR at step {step}: {format_error(result['error'])}")
             break
 
         # Fetch step result
         fetch = eval_code("ctx._last_step_result", args.host, args.port)
         if not fetch['success']:
-            print(f"ERROR fetching step result: {fetch['error']}")
+            print(f"ERROR fetching step result: {format_error(fetch['error'])}")
             break
 
         metrics = fetch['result']

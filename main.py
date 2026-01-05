@@ -364,10 +364,21 @@ def main():
     eval_server_cfg = cfg['logging']['eval_server']
     if eval_server_cfg['enabled']:
         from src.eval_server import yeet_to_server, query_health
+        from pathlib import Path
 
         print(f"\nYeeting weights to eval server at {eval_server_cfg['url']}...")
         model = components[0]  # coolerLDTformerZC
-        yeet_success = yeet_to_server(model, eval_server_cfg['url'])
+
+        # Extract provenance info from logger's run directory
+        run_path = str(logger.run_dir)
+        run_id = Path(run_path).name  # e.g., "main_run_094"
+
+        yeet_success = yeet_to_server(
+            model,
+            eval_server_cfg['url'],
+            run_id=run_id,
+            run_path=run_path
+        )
 
         if yeet_success and eval_server_cfg['health_check']:
             health = query_health(eval_server_cfg['url'])
@@ -375,6 +386,7 @@ def main():
             print(f"  Status: {health.get('status', 'unknown')}")
             print(f"  Weights loaded: {health.get('weights_loaded', False)}")
             print(f"  Params: {health.get('params', 0):,}")
+            print(f"  Provenance: run_id={run_id}")
             if not health.get('weights_loaded'):
                 print(f"  WARNING: Weights not confirmed on server!")
         elif not yeet_success:

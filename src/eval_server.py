@@ -50,13 +50,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Client-side: Yeet weights from training to server
 # ============================================================================
 
-def yeet_to_server(model: nn.Module, server_url: str = 'http://localhost:8421') -> bool:
+def yeet_to_server(
+    model: nn.Module,
+    server_url: str = 'http://localhost:8421',
+    run_id: Optional[str] = None,
+    run_path: Optional[str] = None,
+    step: Optional[int] = None,
+    extra: Optional[Dict] = None
+) -> bool:
     """
     Network-yeet model weights to eval server. No filesystem involved.
 
+    Args:
+        model: Model to yeet weights from
+        server_url: Eval server URL
+        run_id: Run identifier (e.g., 'main_run_093')
+        run_path: Path to run output directory
+        step: Training step
+        extra: Additional metadata dict
+
     Usage in training loop:
         if step % eval_interval == 0:
-            yeet_to_server(model, 'http://localhost:8421')
+            yeet_to_server(model, 'http://localhost:8421',
+                          run_id='main_run_093',
+                          run_path='experiments_swiglu_ae/main_run_093',
+                          step=step)
     """
     import urllib.request
 
@@ -76,7 +94,7 @@ def yeet_to_server(model: nn.Module, server_url: str = 'http://localhost:8421') 
     torch.save(state, buffer)
     data = buffer.getvalue()
 
-    # Yeet
+    # Yeet weights
     req = urllib.request.Request(
         f"{server_url}/yeet",
         data=data,
@@ -85,15 +103,36 @@ def yeet_to_server(model: nn.Module, server_url: str = 'http://localhost:8421') 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode('utf-8'))
-            if result.get('success'):
-                print(f"[yeet] Sent {len(data):,} bytes to {server_url}")
-                return True
-            else:
+            if not result.get('success'):
                 print(f"[yeet] Failed: {result.get('error')}")
                 return False
+            print(f"[yeet] Sent {len(data):,} bytes to {server_url}")
     except Exception as e:
         print(f"[yeet] Error: {e}")
         return False
+
+    # Send provenance if provided
+    if run_id or run_path or step is not None:
+        provenance_data = {
+            'run_id': run_id or 'unknown',
+            'run_path': run_path or '',
+            'step': step,
+            'extra': extra
+        }
+        try:
+            prov_req = urllib.request.Request(
+                f"{server_url}/provenance",
+                data=json.dumps(provenance_data).encode('utf-8'),
+                headers={'Content-Type': 'application/json'}
+            )
+            with urllib.request.urlopen(prov_req, timeout=5) as resp:
+                prov_result = json.loads(resp.read().decode('utf-8'))
+                if prov_result.get('success'):
+                    print(f"[yeet] Provenance set: {run_id} step={step}")
+        except Exception as e:
+            print(f"[yeet] Warning: failed to set provenance: {e}")
+
+    return True
 
 
 def probe_server(code: str, server_url: str = 'http://localhost:8421') -> Any:
@@ -139,8 +178,19 @@ def query_health(server_url: str = 'http://localhost:8421') -> Dict[str, Any]:
 
 class EvalContext:
     """
-    Holds model architecture (empty), config, and test data generators.
+    Holds model architecture, config, and test data generators.
     Weights are yeet'd in via /yeet endpoint.
+
+    This is an eval() REPL - send arbitrary Python code to /eval.
+    The server's job is to:
+    1. Receive weights and know where they came from (provenance)
+    2. Execute arbitrary code against the loaded model
+    3. Return detailed errors when things fail
+
+    Key attributes:
+    - ctx.provenance - dict with run_id, run_path, step of current weights
+    - ctx.run_id, ctx.run_path - shortcuts to provenance fields
+    - ctx.weights_loaded - whether weights have been received
     """
 
     def __init__(self, config_path: str, device: str = 'cuda', checkpoint_path: Optional[str] = None):
@@ -149,6 +199,7 @@ class EvalContext:
         self.weights_loaded = False
         self.deps_loaded = False  # Track if plotting deps are loaded
         self._plot_deps = {}  # Cache loaded plotting dependencies
+        self._provenance = None  # Provenance of current weights
 
         # Load config
         from src.config import load_config, sanitize_config
@@ -302,6 +353,47 @@ class EvalContext:
             'errors': errors,
             'message': f'Loaded {len(dep_names)} dependencies'
         }
+
+    # ========================================================================
+    # Run Provenance - track where weights came from
+    # ========================================================================
+
+    def set_provenance(self, run_id: str, run_path: str, step: Optional[int] = None,
+                       extra: Optional[Dict] = None):
+        """
+        Record provenance of current weights. Called by training code when yeeting.
+
+        Args:
+            run_id: Run identifier (e.g., 'main_run_093')
+            run_path: Full path to run directory
+            step: Training step when weights were captured
+            extra: Any additional metadata
+        """
+        from datetime import datetime
+        self._provenance = {
+            'run_id': run_id,
+            'run_path': run_path,
+            'step': step,
+            'received_at': datetime.now().isoformat(),
+            'extra': extra or {}
+        }
+
+    @property
+    def provenance(self) -> Optional[Dict]:
+        """Get provenance of current weights, if known."""
+        return getattr(self, '_provenance', None)
+
+    @property
+    def run_path(self) -> Optional[str]:
+        """Shortcut to get current run path from provenance."""
+        prov = self.provenance
+        return prov['run_path'] if prov else None
+
+    @property
+    def run_id(self) -> Optional[str]:
+        """Shortcut to get current run ID from provenance."""
+        prov = self.provenance
+        return prov['run_id'] if prov else None
 
     def build_namespace(self) -> Dict[str, Any]:
         """Build the namespace dict for eval()."""
@@ -485,7 +577,23 @@ class EvalHandler(BaseHTTPRequestHandler):
             if hasattr(self.context.model, 'flush'):
                 self.context.model.flush()
             self.context.weights_loaded = False
+            self.context._provenance = None
             self._send_json({'success': True, 'message': 'Model flushed'})
+
+        elif self.path == '/provenance':
+            # Set provenance metadata for current weights
+            body = self.rfile.read(content_length).decode('utf-8')
+            try:
+                data = json.loads(body)
+                self.context.set_provenance(
+                    run_id=data.get('run_id', 'unknown'),
+                    run_path=data.get('run_path', ''),
+                    step=data.get('step'),
+                    extra=data.get('extra')
+                )
+                self._send_json({'success': True, 'provenance': self.context.provenance})
+            except json.JSONDecodeError as e:
+                self._send_json({'success': False, 'error': f'Invalid JSON: {e}'})
 
         else:
             self.send_error(404)
@@ -509,6 +617,13 @@ class EvalHandler(BaseHTTPRequestHandler):
             # Load plotting/visualization dependencies into namespace
             result = self.context.load_deps()
             self._send_json(result)
+        elif self.path == '/provenance':
+            # Get provenance of current weights
+            prov = self.context.provenance
+            if prov:
+                self._send_json(prov)
+            else:
+                self._send_json({'error': 'No provenance recorded. Weights may have been loaded without metadata.'})
         else:
             self.send_error(404)
 
@@ -519,7 +634,7 @@ class EvalHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data, indent=2, default=str).encode('utf-8'))
 
     def execute_with_timeout(self, code: str) -> Dict[str, Any]:
-        """Execute code with timeout."""
+        """Execute code with timeout. Returns detailed error info on failure."""
         result = {'success': False, 'result': None, 'error': None}
 
         def target():
@@ -534,14 +649,43 @@ class EvalHandler(BaseHTTPRequestHandler):
                     result['result'] = namespace.get('result', 'executed')
                     result['success'] = True
             except Exception as e:
-                result['error'] = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
+                # Capture detailed exception info
+                exc_type, exc_value, exc_tb = sys.exc_info()
+                tb_lines = traceback.format_exception(exc_type, exc_value, exc_tb)
+
+                # Extract the innermost frame's local variables (if available)
+                locals_snapshot = {}
+                if exc_tb:
+                    # Walk to innermost frame
+                    tb = exc_tb
+                    while tb.tb_next:
+                        tb = tb.tb_next
+                    frame_locals = tb.tb_frame.f_locals
+                    # Capture serializable locals (skip large objects)
+                    for k, v in frame_locals.items():
+                        if k.startswith('_'):
+                            continue
+                        try:
+                            # Try to get a useful repr, skip if too large
+                            r = repr(v)
+                            if len(r) < 500:
+                                locals_snapshot[k] = r
+                        except Exception:
+                            pass
+
+                result['error'] = {
+                    'type': type(e).__name__,
+                    'message': str(e),
+                    'traceback': ''.join(tb_lines),
+                    'locals': locals_snapshot if locals_snapshot else None
+                }
 
         thread = threading.Thread(target=target)
         thread.start()
         thread.join(timeout=self.timeout)
 
         if thread.is_alive():
-            result['error'] = f"Timeout after {self.timeout}s"
+            result['error'] = {'type': 'Timeout', 'message': f'Execution exceeded {self.timeout}s'}
 
         return result
 
@@ -559,20 +703,21 @@ def run_server(context: EvalContext, port: int = 8421, timeout: int = 30):
     print(f"Eval server running on http://localhost:{port}")
     print(f"{'='*60}")
     print(f"\nEndpoints:")
-    print(f"  POST /yeet     - Receive model weights (raw bytes)")
-    print(f"  POST /eval     - Execute Python code")
-    print(f"  POST /flush    - Zero out model weights")
-    print(f"  GET  /health   - Health check")
-    print(f"  GET  /status   - Detailed status")
-    print(f"  GET  /load_deps - Load plotting/viz deps into namespace")
+    print(f"  POST /yeet       - Receive model weights (raw bytes)")
+    print(f"  POST /eval       - Execute Python code (returns detailed errors)")
+    print(f"  POST /provenance - Set run metadata: {{run_id, run_path, step, extra}}")
+    print(f"  POST /flush      - Zero out model weights and provenance")
+    print(f"  GET  /health     - Health check")
+    print(f"  GET  /status     - Detailed status")
+    print(f"  GET  /provenance - Get current weights provenance")
+    print(f"  GET  /load_deps  - Load plotting/viz deps into namespace")
     print(f"\nFrom training code:")
     print(f"  from src.eval_server import yeet_to_server")
-    print(f"  yeet_to_server(model, 'http://localhost:{port}')")
-    print(f"\nFrom Claude Code:")
-    print(f"  from src.eval_server import probe_server")
-    print(f"  probe_server('health_check(model, ae, batch)')")
+    print(f"  yeet_to_server(model, 'http://localhost:{port}',")
+    print(f"                 run_id='main_run_093', run_path='experiments/...', step=1000)")
     print(f"\nNamespace: model, ae, config, batch, ctx, torch, F, nn")
-    print(f"Functions: health_check, activation_variance_sweep, codebook_usage, ...")
+    print(f"Context: ctx.provenance, ctx.run_id, ctx.run_path")
+    print(f"Diagnostics: health_check, codebook_usage, per_level_importance, ...")
     print(f"\nPlotting deps: GET /load_deps → adds plt, np, make_grid, ...")
     print(f"{'='*60}\n")
 
