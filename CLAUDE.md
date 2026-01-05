@@ -4,6 +4,11 @@
 
 Field diffusion training with heterogeneous optimization, sparse autoencoders, and multi-resolution bucketing.
 
+**Architecture Documentation:**
+- For latent vs pixel diffusion architecture and implementation, see `notes/latent_vs_pixel_diffusion.md`
+- For SwiGLU FSQ reference implementation, see `clean_impl_swiglu_reference/`
+- For train.py patterns (`TrainingContext`, `DeferredStatsCollector`, `prepare_latent_batch`), see `notes/train_refactor_jan2026.md` - relevant when adding new training functions or modifying stats collection
+
 ---
 
 ## File Map: Where Features Live
@@ -12,7 +17,8 @@ Field diffusion training with heterogeneous optimization, sparse autoencoders, a
 | File | Purpose | Key Classes/Functions |
 |------|---------|----------------------|
 | `main.py` | Entry point, config loading, component assembly | `build_model()`, `build_components()` |
-| `src/train.py` | Training loops (AE warmup + denoiser) | `train_autoembed()`, `train_denoise()`, `OnlineVarianceTracker` |
+| `src/train.py` | Training loops (AE warmup + denoiser) | `train_autoembed()`, `train_denoise()`, `train_latent_diffusion()`, `DeferredStatsCollector` |
+| `src/optim_closure_bullshit.py` | Optimizer ceremony encapsulation | `TrainingContext`, `build_training_context()` |
 | `src/config.py` | Pydantic schema - ALL defaults live here | `ExperimentConfig`, `OptimizerConfig`, `MuonConfig`, etc. |
 | `configs/*.toml` | User-facing config files | - |
 
@@ -21,7 +27,7 @@ Field diffusion training with heterogeneous optimization, sparse autoencoders, a
 |------|---------|-------------|
 | `src/model.py` | Main transformer models | `coolerLDTformerZC`, `LDTformerBlockZC`, `LDTformerAttentionZC` |
 | `src/blocks.py` | Sparse AE transformer blocks | `TransformerEncoder`, `TransformerDecoder`, `EncoderAttention`, `SwiGLU`, `SigmoidMoE` |
-| `src/embedders.py` | Patch embed/unembed, Fourier features | `ContextualPatchEmbedder`, `ContextualPatchUnembedder`, `FourierFeatures` |
+| `src/embedders.py` | Patch embed/unembed, Fourier features, batch prep | `ContextualPatchEmbedder`, `ContextualPatchUnembedder`, `FourierFeatures`, `prepare_latent_batch()` |
 | `src/context_manager.py` | Span embedding for mixed modality | `SpanEmbedder`, `SpanUnembedder`, `ContextBlock` |
 | `src/rope.py` | Rotary position embeddings | `RnRoPE`, `HouseholderOrthogonal` |
 

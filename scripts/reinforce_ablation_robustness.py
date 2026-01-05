@@ -25,7 +25,7 @@ import requests
 
 DEFAULT_HOST = "172.26.160.1"
 DEFAULT_PORT = 8421
-DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_091"
+DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_096"
 
 
 def eval_code(code: str, host: str, port: int, timeout: int = 180) -> dict:
@@ -62,6 +62,10 @@ def main():
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--vaporeon", action="store_true")
     parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--save-interval", type=int, default=25,
+                        help="Save ablation image grid every N steps (0 to disable)")
+    parser.add_argument("--n-viz-samples", type=int, default=4,
+                        help="Number of samples in periodic visualization grids")
     args = parser.parse_args()
 
     if args.run_id is None:

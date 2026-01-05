@@ -255,19 +255,18 @@ def main():
                                                       name="subspace_sensitivity_heatmap")
                 print("  Sensitivity sweep complete.")
 
-    # Use latent diffusion if sparse AE is enabled with latent_diffusion=true
+    # Select diffusion training function based on config
+    # diffusion_space determines where noise is added: "latent" (codes) or "pixel"
     sparse_ae_cfg = cfg['training'].get('sparse_ae', {})
-    use_latent_diffusion = (
-        sparse_ae_cfg.get('enabled', False) and
-        sparse_ae_cfg.get('latent_diffusion', False)
-    )
+    diffusion_space = sparse_ae_cfg.get('topology', {}).get('diffusion_space', 'pixel')
 
-    if use_latent_diffusion:
-        print("\n[Main] Using LATENT diffusion (noise in code space)")
-        df_train = train_latent_diffusion(components, cfg, val_iterator, logger)
-    else:
-        print("\n[Main] Using PIXEL diffusion (noise in pixel space)")
-        df_train = train_denoise(components, cfg, val_iterator, logger)
+    ldtformer_train_func = {
+        'latent': train_latent_diffusion,
+        'pixel': train_denoise,
+    }[diffusion_space]
+
+    print(f"\n[Main] Diffusion training: {diffusion_space.upper()} space")
+    df_train = ldtformer_train_func(components, cfg, val_iterator, logger)
 
     print("\nPlotting Metrics...")
     # Save dataframe BEFORE plotting (crash safety)
@@ -277,7 +276,7 @@ def main():
     plot_multimetric_analysis(df_train, logger, f"multimetric_{cfg['training']['mode']}")
 
     # Loss schedule analysis for latent diffusion (v-field MSE/BCE compatibility)
-    if use_latent_diffusion and not df_train.empty:
+    if diffusion_space == 'latent' and not df_train.empty:
         diffusion_loss_schedule = sparse_ae_cfg.get('diffusion_loss_schedule', {})
         if isinstance(diffusion_loss_schedule, dict) and diffusion_loss_schedule.get('enabled', False):
             print("Plotting diffusion loss schedule analysis...")

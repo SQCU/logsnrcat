@@ -1,0 +1,61 @@
+{
+  "run_id": "main_run_095",
+  "run_path": "experiments_swiglu_ae\\main_run_095",
+  "architecture": {
+    "ae_type": "SwiGLUFSQAutoencoder",
+    "wavelet_gating": true,
+    "n_levels": 7,
+    "code_dim": 128,
+    "n_wavelet_dims": 64,
+    "n_amplitude_dims": 64,
+    "sparsity_type": "SubspaceSparsity"
+  },
+  "reconstruction": {
+    "mse": 0.07213550060987473,
+    "psnr": 11.418509483337402
+  },
+  "code_stats": [
+    [
+      0,
+      128,
+      0.9296875,
+      33
+    ],
+    [
+      1,
+      128,
+      0.9296875,
+      45
+    ],
+    [
+      2,
+      128,
+      0.9296875,
+      68
+    ],
+    [
+      3,
+      128,
+      0.9296875,
+      63
+    ],
+    [
+      4,
+      128,
+      0.9296875,
+      62
+    ],
+    [
+      5,
+      128,
+      0.9296875,
+      55
+    ],
+    [
+      6,
+      128,
+      0.9296875,
+      54
+    ]
+  ]
+}

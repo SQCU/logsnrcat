@@ -377,3 +377,173 @@ class ContextualPatchUnembedder(nn.Module):
             logsnr_pixel = F.interpolate(logsnr_grid.unsqueeze(0), scale_factor=P, mode='nearest').squeeze(0)
 
             return torch.cat([rasters, logsnr_pixel], dim=0)
+
+
+# =============================================================================
+# Latent Diffusion Batched Embedding Preparation
+# =============================================================================
+
+def prepare_latent_batch(
+    group: list,
+    grid_shape: Tuple[int, int],
+    sparse_ae,
+    patch_embedder,
+    topo_config: dict,
+    device: torch.device,
+) -> dict:
+    """
+    Prepare batched embeddings for latent diffusion training.
+
+    Creates a tidy package of data structures that can be used for:
+    - Direct AE reconstruction (codes → decode → recon loss)
+    - Latent diffusion (noisy codes → LDTformer → v_pred → loss)
+
+    This decouples embedding preparation from model application, allowing
+    the same embeddings to support both autoencoding and denoising paths.
+
+    Args:
+        group: List of (block, img, logsnr) tuples from group_blocks_by_grid()
+        grid_shape: (GH, GW) patch grid dimensions
+        sparse_ae: The sparse autoencoder model
+        patch_embedder: Embedder with latent_code_proj, logsnr_proj, _get_masks
+        topo_config: Dict with level_lambda, level_scale, vertical_free, window_size
+        device: Target device
+
+    Returns:
+        Dict with prepared tensors:
+            # Original data
+            'imgs': [B, C, H, W] original images
+            'blocks': Original ContextBlocks for source tracking
+
+            # Encoded representations
+            'pre_quant_flat': [B, N*L, code_dim] clean codes (pre-quantization)
+            'logsnr_flat': [B, N*L, 1] logsnr per token
+
+            # Diffusion components
+            'noisy_codes': [B, N*L, code_dim] noised codes
+            'target_v': [B, N*L, code_dim] target v-field
+            'alpha': [B, N*L, 1] signal coefficient
+            'sigma': [B, N*L, 1] noise coefficient
+
+            # Model input (projected to model_dim)
+            'h_input': [B, N*L, model_dim] input for LDTformer
+            'topo_embeds': [N*L, topo_dim] topology embeddings
+            'latent_mask': BlockMask for attention
+
+            # Reconstruction support
+            'decoder_masks': For sparse_ae.quantize_and_decode()
+
+            # Geometry
+            'grid_shape': (GH, GW)
+            'n_patches': int
+            'n_levels': int
+            'batch_size': int
+    """
+    from .context_manager import (
+        render_latent_topology_embeddings,
+        get_cached_latent_mask,
+    )
+
+    H_grid, W_grid = grid_shape
+    n_levels = sparse_ae.n_levels
+    code_dim = sparse_ae.code_dim
+    n_patches = H_grid * W_grid
+    total_tokens = n_patches * n_levels
+    p = sparse_ae.patch_size
+
+    # Extract tensors from group
+    blocks = [g[0] for g in group]
+    imgs = torch.stack([g[1] for g in group], dim=0)  # [B, C, H, W]
+    logsnrs = torch.stack([g[2] for g in group], dim=0)  # [B, 1, H, W]
+    batch_size = imgs.shape[0]
+
+    # Get encoder/decoder masks
+    encoder_masks, decoder_masks = patch_embedder._get_masks(grid_shape, device)
+
+    # Build latent diffusion topology (4D: highway, spatial_x, spatial_y, level)
+    topo_embeds, level_ids, patch_ids = render_latent_topology_embeddings(
+        n_patches=n_patches,
+        n_levels=n_levels,
+        grid_shape=grid_shape,
+        device=device,
+        level_scale=topo_config['level_scale'],
+    )
+
+    # Get cached level-aware attention mask
+    latent_mask = get_cached_latent_mask(
+        n_patches=n_patches,
+        n_levels=n_levels,
+        grid_shape=grid_shape,
+        window_size=topo_config['window_size'],
+        level_lambda=topo_config['level_lambda'],
+        vertical_free=topo_config['vertical_free'],
+        mode='local',
+        device=device,
+    )
+
+    # === ENCODE: Batched encoding with pre_quant ===
+    codes_list, level_logsnrs, prequant_list = sparse_ae.encode_with_prequant(
+        imgs, logsnrs,
+        grid_shape=grid_shape,
+        encoder_masks=encoder_masks,
+        decoder_masks=decoder_masks
+    )
+
+    # Stack and flatten pre_quants across levels: [B, n_patches, n_levels, code_dim]
+    pre_quant_stacked = torch.stack(prequant_list, dim=2)  # [B, N, L, D]
+    pre_quant_flat = pre_quant_stacked.view(batch_size, total_tokens, code_dim)  # [B, N*L, D]
+
+    # Expand logsnr to per-token (each level gets same logsnr per patch)
+    logsnr_pooled = F.avg_pool2d(logsnrs, kernel_size=p, stride=p)
+    logsnr_patches = logsnr_pooled.flatten(2).transpose(1, 2)  # [B, N, 1]
+    logsnr_flat = logsnr_patches.repeat(1, n_levels, 1)  # [B, N*L, 1]
+
+    # === DIFFUSION: Add noise to codes ===
+    noise = torch.randn_like(pre_quant_flat)
+
+    # Compute alpha/sigma from logsnr
+    alpha_sq = torch.sigmoid(logsnr_flat)  # [B, N*L, 1]
+    sigma_sq = torch.sigmoid(-logsnr_flat)
+    alpha = torch.sqrt(alpha_sq)
+    sigma = torch.sqrt(sigma_sq)
+
+    # Noisy codes: z_t = alpha * x_0 + sigma * noise
+    noisy_codes = alpha * pre_quant_flat + sigma * noise
+
+    # Target v-field: v = alpha * noise - sigma * x_0
+    target_v = alpha * noise - sigma * pre_quant_flat
+
+    # === PROJECT: Prepare model input ===
+    h_input = patch_embedder.latent_code_proj(noisy_codes)  # [B, N*L, model_dim]
+    logsnr_features = patch_embedder.logsnr_proj(logsnr_flat)  # [B, N*L, model_dim]
+    h_input = h_input + logsnr_features
+
+    return {
+        # Original data
+        'imgs': imgs,
+        'blocks': blocks,
+
+        # Encoded representations
+        'pre_quant_flat': pre_quant_flat,
+        'logsnr_flat': logsnr_flat,
+
+        # Diffusion components
+        'noisy_codes': noisy_codes,
+        'target_v': target_v,
+        'alpha': alpha,
+        'sigma': sigma,
+
+        # Model input
+        'h_input': h_input,
+        'topo_embeds': topo_embeds,
+        'latent_mask': latent_mask,
+
+        # Reconstruction support
+        'decoder_masks': decoder_masks,
+
+        # Geometry
+        'grid_shape': grid_shape,
+        'n_patches': n_patches,
+        'n_levels': n_levels,
+        'batch_size': batch_size,
+    }

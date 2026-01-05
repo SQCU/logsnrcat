@@ -18,15 +18,83 @@ from .utils import run_model_forward, predict_velocity_from_blocks
 from .sample import euler_forward_step, euler_reverse_step
 from .config import sanitize_config
 from .graph_runner import GraphRunner
-from .optim_utils import (
-    build_optimizer_group, print_optimizer_summary, OptimizerGroup,
-    prepare_model_for_training, HAS_FP8, get_linear_weight_dtype,
-    build_optimizer_for_role, print_role_optimizer_summary,
-    collect_fp8_modules, FP8Muon, FP8SGD, FP8AdamW, FP8Linear,
-)
+from .optim_closure_bullshit import build_training_context
 from .losses import scheduled_mse_bce_velocity_loss
 
-# src/train.py - Add near top
+def build_variance_tracker(config: dict, device: torch.device):
+    """Build OnlineVarianceTracker from config, or None if disabled."""
+    var_cfg = config['training']['online_variance_correction']
+    if var_cfg['enabled']:
+        return OnlineVarianceTracker(device=device, **var_cfg)
+    return None
+
+
+class DeferredStatsCollector:
+    """
+    Collects per-sample stats during training, converts tensors at logging intervals.
+
+    Avoids CPU-GPU sync on every step by keeping tensors until flush().
+    Deduplicates the stats collection boilerplate across training functions.
+
+    Usage:
+        collector = DeferredStatsCollector()
+
+        # In training loop:
+        collector.add(step=i, source='fractal', type='latent', resolution=4096,
+                      loss_tensor=loss.detach(), logsnr_tensor=logsnr.mean().detach())
+
+        # At logging intervals:
+        if i % log_interval == 0:
+            history.extend(collector.flush(extra_stats={'mse_weight': 0.5}))
+    """
+    def __init__(self):
+        self._entries = []
+
+    def add(self, step: int, source: str, type: str, resolution: int = None, **tensor_stats):
+        """Add a stat entry. Keys ending in '_tensor' are converted to floats on flush."""
+        entry = {'step': step, 'source': source, 'type': type}
+        if resolution is not None:
+            entry['resolution'] = resolution
+        entry.update(tensor_stats)
+        self._entries.append(entry)
+
+    def flush(self, extra_stats: dict = None) -> list:
+        """
+        Convert tensors to floats and return entries. Clears internal buffer.
+
+        Args:
+            extra_stats: Optional dict of extra stats to add to each entry (e.g., schedule weights)
+
+        Returns:
+            List of converted stat dicts ready for DataFrame
+        """
+        converted_list = []
+        base_keys = {'step', 'source', 'type', 'resolution'}
+        for stat in self._entries:
+            converted = {'step': stat['step'], 'source': stat['source'], 'type': stat['type']}
+            if 'resolution' in stat:
+                converted['resolution'] = stat['resolution']
+
+            # Handle tensor -> float conversion for all *_tensor keys
+            for key, val in stat.items():
+                if key.endswith('_tensor'):
+                    base_key = key[:-7]  # Remove '_tensor' suffix
+                    converted[base_key] = val.item() if isinstance(val, torch.Tensor) else val
+                elif key not in base_keys:
+                    converted[key] = val
+
+            # Add extra stats if provided
+            if extra_stats:
+                converted.update(extra_stats)
+
+            converted_list.append(converted)
+
+        self._entries.clear()
+        return converted_list
+
+    def __len__(self):
+        return len(self._entries)
+
 
 class OnlineVarianceTracker:
     """
@@ -194,59 +262,9 @@ def compute_online_weighted_mse(
 
     return loss, stats
 
-def calculate_global_max_resolution(config: Dict[str, Any]) -> int:
-    """
-    Scans config to find the maximum resolution required for video caching.
-    Considers both explicit bucket definitions and sequence relative scaling.
-    """
-    max_res = 32 # Floor
-
-    # 1. Check Buckets (if enabled)
-    bucketing = config['training']['bucketing']
-    if bucketing['enabled']:
-        buckets = bucketing['image_buckets']
-        if buckets:
-            max_bucket_res = max(b['resolution'] for b in buckets)
-        else:
-            max_bucket_res = 32
-    else:
-        max_bucket_res = 0 # Not driving resolution
-
-    # 2. Check Sequence Structures
-    # We need to find the max 'res' (absolute) OR max 'relative_res'
-    dataset_mix = config['dataset_mix']
-
-    max_seq_res_abs = 0
-    max_seq_rel = 1.0
-
-    for split_name, split_cfg in dataset_mix.items():
-        if split_cfg['type'] == 'video':
-            params = split_cfg['params']
-            seq_struct = params['sequence_structure']
-            for frame in seq_struct:
-                # Track absolute max defined in config
-                max_seq_res_abs = max(max_seq_res_abs, frame['res'])
-                # Track relative max
-                max_seq_rel = max(max_seq_rel, frame['relative_res'])
-
-    # 3. Compute Global Max
-    if bucketing['enabled']:
-        # If bucketing, the demand is Bucket * Relative
-        # We assume the worst case: Biggest Bucket * Biggest Relative Factor
-        res_from_buckets = int(max_bucket_res * max_seq_rel)
-        # Ensure we cover at least that
-        max_res = max(max_res, res_from_buckets)
-    else:
-        # If no bucketing, we rely on the absolute definitions
-        max_res = max(max_res, max_seq_res_abs)
-
-    # Alignment (Optional, but safe)
-    if max_res % 2 != 0: max_res += 1
-
-    return max_res
 
 # ==============================================================================
-# 3. Training Loops (Config Driven)
+# Training Loops (Config Driven)
 # ==============================================================================
 
 from .bucket_manager import build_bucket_manager_from_config
@@ -322,48 +340,9 @@ def train_autoembed(components, config, iterator, logger=None):
     if wavelet_gating and routing_entropy_weight > 0:
         print(f"    Entropy regularization: weight={routing_entropy_weight}")
 
-    # Build AE module wrapper for optimizer
-    # Wraps AE and projection layers for unified optimizer handling
-    # NOTE: latent_code_proj/unproj are trained later in latent diffusion,
-    # but we include them here so they're part of the same model checkpoint
-    class AEModule(nn.Module):
-        """Wrapper to expose all AE parameters for optimizer."""
-        def __init__(self, sparse_ae, patch_emb, patch_unemb):
-            super().__init__()
-            self.sparse_ae = sparse_ae
-            # Per-token projections (trained in latent diffusion phase)
-            self.latent_code_proj = patch_emb.latent_code_proj
-            self.latent_code_unproj = patch_unemb.latent_code_unproj
-            # LogSNR conditioning/decoding
-            if hasattr(patch_emb, 'logsnr_proj'):
-                self.logsnr_proj = patch_emb.logsnr_proj
-            if hasattr(patch_unemb, 'logsnr_decoder'):
-                self.logsnr_decoder = patch_unemb.logsnr_decoder
-
-    ae_module = AEModule(sparse_ae, patch_emb, patch_unemb)
-
-    # Apply FP8 conversion if configured (W8A16: 8-bit weights, 16-bit activations)
-    device = config['device']
-    ae_module = prepare_model_for_training(ae_module, config, device=device)
-
-    # Create FP8 optimizer for FP8Linear weights - must match the claimed optimizer
-    fp8_modules = collect_fp8_modules(ae_module)
-    fp8_optimizer = None
-    if fp8_modules:
-        ae_opt_cfg = config['training']['ae_optimizer']
-        adamw_cfg = config['training']['optimizer']['adamw']
-        fp8_optimizer = FP8AdamW(
-            fp8_modules,
-            lr=ae_opt_cfg['lr'],
-            betas=tuple(adamw_cfg['betas']),
-            weight_decay=ae_opt_cfg['weight_decay'],
-        )
-        n_fp8_params = sum(m.out_features * m.in_features for m in fp8_modules)
-        print(f"[FP8] Created FP8AdamW for {len(fp8_modules)} modules ({n_fp8_params:,} params)")
-
-    # Use role-based optimizer: simple AdamW for AE (no Muon)
-    optimizer_group = build_optimizer_for_role(ae_module, "ae", config, total_steps=steps)
-    print_role_optimizer_summary(optimizer_group, ae_module, "ae")
+    # Build training context - model already owns sparse_ae, patch_embedder, patch_unembedder
+    # No wrapper needed: model.parameters() includes all AE components
+    ctx = build_training_context(model, config, total_steps=steps, role="ae")
 
     # Build bucket manager
     model_stride = model.patch_embedder.stride
@@ -371,15 +350,13 @@ def train_autoembed(components, config, iterator, logger=None):
     bucketing_enabled = config['training']['bucketing']['enabled']
 
     history = []
-    use_amp = dtype in (torch.bfloat16, torch.float16)
-    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
     log_interval = config['logging']['log_interval']
 
     pbar = tqdm(range(steps), desc="train-ae")
     for i in pbar:
-        optimizer_group.zero_grad()
+        ctx.zero_grad()
 
-        with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+        with ctx.autocast():
             # Sample bucket for resolution
             if bucketing_enabled:
                 bucket = bucket_mgr.sample_bucket()
@@ -465,22 +442,9 @@ def train_autoembed(components, config, iterator, logger=None):
             for k in loss_stats_accum:
                 loss_stats_accum[k] /= n_latent
 
-        # Backward
-        if dtype == torch.float16:
-            scaler.scale(total_loss).backward()
-            for spec in optimizer_group.specs.values():
-                scaler.step(spec.optimizer)
-            scaler.update()
-            optimizer_group.schedule_step()
-        else:
-            total_loss.backward()
-            optimizer_group.step()
-            optimizer_group.schedule_step()
-
-        # Apply FP8 weight updates
-        if fp8_optimizer is not None:
-            fp8_optimizer.step()
-            fp8_optimizer.zero_grad()
+        # Backward and step (TrainingContext handles scaler, FP8, scheduling)
+        ctx.backward(total_loss)
+        ctx.step()
 
         # Logging with per-source losses (not batch-averaged)
         if i % log_interval == 0:
@@ -522,51 +486,6 @@ def train_autoembed(components, config, iterator, logger=None):
                 postfix['k'] = current_k
             pbar.set_postfix(postfix)
 
-    # --- End of training: collect reconstruction samples for visualization ---
-    if logger is not None and steps > 0:
-        print("Collecting AE reconstruction samples...")
-        recon_samples = {'x0': [], 'noisy_input': [], 'reconstruction': [], 'logsnr_map': [], 'source': []}
-
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
-            for res in [64, 128, 256]:
-                try:
-                    sample_blocks = iterator.generate_batch_list(4, resolution=res)
-                except:
-                    continue
-
-                for b in sample_blocks:
-                    if b.type != 'latent':
-                        continue
-
-                    x0 = b.content.unsqueeze(0)  # [1, C, H, W]
-                    logsnr = b.logsnr.unsqueeze(0)  # [1, 1, H, W]
-                    p = sparse_ae.patch_size
-                    grid_shape = (x0.shape[2] // p, x0.shape[3] // p)
-
-                    # DIRECT AE reconstruction (no projection bottleneck)
-                    encoder_masks, decoder_masks = sparse_ae.build_masks(grid_shape, device)
-                    output = sparse_ae(x0, logsnr_map=logsnr,
-                                       encoder_masks=encoder_masks,
-                                       decoder_masks=decoder_masks,
-                                       grid_shape=grid_shape)
-                    recon = output['recon'][0]  # [C, H, W]
-
-                    recon_samples['x0'].append(b.content)
-                    recon_samples['noisy_input'].append(b.content)
-                    recon_samples['reconstruction'].append(recon)
-                    recon_samples['logsnr_map'].append(b.logsnr)
-                    recon_samples['source'].append(getattr(b, 'source', 'unknown'))
-
-                    if len(recon_samples['x0']) >= 12:
-                        break
-                if len(recon_samples['x0']) >= 12:
-                    break
-
-        if recon_samples['x0']:
-            from .plotting import plot_dset_reconstruction
-            plot_dset_reconstruction(recon_samples, logger, name="ae_reconstruction", show_map=True, show_error=True)
-            print(f"  Saved {len(recon_samples['x0'])} AE reconstruction samples")
-
     return pd.DataFrame(history)
 
 def train_denoise(components, config, iterator, logger=None):
@@ -593,11 +512,7 @@ def train_denoise(components, config, iterator, logger=None):
     print(f"\n--- Training: Denoiser ({mode.upper()}) ---")
     model, _, _, page_table = components
     device = config['device']
-    var_cfg = config['training']['online_variance_correction']
-    if var_cfg['enabled']:
-        variance_tracker = OnlineVarianceTracker(device=device, **var_cfg)
-    else:
-        variance_tracker = None
+    variance_tracker = build_variance_tracker(config, device)
 
     # 3. Build Manager
     # We explicitly look up the stride from the model instance, or the config dict
@@ -619,57 +534,18 @@ def train_denoise(components, config, iterator, logger=None):
         graph_runner = None
         warmup_steps_needed = 0
 
-    # Model now owns all components including sparse AE (if enabled)
-    # So model.parameters() naturally includes everything needed for joint training
-
-    # Optional FP8 conversion (transformer weights only, embeddings stay bf16)
-    model = prepare_model_for_training(model, config, device=device)
-
-    # Create FP8 optimizer for FP8Linear weights - must match the main optimizer type
-    fp8_modules = collect_fp8_modules(model)
-    fp8_optimizer = None
-    if fp8_modules:
-        opt_type = config['training']['optimizer']['type']
-        n_fp8_params = sum(m.out_features * m.in_features for m in fp8_modules)
-
-        if opt_type == "heterogeneous":
-            # Muon for transformer weights in heterogeneous mode
-            muon_cfg = config['training']['optimizer']['muon']
-            fp8_optimizer = FP8Muon(
-                fp8_modules,
-                lr=muon_cfg['lr'],
-                momentum=muon_cfg['momentum'],
-                nesterov=muon_cfg['nesterov'],
-                ns_steps=muon_cfg['ns_steps'],
-            )
-            print(f"[FP8] Created FP8Muon for {len(fp8_modules)} modules ({n_fp8_params:,} params)")
-        else:
-            # AdamW for all weights when using single optimizer
-            adamw_cfg = config['training']['optimizer']['adamw']
-            fp8_optimizer = FP8AdamW(
-                fp8_modules,
-                lr=adamw_cfg['lr'],
-                betas=tuple(adamw_cfg['betas']),
-                weight_decay=adamw_cfg['weight_decay'],
-            )
-            print(f"[FP8] Created FP8AdamW for {len(fp8_modules)} modules ({n_fp8_params:,} params)")
-
-    # Build optimizer group for non-FP8 params (bias, embeddings, norms)
-    optimizer_group = build_optimizer_group(model, config, total_steps=steps)
-    print_optimizer_summary(optimizer_group, model)
+    # Build training context (handles FP8, optimizer, scaler, autocast)
+    ctx = build_training_context(model, config, total_steps=steps)
 
     history = []
-    # Pre-fetch bucketing flag to avoid lookup in loop
+    stats_collector = DeferredStatsCollector()
     bucketing_enabled = config['training']['bucketing']['enabled']
-    dtype = config['dtype']
-    use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
-    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16)) 
-    
+    log_interval = config['logging']['log_interval']
+
     pbar = tqdm(range(steps), desc="train-denoise")
     for i in pbar:
-        optimizer_group.zero_grad()
-        # --- AUTOCAST BLOCK ---
-        with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+        ctx.zero_grad()
+        with ctx.autocast():
             # 1. Clean Data
             # 1. NEW: Sample Bucket
             if bucketing_enabled:
@@ -724,9 +600,7 @@ def train_denoise(components, config, iterator, logger=None):
             valid_latent_samples = 0
             valid_text_samples = 0
 
-            # Deferred stats: only collect tensors, convert to CPU at log intervals
-            # This avoids per-block CPU-GPU sync
-            deferred_stats = []
+            # Stats collection (uses shared DeferredStatsCollector)
 
             # We iterate through the aligned lists of Blocks and Results
             latent_cursor = 0
@@ -756,25 +630,19 @@ def train_denoise(components, config, iterator, logger=None):
                         )
                         loss_v_accum = loss_v_accum + loss_v
 
-                        # Defer stats (keep tensors, sync at logging time)
-                        stat_entry = {
-                            'step': i,
-                            'source': getattr(block, 'source', 'unknown'),
-                            'type': 'latent',
-                            'loss_tensor': loss_stats['loss'],
-                            'logsnr_tensor': target_l.mean().detach(),
-                            'resolution': block.content.shape[-1] * block.content.shape[-2],
-                        }
-                        # Add variance-tracker specific stats if available
-                        if 'loss_unweighted' in loss_stats:
-                            stat_entry['loss_unweighted_tensor'] = loss_stats['loss_unweighted']
-                        if 'weight_mean' in loss_stats:
-                            stat_entry['weight_mean_tensor'] = loss_stats['weight_mean']
-                        if 'weight_range' in loss_stats:
-                            stat_entry['loss_var_tensor'] = loss_stats['weight_range']
-                        if 'loss_var' in loss_stats:
-                            stat_entry['loss_var_tensor'] = loss_stats['loss_var']
-                        deferred_stats.append(stat_entry)
+                        # Collect stats (deferred tensor->float conversion)
+                        extra = {}
+                        for k in ('loss_unweighted', 'weight_mean', 'weight_range', 'loss_var'):
+                            if k in loss_stats:
+                                extra[f'{k}_tensor'] = loss_stats[k]
+                        stats_collector.add(
+                            step=i, source=getattr(block, 'source', 'unknown'),
+                            type='latent',
+                            resolution=block.content.shape[-1] * block.content.shape[-2],
+                            loss_tensor=loss_stats['loss'],
+                            logsnr_tensor=target_l.mean().detach(),
+                            **extra
+                        )
 
                         # Lambda L1 loss via stateless function
                         loss_l, _ = logsnr_prediction_loss(pred_l, target_l)
@@ -794,13 +662,10 @@ def train_denoise(components, config, iterator, logger=None):
                             loss_t = F.cross_entropy(shift_logits, shift_targets)
                             loss_text_accum = loss_text_accum + loss_t
 
-                            deferred_stats.append({
-                                'step': i,
-                                'source': getattr(block, 'source', 'text'),
-                                'type': 'text',
-                                'loss_tensor': loss_t.detach(),
-                                'loss_var': 0.0
-                            })
+                            stats_collector.add(
+                                step=i, source=getattr(block, 'source', 'text'),
+                                type='text', loss_tensor=loss_t.detach(), loss_var=0.0
+                            )
                             valid_text_samples += 1
 
             # Normalize Accumulators
@@ -814,42 +679,13 @@ def train_denoise(components, config, iterator, logger=None):
             # Weighted Sum
             total_loss = loss_v_accum + (lambda_coeff * loss_lam_accum) + loss_text_accum + aux_loss
 
-        if dtype == torch.float16:
-            scaler.scale(total_loss).backward()
-            # Step each optimizer in the group through scaler
-            for spec in optimizer_group.specs.values():
-                scaler.step(spec.optimizer)
-            scaler.update()
-            optimizer_group.schedule_step()
-        else:
-            total_loss.backward()
-            optimizer_group.step()
-            optimizer_group.schedule_step()
-
-        # Apply FP8 weight updates (captured gradients -> FP8 storage)
-        if fp8_optimizer is not None:
-            fp8_optimizer.step()
-            fp8_optimizer.zero_grad()
+        # Backward and step (TrainingContext handles scaler, FP8, scheduling)
+        ctx.backward(total_loss)
+        ctx.step()
 
         # Only sync to CPU at logging intervals (avoids per-step CPU-GPU sync)
-        log_interval = config['logging']['log_interval']
         if i % log_interval == 0:
-            # Now convert deferred tensors to CPU for logging
-            step_stats = []
-            for stat in deferred_stats:
-                converted = {'step': stat['step'], 'source': stat['source'], 'type': stat['type']}
-
-                # Handle tensor -> float conversion for all *_tensor keys
-                for key in list(stat.keys()):
-                    if key.endswith('_tensor'):
-                        base_key = key[:-7]  # Remove '_tensor' suffix
-                        val = stat[key]
-                        converted[base_key] = val.item() if isinstance(val, torch.Tensor) else val
-                    elif key not in ('step', 'source', 'type'):
-                        converted[key] = stat[key]
-
-                step_stats.append(converted)
-            history.extend(step_stats)
+            history.extend(stats_collector.flush())
 
             pbar.set_postfix({
                 'v': f'{loss_v_accum.item():.3f}',
@@ -895,10 +731,8 @@ def train_latent_diffusion(
     Returns:
         DataFrame with training history
     """
-    from .context_manager import (
-        render_latent_topology_embeddings,
-        get_cached_latent_mask,
-    )
+    from .losses import group_blocks_by_grid
+    from .embedders import prepare_latent_batch
 
     config = sanitize_config(config)
     model = components[0]
@@ -928,11 +762,13 @@ def train_latent_diffusion(
     n_levels = sparse_ae.n_levels
     code_dim = sparse_ae.code_dim
 
-    # Topology geometry config
-    level_lambda = topo_cfg['level_lambda']
-    level_scale = topo_cfg['level_scale']
-    vertical_free = topo_cfg['vertical_attention_free']
-    window_size = config['model']['window_size']
+    # Topology geometry config (passed to latent_diffusion_forward_batch)
+    topo_config = {
+        'level_lambda': topo_cfg['level_lambda'],
+        'level_scale': topo_cfg['level_scale'],
+        'vertical_free': topo_cfg['vertical_attention_free'],
+        'window_size': config['model']['window_size'],
+    }
 
     # Training params from [training]
     steps = config['training']['steps']
@@ -961,56 +797,11 @@ def train_latent_diffusion(
 
     print(f"\n--- Training: Latent Diffusion (Main LDTformer) ---")
     print(f"    Steps: {steps}, n_levels: {n_levels}, code_dim: {code_dim}")
-    print(f"    Level lambda: {level_lambda}, vertical_free: {vertical_free}")
+    print(f"    Level lambda: {topo_config['level_lambda']}, vertical_free: {topo_config['vertical_free']}")
 
-    # Optimizer: encoder + model + decoder (joint training)
-    # Build a combined module for heterogeneous optimization
-    class LatentDiffusionModule(nn.Module):
-        """Wrapper to enable heterogeneous optimizer classification."""
-        def __init__(self, sparse_ae, main_model, patch_emb, patch_unemb):
-            super().__init__()
-            self.sparse_ae = sparse_ae
-            self.denoiser = main_model  # Main LDTformer as denoiser
-            # Use latent-specific projections (per-token, not concatenated)
-            self.latent_code_proj = patch_emb.latent_code_proj
-            self.logsnr_proj = patch_emb.logsnr_proj
-            self.latent_code_unproj = patch_unemb.latent_code_unproj
-            self.logsnr_decoder = patch_unemb.logsnr_decoder
-
-    latent_diff_module = LatentDiffusionModule(sparse_ae, model, patch_emb, patch_unemb)
-
-    # Apply FP8 conversion if configured (W8A16: 8-bit weights, 16-bit activations)
-    latent_diff_module = prepare_model_for_training(latent_diff_module, config, device=device)
-
-    # Create FP8 optimizer for FP8Linear weights - must match the main optimizer type
-    fp8_modules = collect_fp8_modules(latent_diff_module)
-    fp8_optimizer = None
-    if fp8_modules:
-        opt_type = config['training']['optimizer']['type']
-        n_fp8_params = sum(m.out_features * m.in_features for m in fp8_modules)
-
-        if opt_type == "heterogeneous":
-            muon_cfg = config['training']['optimizer']['muon']
-            fp8_optimizer = FP8Muon(
-                fp8_modules,
-                lr=muon_cfg['lr'],
-                momentum=muon_cfg['momentum'],
-                nesterov=muon_cfg['nesterov'],
-                ns_steps=muon_cfg['ns_steps'],
-            )
-            print(f"[FP8] Created FP8Muon for {len(fp8_modules)} modules ({n_fp8_params:,} params)")
-        else:
-            adamw_cfg = config['training']['optimizer']['adamw']
-            fp8_optimizer = FP8AdamW(
-                fp8_modules,
-                lr=adamw_cfg['lr'],
-                betas=tuple(adamw_cfg['betas']),
-                weight_decay=adamw_cfg['weight_decay'],
-            )
-            print(f"[FP8] Created FP8AdamW for {len(fp8_modules)} modules ({n_fp8_params:,} params)")
-
-    optimizer_group = build_optimizer_group(latent_diff_module, config, total_steps=steps)
-    print_optimizer_summary(optimizer_group, latent_diff_module)
+    # Build training context - model already owns sparse_ae, patch_embedder, patch_unembedder
+    # No wrapper needed: model.parameters() includes all components for joint training
+    ctx = build_training_context(model, config, total_steps=steps)
 
     # Bucketing
     model_stride = patch_emb.stride
@@ -1018,23 +809,17 @@ def train_latent_diffusion(
     bucketing_enabled = config['training']['bucketing']['enabled']
 
     # Variance tracker
-    var_cfg = config['training']['online_variance_correction']
-    if var_cfg['enabled']:
-        variance_tracker = OnlineVarianceTracker(device=device, **var_cfg)
-    else:
-        variance_tracker = None
+    variance_tracker = build_variance_tracker(config, device)
 
     history = []
-    deferred_sample_stats = []  # Per-sample stats for SNR binning
-    use_amp = dtype in (torch.bfloat16, torch.float16)
-    scaler = torch.amp.GradScaler('cuda', enabled=(dtype == torch.float16))
+    stats_collector = DeferredStatsCollector()
     log_interval = config['logging']['log_interval']
 
     pbar = tqdm(range(steps), desc="train-latent-diff")
     for i in pbar:
-        optimizer_group.zero_grad()
+        ctx.zero_grad()
 
-        with torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
+        with ctx.autocast():
             # Sample bucket
             if bucketing_enabled:
                 bucket = bucket_mgr.sample_bucket()
@@ -1047,18 +832,8 @@ def train_latent_diffusion(
             # Get clean blocks
             clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
 
-            # Group by grid_shape for batched processing
-            latent_groups = {}
-            for b in clean_blocks:
-                if b.type != 'latent':
-                    continue
-                img = b.content
-                lsnr = b.logsnr
-                p = patch_emb.stride
-                grid_shape = (img.shape[1] // p, img.shape[2] // p)
-                if grid_shape not in latent_groups:
-                    latent_groups[grid_shape] = []
-                latent_groups[grid_shape].append((b, img, lsnr))
+            # Group by grid_shape for batched processing (reuse from losses.py)
+            latent_groups = group_blocks_by_grid(clean_blocks, sparse_ae.patch_size, device)
 
             if not latent_groups:
                 continue
@@ -1072,178 +847,85 @@ def train_latent_diffusion(
             n_latent = 0
 
             for grid_shape, group in latent_groups.items():
-                H_grid, W_grid = grid_shape
-                n_patches = H_grid * W_grid
-                total_tokens = n_patches * n_levels
-
-                imgs = torch.stack([g[1] for g in group], dim=0)  # [B, C, H, W]
-                logsnrs = torch.stack([g[2] for g in group], dim=0)  # [B, 1, H, W]
-                batch_size = imgs.shape[0]
-                p = sparse_ae.patch_size
-
-                # Get encoder/decoder masks for sparse_ae
-                encoder_masks, decoder_masks = patch_emb._get_masks(grid_shape, device)
-
-                # Build latent diffusion topology (4D: highway, spatial_x, spatial_y, level)
-                topo_embeds, level_ids, patch_ids = render_latent_topology_embeddings(
-                    n_patches=n_patches,
-                    n_levels=n_levels,
-                    grid_shape=grid_shape,
-                    device=device,
-                    level_scale=level_scale,
+                # Prepare embeddings (extracted to embedders.py)
+                batch = prepare_latent_batch(
+                    group, grid_shape, sparse_ae, patch_emb, topo_config, device
                 )
+                B = batch['batch_size']
+                target_v = batch['target_v']
+                logsnr_flat = batch['logsnr_flat']
+                alpha, sigma, noisy_codes = batch['alpha'], batch['sigma'], batch['noisy_codes']
+                imgs = batch['imgs']
 
-                # Get cached level-aware attention mask
-                latent_mask = get_cached_latent_mask(
-                    n_patches=n_patches,
-                    n_levels=n_levels,
-                    grid_shape=grid_shape,
-                    window_size=window_size,
-                    level_lambda=level_lambda,
-                    vertical_free=vertical_free,
-                    mode='local',
-                    device=device,
-                )
-
-                # === ENCODE: Batched encoding with pre_quant ===
-                codes_list, level_logsnrs, prequant_list = sparse_ae.encode_with_prequant(
-                    imgs, logsnrs,
-                    grid_shape=grid_shape,
-                    encoder_masks=encoder_masks,
-                    decoder_masks=decoder_masks
-                )
-
-                # Stack and flatten pre_quants across levels: [B, n_patches, n_levels, code_dim]
-                pre_quant_stacked = torch.stack(prequant_list, dim=2)  # [B, N, L, D]
-                pre_quant_flat = pre_quant_stacked.view(batch_size, total_tokens, code_dim)  # [B, N*L, D]
-
-                # Expand logsnr to per-token (each level gets same logsnr per patch)
-                logsnr_pooled = F.avg_pool2d(logsnrs, kernel_size=p, stride=p)
-                logsnr_patches = logsnr_pooled.flatten(2).transpose(1, 2)  # [B, N, 1]
-                logsnr_flat = logsnr_patches.repeat(1, n_levels, 1)  # [B, N*L, 1]
-
-                # === DIFFUSION: Add noise to pre_quant, predict v-field ===
-                noise = torch.randn_like(pre_quant_flat)
-
-                # Compute alpha/sigma from logsnr
-                alpha_sq = torch.sigmoid(logsnr_flat)  # [B, N*L, 1]
-                sigma_sq = torch.sigmoid(-logsnr_flat)
-                alpha = torch.sqrt(alpha_sq)
-                sigma = torch.sqrt(sigma_sq)
-
-                # Noisy codes: z_t = alpha * x_0 + sigma * noise
-                noisy_codes = alpha * pre_quant_flat + sigma * noise
-
-                # Target v-field: v = alpha * noise - sigma * x_0
-                target_v = alpha * noise - sigma * pre_quant_flat
-
-                # Project codes to model dim and add topology embedding
-                # Use latent_code_proj for per-token (not concatenated) code projection
-                h = patch_emb.latent_code_proj(noisy_codes)  # [B, N*L, model_dim]
-
-                # Add logsnr conditioning
-                logsnr_features = patch_emb.logsnr_proj(logsnr_flat)  # [B, N*L, model_dim]
-                h = h + logsnr_features
-
-                # Run through main LDTformer with 4D topology
-                # The model expects: (tokens, topo_embeds, block_mask)
+                # Apply model: h_input → LDTformer → v_pred, logsnr_pred
                 h = model.forward_latent_diffusion(
-                    h,
-                    topo_embeds=topo_embeds.unsqueeze(0).expand(batch_size, -1, -1),
-                    block_mask=latent_mask,
+                    batch['h_input'],
+                    topo_embeds=batch['topo_embeds'].unsqueeze(0).expand(B, -1, -1),
+                    block_mask=batch['latent_mask'],
                 )
-
-                # Project back to code space (per-token, not concatenated)
-                v_pred = patch_unemb.latent_code_unproj(h)  # [B, N*L, code_dim]
-                logsnr_pred = patch_unemb.logsnr_decoder(h)  # [B, N*L, 1]
+                v_pred = patch_unemb.latent_code_unproj(h)
+                logsnr_pred = patch_unemb.logsnr_decoder(h)
 
                 # V-field loss in latent space
                 if use_scheduled_v_loss:
                     loss_v, v_stats = scheduled_mse_bce_velocity_loss(
-                        v_pred, target_v,
-                        step=i,
-                        total_steps=steps,
+                        v_pred, target_v, step=i, total_steps=steps,
                         schedule_cfg=diffusion_loss_schedule,
-                        variance_tracker=variance_tracker,
-                        logsnr_map=logsnr_flat
+                        variance_tracker=variance_tracker, logsnr_map=logsnr_flat
                     )
-                    last_v_stats = v_stats  # Track for logging
+                    last_v_stats = v_stats
                 else:
-                    sq_err_v = (v_pred - target_v) ** 2
-                    loss_v = sq_err_v.mean()
-                loss_v_accum = loss_v_accum + loss_v * batch_size
+                    loss_v = ((v_pred - target_v) ** 2).mean()
+                loss_v_accum = loss_v_accum + loss_v * B
 
-                # === RECONSTRUCTION: Unflatten, re-quantize and decode ===
+                # Reconstruction: recover clean codes, quantize, decode
                 if recon_weight > 0:
-                    # Recover clean estimate from v-field: x_0 = alpha * z_t - sigma * v
                     clean_pred = alpha * noisy_codes - sigma * v_pred
-
-                    # Unflatten back to [B, N, L, D]
-                    clean_pred_stacked = clean_pred.view(batch_size, n_patches, n_levels, code_dim)
-
-                    # Split to per-level list
+                    clean_pred_stacked = clean_pred.view(B, batch['n_patches'], n_levels, code_dim)
                     prequant_pred_list = [clean_pred_stacked[:, :, lv, :] for lv in range(n_levels)]
-
-                    # Batched quantize and decode
                     cumulative_recon = sparse_ae.quantize_and_decode(
-                        prequant_pred_list, grid_shape, decoder_masks
+                        prequant_pred_list, grid_shape, batch['decoder_masks']
                     )
 
-                    # Reconstruction loss vs original image (scheduled MSE/BCE if enabled)
                     if use_scheduled_recon_loss:
                         recon_mse = F.mse_loss(cumulative_recon, imgs)
-                        # BCE requires values in (0, 1) - clamp for safety
                         with torch.amp.autocast(device_type='cuda', enabled=False):
                             recon_clamped = cumulative_recon.float().clamp(1e-7, 1 - 1e-7)
                             imgs_clamped = imgs.float().clamp(1e-7, 1 - 1e-7)
                             recon_bce = F.binary_cross_entropy(recon_clamped, imgs_clamped)
                         recon_loss = recon_mse_weight * recon_mse + recon_bce_weight * recon_bce
                         last_recon_stats = {
-                            'mse_loss': recon_mse.detach(),
-                            'bce_loss': recon_bce.detach(),
-                            'mse_weight': recon_mse_weight,
-                            'bce_weight': recon_bce_weight
+                            'mse_loss': recon_mse.detach(), 'bce_loss': recon_bce.detach(),
+                            'mse_weight': recon_mse_weight, 'bce_weight': recon_bce_weight
                         }
                     else:
                         recon_loss = F.mse_loss(cumulative_recon, imgs)
                         last_recon_stats = None
-                    loss_recon_accum = loss_recon_accum + recon_loss * batch_size
+                    loss_recon_accum = loss_recon_accum + recon_loss * B
 
                 # LogSNR prediction loss
                 loss_logsnr = F.l1_loss(logsnr_pred, logsnr_flat)
-                loss_logsnr_accum = loss_logsnr_accum + loss_logsnr * batch_size
+                loss_logsnr_accum = loss_logsnr_accum + loss_logsnr * B
+                n_latent += B
 
-                n_latent += batch_size
-
-                # Collect per-sample stats for SNR binning (defer sync to logging time)
-                # Match train_denoise pattern: keep tensors, convert at logging time
+                # Per-sample stats for SNR binning
                 with torch.no_grad():
-                    # Per-sample mean logsnr: [B]
                     per_sample_logsnr = logsnr_flat.mean(dim=1).squeeze(-1)
-                    # Per-sample v-field MSE: [B]
                     per_sample_loss = ((v_pred - target_v) ** 2).mean(dim=(1, 2))
-                    # Resolution is same for all samples in this group
                     res = curr_res * curr_res
-
-                    for b_idx in range(batch_size):
-                        block = group[b_idx][0]  # (block, img, lsnr) tuple
-                        stat_entry = {
-                            'step': i,
-                            'source': getattr(block, 'source', 'unknown'),
-                            'type': 'latent',
-                            'loss_tensor': per_sample_loss[b_idx].detach(),
-                            'logsnr_tensor': per_sample_logsnr[b_idx].detach(),
-                            'resolution': res,
-                        }
-                        # Add variance-tracker stats if available (from last_v_stats)
-                        if use_scheduled_v_loss and last_v_stats is not None:
-                            if 'loss_unweighted' in last_v_stats:
-                                stat_entry['loss_unweighted_tensor'] = last_v_stats['loss_unweighted']
-                            if 'weight_mean' in last_v_stats:
-                                stat_entry['weight_mean_tensor'] = last_v_stats['weight_mean']
-                            if 'loss_var' in last_v_stats:
-                                stat_entry['loss_var_tensor'] = last_v_stats['loss_var']
-                        deferred_sample_stats.append(stat_entry)
+                    for b_idx, block in enumerate(batch['blocks']):
+                        extra = {}
+                        if use_scheduled_v_loss and last_v_stats:
+                            for k in ('loss_unweighted', 'weight_mean', 'loss_var'):
+                                if k in last_v_stats:
+                                    extra[f'{k}_tensor'] = last_v_stats[k]
+                        stats_collector.add(
+                            step=i, source=getattr(block, 'source', 'unknown'),
+                            type='latent', resolution=res,
+                            loss_tensor=per_sample_loss[b_idx].detach(),
+                            logsnr_tensor=per_sample_logsnr[b_idx].detach(),
+                            **extra
+                        )
 
             if n_latent == 0:
                 continue
@@ -1256,54 +938,30 @@ def train_latent_diffusion(
             # Total loss
             total_loss = loss_v + recon_weight * loss_recon + logsnr_weight * loss_logsnr
 
-        # Backward
-        if dtype == torch.float16:
-            scaler.scale(total_loss).backward()
-            for spec in optimizer_group.specs.values():
-                scaler.step(spec.optimizer)
-            scaler.update()
-            optimizer_group.schedule_step()
-        else:
-            total_loss.backward()
-            optimizer_group.step()
-            optimizer_group.schedule_step()
-
-        # Apply FP8 weight updates (captured gradients -> FP8 storage)
-        if fp8_optimizer is not None:
-            fp8_optimizer.step()
-            fp8_optimizer.zero_grad()
+        # Backward and step (TrainingContext handles scaler, FP8, scheduling)
+        ctx.backward(total_loss)
+        ctx.step()
 
         # Logging - per-sample entries for proper SNR binning
-        # Match train_denoise pattern: convert tensors to floats at logging time
         if i % log_interval == 0:
-            for stat in deferred_sample_stats:
-                converted = {'step': stat['step'], 'source': stat['source'], 'type': stat['type']}
-
-                # Handle tensor -> float conversion for all *_tensor keys
-                for key in list(stat.keys()):
-                    if key.endswith('_tensor'):
-                        base_key = key[:-7]  # Remove '_tensor' suffix
-                        val = stat[key]
-                        converted[base_key] = val.item() if isinstance(val, torch.Tensor) else val
-                    elif key not in ('step', 'source', 'type'):
-                        converted[key] = stat[key]
-
-                # Add v-field BCE schedule stats if enabled
-                if use_scheduled_v_loss and last_v_stats is not None:
-                    converted['mse_loss'] = float(last_v_stats['mse_loss'])
-                    converted['bce_loss'] = float(last_v_stats['bce_loss'])
-                    converted['mse_weight'] = last_v_stats['mse_weight']
-                    converted['bce_weight'] = last_v_stats['bce_weight']
-                    converted['lerp_t'] = i / max(steps - 1, 1)
-                # Add recon BCE schedule stats if enabled
-                if use_scheduled_recon_loss and last_recon_stats is not None:
-                    converted['recon_mse_loss'] = float(last_recon_stats['mse_loss'])
-                    converted['recon_bce_loss'] = float(last_recon_stats['bce_loss'])
-                    converted['recon_mse_weight'] = last_recon_stats['mse_weight']
-                    converted['recon_bce_weight'] = last_recon_stats['bce_weight']
-
-                history.append(converted)
-            deferred_sample_stats.clear()
+            # Build extra_stats from schedule-specific values
+            extra_stats = {}
+            if use_scheduled_v_loss and last_v_stats is not None:
+                extra_stats.update({
+                    'mse_loss': float(last_v_stats['mse_loss']),
+                    'bce_loss': float(last_v_stats['bce_loss']),
+                    'mse_weight': last_v_stats['mse_weight'],
+                    'bce_weight': last_v_stats['bce_weight'],
+                    'lerp_t': i / max(steps - 1, 1),
+                })
+            if use_scheduled_recon_loss and last_recon_stats is not None:
+                extra_stats.update({
+                    'recon_mse_loss': float(last_recon_stats['mse_loss']),
+                    'recon_bce_loss': float(last_recon_stats['bce_loss']),
+                    'recon_mse_weight': last_recon_stats['mse_weight'],
+                    'recon_bce_weight': last_recon_stats['bce_weight'],
+                })
+            history.extend(stats_collector.flush(extra_stats=extra_stats if extra_stats else None))
 
             postfix = {
                 'v': f'{loss_v.item():.4f}',
