@@ -46,6 +46,138 @@ def format_error(error) -> str:
     return str(error)
 
 
+def save_ablation_grid(host: str, port: int, step: int, n_samples: int,
+                       output_dir: Path, run_id: str, vaporeon: bool):
+    """Generate and save ablation comparison grid at current policy state."""
+    viz_code = f'''
+import torch
+import numpy as np
+
+# Get fresh test batch
+blocks = ctx._rl_iterator.generate_batch_list(batch_size={n_samples * 4}, resolution=64)
+matching = [b.content for b in blocks if b.content.shape[-1] == 64][:{n_samples}]
+images = torch.stack(matching).to(ctx.device)
+
+ae = model.sparse_ae
+p = ae.patch_size
+grid_shape = (64 // p, 64 // p)
+encoder_masks, decoder_masks = ae.build_masks(grid_shape, images.device)
+code_dim = ae.code_dim
+n_wavelet_dims = getattr(ae, 'n_wavelet_dims', None) or code_dim // 2
+n_amp_dims = code_dim - n_wavelet_dims
+
+def ablate_codes(codes_list, subspace, rate):
+    ablated = []
+    for codes in codes_list:
+        c = codes.clone()
+        B, N, D = c.shape
+        if subspace == "wavelet":
+            n_zero = int(n_wavelet_dims * rate)
+            if n_zero > 0:
+                mask = torch.ones(D, device=c.device, dtype=c.dtype)
+                zero_idx = torch.randperm(n_wavelet_dims)[:n_zero]
+                mask[zero_idx] = 0
+                c = c * mask
+        elif subspace == "amplitude":
+            n_zero = int(n_amp_dims * rate)
+            if n_zero > 0:
+                mask = torch.ones(D, device=c.device, dtype=c.dtype)
+                zero_idx = torch.randperm(n_amp_dims)[:n_zero] + n_wavelet_dims
+                mask[zero_idx] = 0
+                c = c * mask
+        ablated.append(c)
+    return ablated
+
+ablation_rates = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+    codes = ae.encode(images, grid_shape=grid_shape,
+                      encoder_masks=encoder_masks, decoder_masks=decoder_masks)
+
+    # Collect reconstructions at each ablation rate
+    viz_data = {{"images": [], "recons_base": [], "wav_ablations": {{}}, "amp_ablations": {{}}}}
+
+    recon_base = ae.decode(codes, grid_shape, decoder_masks).float()
+
+    for i in range({n_samples}):
+        viz_data["images"].append(images[i].float().permute(1,2,0).cpu().numpy().clip(0,1).tolist())
+        viz_data["recons_base"].append(recon_base[i].permute(1,2,0).cpu().numpy().clip(0,1).tolist())
+
+    for rate in ablation_rates:
+        viz_data["wav_ablations"][rate] = []
+        viz_data["amp_ablations"][rate] = []
+
+        codes_w = ablate_codes(codes, "wavelet", rate)
+        codes_a = ablate_codes(codes, "amplitude", rate)
+        recon_w = ae.decode(codes_w, grid_shape, decoder_masks).float()
+        recon_a = ae.decode(codes_a, grid_shape, decoder_masks).float()
+
+        for i in range({n_samples}):
+            viz_data["wav_ablations"][rate].append(recon_w[i].permute(1,2,0).cpu().numpy().clip(0,1).tolist())
+            viz_data["amp_ablations"][rate].append(recon_a[i].permute(1,2,0).cpu().numpy().clip(0,1).tolist())
+
+ctx._periodic_viz = viz_data
+'''
+    result = eval_code(viz_code, host, port)
+    if not result['success']:
+        print(f"    Warning: Could not generate viz at step {step}: {format_error(result['error'])}")
+        return
+
+    fetch = eval_code("ctx._periodic_viz", host, port)
+    if not fetch['success']:
+        return
+
+    viz_data = fetch['result']
+    ablation_rates = [0.0, 0.25, 0.5, 0.75, 1.0]
+
+    # Create grid: rows = samples, cols = Original | Base | Wav@rates... | Amp@rates...
+    n_cols = 2 + 2 * len(ablation_rates)
+    fig, axes = plt.subplots(n_samples, n_cols, figsize=(2 * n_cols, 2 * n_samples))
+    if n_samples == 1:
+        axes = axes[np.newaxis, :]
+
+    for row in range(n_samples):
+        col = 0
+
+        # Original
+        axes[row, col].imshow(np.array(viz_data["images"][row]))
+        axes[row, col].set_title("Original" if row == 0 else "")
+        axes[row, col].axis('off')
+        col += 1
+
+        # Base reconstruction
+        axes[row, col].imshow(np.array(viz_data["recons_base"][row]))
+        axes[row, col].set_title("Recon" if row == 0 else "")
+        axes[row, col].axis('off')
+        col += 1
+
+        # Wavelet ablations
+        for rate in ablation_rates:
+            img = np.array(viz_data["wav_ablations"][str(rate)][row])
+            axes[row, col].imshow(img)
+            axes[row, col].set_title(f"Wav{int(rate*100)}%" if row == 0 else "")
+            axes[row, col].axis('off')
+            col += 1
+
+        # Amplitude ablations
+        for rate in ablation_rates:
+            img = np.array(viz_data["amp_ablations"][str(rate)][row])
+            axes[row, col].imshow(img)
+            axes[row, col].set_title(f"Amp{int(rate*100)}%" if row == 0 else "")
+            axes[row, col].axis('off')
+            col += 1
+
+    suffix = "_vaporeon" if vaporeon else ""
+    plt.suptitle(f'Ablation Robustness @ Step {step} ({run_id})', fontsize=12)
+    plt.tight_layout()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"ablation_step{step:04d}_{run_id}{suffix}.png"
+    plt.savefig(output_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {output_path.name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Ablation robustness REINFORCE")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -372,6 +504,11 @@ ctx._last_step = {{
             print(f"{m['step']:>6} {m['mse_base']:>10.6f} {m['mse_wav']:>10.6f} "
                   f"{m['mse_amp']:>10.6f} {m['robustness']:>10.6f} "
                   f"{m['reward']:>10.4f} {m['advantage']:>+8.4f}")
+
+        # Periodic image saving
+        if args.save_interval > 0 and (step % args.save_interval == 0 or step == args.steps - 1):
+            save_ablation_grid(args.host, args.port, step, args.n_viz_samples,
+                               Path(args.output_dir), args.run_id, args.vaporeon)
 
     # Generate comparison with ablation curves
     print("\nGenerating ablation curve comparison...")

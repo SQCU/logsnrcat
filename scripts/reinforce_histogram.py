@@ -25,7 +25,7 @@ import requests
 
 DEFAULT_HOST = "172.26.160.1"
 DEFAULT_PORT = 8421
-DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_091"
+DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_096"
 
 
 def eval_code(code: str, host: str, port: int, timeout: int = 180) -> dict:
@@ -47,6 +47,128 @@ def format_error(error) -> str:
     return str(error)
 
 
+def save_histogram_grid(host: str, port: int, step: int, n_samples: int,
+                        output_dir: Path, run_id: str, vaporeon: bool, n_bins: int = 32):
+    """Generate and save histogram comparison grid at current policy state."""
+    viz_code = f'''
+import torch
+import numpy as np
+
+# Get fresh test batch
+blocks = ctx._rl_iterator.generate_batch_list(batch_size={n_samples * 4}, resolution=64)
+matching = [b.content for b in blocks if b.content.shape[-1] == 64][:{n_samples}]
+images = torch.stack(matching).to(ctx.device)
+
+ae = model.sparse_ae
+p = ae.patch_size
+grid_shape = (64 // p, 64 // p)
+encoder_masks, decoder_masks = ae.build_masks(grid_shape, images.device)
+
+with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+    codes_list = ae.encode(images, grid_shape=grid_shape,
+                           encoder_masks=encoder_masks, decoder_masks=decoder_masks)
+
+    # Apply LoRA adapters if available
+    if hasattr(ctx, '_lora_enc') and hasattr(ctx, '_lora_dec'):
+        codes_adapted = []
+        for codes in codes_list:
+            adapted = codes + ctx._lora_enc(codes)
+            adapted = adapted + ctx._lora_dec(adapted)
+            codes_adapted.append(adapted)
+        recon = ae.decode(codes_adapted, grid_shape, decoder_masks)
+    else:
+        recon = ae.decode(codes_list, grid_shape, decoder_masks)
+
+# Convert to numpy (detach to be safe)
+images_np = images.detach().float().cpu().numpy()
+recon_np = recon.detach().float().cpu().numpy()
+
+# Compute histograms
+def compute_histogram(img_batch, n_bins):
+    B, C, H, W = img_batch.shape
+    hists = []
+    for c in range(C):
+        channel_data = img_batch[:, c, :, :].flatten()
+        hist, _ = np.histogram(channel_data, bins=n_bins, range=(0, 1), density=True)
+        hists.append((hist / (hist.sum() + 1e-10)).tolist())
+    return hists
+
+hist_input = compute_histogram(images_np, {n_bins})
+hist_recon = compute_histogram(recon_np, {n_bins})
+
+# JS divergence
+def js_div(p, q):
+    p, q = np.array(p), np.array(q)
+    m = 0.5 * (p + q)
+    kl_pm = np.sum(p * np.log((p + 1e-10) / (m + 1e-10)))
+    kl_qm = np.sum(q * np.log((q + 1e-10) / (m + 1e-10)))
+    return 0.5 * kl_pm + 0.5 * kl_qm
+
+js_per_channel = [js_div(hist_input[c], hist_recon[c]) for c in range(3)]
+
+ctx._hist_viz = {{
+    "images": [images_np[i].transpose(1,2,0).clip(0,1).tolist() for i in range({n_samples})],
+    "recons": [recon_np[i].transpose(1,2,0).clip(0,1).tolist() for i in range({n_samples})],
+    "hist_input": hist_input,
+    "hist_recon": hist_recon,
+    "js_per_channel": js_per_channel,
+    "js_mean": float(np.mean(js_per_channel)),
+    "mse": float(F.mse_loss(recon.float(), images.float()).item())
+}}
+'''
+    result = eval_code(viz_code, host, port)
+    if not result['success']:
+        print(f"    Warning: Could not generate viz at step {step}: {format_error(result['error'])}")
+        return
+
+    fetch = eval_code("ctx._hist_viz", host, port)
+    if not fetch['success']:
+        return
+
+    viz_data = fetch['result']
+
+    # Create figure: top row = histograms, bottom row = sample images
+    fig = plt.figure(figsize=(14, 6))
+
+    # Histograms
+    colors = ['red', 'green', 'blue']
+    channel_names = ['R', 'G', 'B']
+    bins = np.linspace(0, 1, n_bins)
+
+    for c in range(3):
+        ax = fig.add_subplot(2, 4, c + 1)
+        ax.bar(bins, viz_data['hist_input'][c], width=1/n_bins, alpha=0.5, label='Input', color=colors[c])
+        ax.bar(bins, viz_data['hist_recon'][c], width=1/n_bins, alpha=0.5, label='Recon', color='gray')
+        ax.set_title(f'{channel_names[c]} JS={viz_data["js_per_channel"][c]:.4f}')
+        ax.legend(fontsize=7)
+
+    # Summary
+    ax = fig.add_subplot(2, 4, 4)
+    ax.axis('off')
+    ax.text(0.1, 0.5, f"Step {step}\n\nJS Mean: {viz_data['js_mean']:.4f}\nMSE: {viz_data['mse']:.6f}",
+            fontsize=11, family='monospace', verticalalignment='center', transform=ax.transAxes)
+
+    # Sample images (input | recon pairs)
+    for i in range(min(4, n_samples)):
+        ax = fig.add_subplot(2, 4, 5 + i)
+        img_in = np.array(viz_data['images'][i])
+        img_re = np.array(viz_data['recons'][i])
+        combined = np.concatenate([img_in, img_re], axis=1)
+        ax.imshow(np.clip(combined, 0, 1))
+        ax.set_title(f'Sample {i+1}: In | Recon')
+        ax.axis('off')
+
+    suffix = "_vaporeon" if vaporeon else ""
+    plt.suptitle(f'Histogram Fidelity @ Step {step} ({run_id})', fontsize=12)
+    plt.tight_layout()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"histogram_step{step:04d}_{run_id}{suffix}.png"
+    plt.savefig(output_path, dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {output_path.name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="REINFORCE histogram trainer")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -58,7 +180,16 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4, help="Adapter learning rate")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT)
     parser.add_argument("--vaporeon", action="store_true")
+    parser.add_argument("--save-interval", type=int, default=10,
+                        help="Save histogram image grid every N steps (0 to disable)")
+    parser.add_argument("--n-viz-samples", type=int, default=4,
+                        help="Number of samples in periodic visualization grids")
+    parser.add_argument("--run-id", type=str, default=None)
     args = parser.parse_args()
+
+    if args.run_id is None:
+        import datetime
+        args.run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print(f"Connecting to eval server at http://{args.host}:{args.port}...")
     health = requests.get(f"http://{args.host}:{args.port}/health").json()
@@ -315,6 +446,11 @@ ctx._last_step_result = {{"step": step_num, "reward": reward, "mse": mse, "js_di
         if step % 5 == 0 or step == args.steps - 1:
             print(f"{metrics['step']:>6} {metrics['reward']:>10.4f} {metrics['js_div']:>10.4f} "
                   f"{metrics['mse']:>10.6f} {metrics['hist_loss']:>10.4f} {metrics['advantage']:>+8.4f}")
+
+        # Periodic image saving
+        if args.save_interval > 0 and (step % args.save_interval == 0 or step == args.steps - 1):
+            save_histogram_grid(args.host, args.port, step, args.n_viz_samples,
+                                Path(args.output_dir), args.run_id, args.vaporeon)
 
     # Fetch training history and plot
     print("\nFetching training history...")

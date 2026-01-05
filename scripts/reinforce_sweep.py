@@ -26,7 +26,7 @@ import requests
 
 DEFAULT_HOST = "172.26.160.1"
 DEFAULT_PORT = 8421
-DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_091"
+DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_096"
 
 
 def eval_code(code: str, host: str, port: int, timeout: int = 300) -> dict:
