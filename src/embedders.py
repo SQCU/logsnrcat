@@ -545,6 +545,7 @@ def prepare_latent_batch(
         'latent_mask': latent_mask,
 
         # Reconstruction support
+        'encoder_masks': encoder_masks,
         'decoder_masks': decoder_masks,
 
         # Geometry

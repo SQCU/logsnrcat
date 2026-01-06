@@ -1654,7 +1654,9 @@ class SwiGLUPatchUnembedder(nn.Module):
     def _get_masks(self, grid_shape: Tuple[int, int], device: torch.device) -> List:
         """Get or build cached decoder masks."""
         if grid_shape not in self._mask_cache:
-            self._mask_cache[grid_shape] = self.ae.decoders[0].transformer.build_masks(grid_shape, device)
+            # MoE variant uses 'decoder' (singular, shared), non-MoE uses 'decoders' (plural, per-level)
+            decoder = getattr(self.ae, 'decoder', None) or self.ae.decoders[0]
+            self._mask_cache[grid_shape] = decoder.transformer.build_masks(grid_shape, device)
         return self._mask_cache[grid_shape]
 
     def forward(

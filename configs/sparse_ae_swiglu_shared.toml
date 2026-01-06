@@ -85,7 +85,8 @@ k_start = 32           # Start with 32 active dims (easier reconstruction)
 k_anneal_steps = 250  # Anneal to k_per_patch=6 over 5000 steps
 residual_scale = 2.0
 fourier_dim = 16
-ae_loss_weight = 0.1   # Weight for AE loss in joint training (not used in standalone AE warmup)
+ae_loss_weight = 0.1   # Weight for diffusion-predicted reconstruction in joint training
+direct_ae_weight = 0.1  # Weight for DIRECT AE reconstruction (prevents AE collapse during joint training)
 n_layers = 4
 # Loss function: cumulative_mse (reference impl), final_mse, or cumulative_mse_contrib
 loss_type = "final_mse"  # Reference uses final only, cumulative dilutes gradients by 1/n_levels

@@ -807,7 +807,8 @@ def train_latent_diffusion(
     steps = config['training']['steps']
     bs = config['training']['batch_size']
     lambda_coeff = config['training']['lambda_coeff']
-    recon_weight = sparse_ae_cfg['ae_loss_weight']
+    recon_weight = sparse_ae_cfg['ae_loss_weight']  # Weight for diffusion-predicted reconstruction
+    direct_ae_weight = sparse_ae_cfg['direct_ae_weight']  # Weight for DIRECT AE reconstruction
     logsnr_weight = sparse_ae_cfg['logsnr_loss_weight']
 
     # Diffusion loss schedule config (MSE -> partial BCE for v-field)
@@ -831,6 +832,9 @@ def train_latent_diffusion(
     print(f"\n--- Training: Latent Diffusion (Main LDTformer) ---")
     print(f"    Steps: {steps}, n_levels: {n_levels}, code_dim: {code_dim}")
     print(f"    Level lambda: {topo_config['level_lambda']}, vertical_free: {topo_config['vertical_free']}")
+    print(f"    Loss weights: v=1.0, recon={recon_weight}, direct_ae={direct_ae_weight}, logsnr={logsnr_weight}")
+    if direct_ae_weight > 0:
+        print(f"    DIRECT AE reconstruction ENABLED (prevents AE collapse during joint training)")
 
     # Build training context - model already owns sparse_ae, patch_embedder, patch_unembedder
     # No wrapper needed: model.parameters() includes all components for joint training
@@ -889,6 +893,7 @@ def train_latent_diffusion(
             # Accumulators
             loss_v_accum = torch.tensor(0.0, device=device)
             loss_recon_accum = torch.tensor(0.0, device=device)
+            loss_direct_ae_accum = torch.tensor(0.0, device=device)  # Direct AE reconstruction
             loss_logsnr_accum = torch.tensor(0.0, device=device)
             last_v_stats = None  # Track v-field stats from last group for logging
             last_recon_stats = None  # Track recon stats from last group for logging
@@ -954,6 +959,23 @@ def train_latent_diffusion(
                 # LogSNR prediction loss
                 loss_logsnr = F.l1_loss(logsnr_pred, logsnr_flat)
                 loss_logsnr_accum = loss_logsnr_accum + loss_logsnr * B
+
+                # === DIRECT AE RECONSTRUCTION ===
+                # CRITICAL: This keeps the encoder/decoder trained on direct reconstruction,
+                # preventing drift from diffusion-predicted reconstruction alone.
+                # Without this, encoder FSQ/sparsity and decoder adapt to diffusion outputs,
+                # not to actual encoder transformer outputs, causing reconstruction collapse.
+                if direct_ae_weight > 0:
+                    ae_output = sparse_ae(
+                        imgs,
+                        encoder_masks=batch['encoder_masks'],
+                        decoder_masks=batch['decoder_masks'],
+                        grid_shape=grid_shape
+                    )
+                    direct_ae_recon = ae_output['recon']
+                    direct_ae_loss = F.mse_loss(direct_ae_recon, imgs)
+                    loss_direct_ae_accum = loss_direct_ae_accum + direct_ae_loss * B
+
                 n_latent += B
 
                 # Per-sample stats for SNR binning
@@ -981,10 +1003,18 @@ def train_latent_diffusion(
             # Average losses
             loss_v = loss_v_accum / n_latent
             loss_recon = loss_recon_accum / n_latent
+            loss_direct_ae = loss_direct_ae_accum / n_latent if direct_ae_weight > 0 else torch.tensor(0.0, device=device)
             loss_logsnr = loss_logsnr_accum / n_latent
 
             # Total loss
-            total_loss = loss_v + recon_weight * loss_recon + logsnr_weight * loss_logsnr
+            # - loss_v: v-field prediction (diffusion denoising)
+            # - loss_recon: diffusion-predicted reconstruction (through quantize_and_decode)
+            # - loss_direct_ae: DIRECT AE reconstruction (encoder→decoder, keeps AE trained)
+            # - loss_logsnr: logsnr prediction
+            total_loss = (loss_v
+                         + recon_weight * loss_recon
+                         + direct_ae_weight * loss_direct_ae
+                         + logsnr_weight * loss_logsnr)
 
         # Backward and step (TrainingContext handles scaler, FP8, scheduling)
         ctx.backward(total_loss)
@@ -1013,7 +1043,8 @@ def train_latent_diffusion(
 
             postfix = {
                 'v': f'{loss_v.item():.4f}',
-                'rec': f'{loss_recon.item():.4f}' if recon_weight > 0 else 'N/A'
+                'rec': f'{loss_recon.item():.4f}' if recon_weight > 0 else 'N/A',
+                'ae': f'{loss_direct_ae.item():.4f}' if direct_ae_weight > 0 else 'N/A'
             }
             if use_scheduled_v_loss and last_v_stats is not None:
                 postfix['v_bce'] = f'{last_v_stats["bce_weight"]:.2f}'

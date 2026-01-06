@@ -368,7 +368,8 @@ class SparseAEConfig(BaseModel):
     k_anneal_steps: int = 2000  # Steps over which to anneal k
     residual_scale: float = 2.0
     fourier_dim: int = 16
-    ae_loss_weight: float = 0.1  # Weight for AE loss in joint training
+    ae_loss_weight: float = 0.1  # Weight for diffusion-predicted reconstruction in joint training
+    direct_ae_weight: float = 0.1  # Weight for DIRECT AE reconstruction (encoder→decoder, no diffusion)
     logsnr_loss_weight: float = 0.1  # Weight for logsnr prediction in joint training
     # Loss function type for AE training
     # cumulative_mse: average MSE across all level reconstructions (reference impl)

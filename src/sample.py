@@ -553,6 +553,14 @@ def diagnostic_ae_vs_diffusion(components, iterator, config_dict, logger):
 
     all_diagnostics = []
 
+    # Detect model dtype for autocast (CRITICAL: model weights are bf16, need matching context)
+    model = components[0]
+    model_dtype = torch.bfloat16
+    for p in model.parameters():
+        model_dtype = p.dtype
+        break
+    use_amp = model_dtype in (torch.bfloat16, torch.float16)
+
     for split_name in split_names:
         try:
             blocks = iterator.generate_from_split(split_name, count=n_per_split, resolution=res)
@@ -579,22 +587,24 @@ def diagnostic_ae_vs_diffusion(components, iterator, config_dict, logger):
 
             # Check if we're using sparse AE wrappers
             # Note: SpanEmbedder uses 'patch_emb', SpanUnembedder uses 'patch_unembed'
-            if hasattr(span_emb, 'patch_emb') and hasattr(span_emb.patch_emb, 'ae'):
-                ae = span_emb.patch_emb.ae
+            # CRITICAL: Use autocast to match training dtype context
+            with torch.amp.autocast(device_type='cuda', dtype=model_dtype, enabled=use_amp):
+                if hasattr(span_emb, 'patch_emb') and hasattr(span_emb.patch_emb, 'ae'):
+                    ae = span_emb.patch_emb.ae
 
-                # Direct AE forward pass (bypass diffusion)
-                ae_out = ae(x0_clean.unsqueeze(0), logsnr_map.unsqueeze(0))
-                ae_recon = ae_out['recon'].squeeze(0)
-                ae_mse = F.mse_loss(ae_recon, x0_clean).item()
-                ae_sparsity = ae_out['sparsity'].item() if isinstance(ae_out['sparsity'], torch.Tensor) else ae_out['sparsity']
-            elif hasattr(span_emb, 'patch_emb'):
-                # Standard patch embedder - test roundtrip
-                z_emb, shape = span_emb.patch_emb(x0_clean, logsnr_map)
-                if hasattr(span_unemb, 'patch_unembed'):
-                    ae_recon_full = span_unemb.patch_unembed(z_emb, shape)
-                    ae_recon = ae_recon_full[:3]  # RGB channels only
+                    # Direct AE forward pass (bypass diffusion)
+                    ae_out = ae(x0_clean.unsqueeze(0), logsnr_map.unsqueeze(0))
+                    ae_recon = ae_out['recon'].squeeze(0)
                     ae_mse = F.mse_loss(ae_recon, x0_clean).item()
-                ae_sparsity = 0.0  # Not sparse
+                    ae_sparsity = ae_out['sparsity'].item() if isinstance(ae_out['sparsity'], torch.Tensor) else ae_out['sparsity']
+                elif hasattr(span_emb, 'patch_emb'):
+                    # Standard patch embedder - test roundtrip
+                    z_emb, shape = span_emb.patch_emb(x0_clean, logsnr_map)
+                    if hasattr(span_unemb, 'patch_unembed'):
+                        ae_recon_full = span_unemb.patch_unembed(z_emb, shape)
+                        ae_recon = ae_recon_full[:3]  # RGB channels only
+                        ae_mse = F.mse_loss(ae_recon, x0_clean).item()
+                    ae_sparsity = 0.0  # Not sparse
 
             # === 2. Full pipeline reconstruction (with diffusion) ===
             # Noise the input

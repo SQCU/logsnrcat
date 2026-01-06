@@ -11,4 +11,9 @@ experiments_alt
 # Dataset files (large binary data)
 data/
 !data/.gitkeep
-!data/README.md_grouped_gemm_build/
+!data/README.md
+_grouped_gemm_build/
+
+profile_traces
+
+_grouped_gemm_build
