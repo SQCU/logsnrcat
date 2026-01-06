@@ -16,7 +16,7 @@ import requests
 
 DEFAULT_HOST = "172.26.160.1"
 DEFAULT_PORT = 8421
-DEFAULT_OUTPUT = "experiments_swiglu_ae/main_run_097"
+DEFAULT_OUTPUT = "experiments_swiglu_moe/main_run_009"
 
 
 def eval_code(code: str, host: str, port: int, timeout: int = 600) -> dict:
@@ -40,6 +40,8 @@ def main():
                         help="Weight for MSE trust region penalty")
     parser.add_argument("--batch-size", type=int, default=4,
                         help="Batch size (default uses server batch)")
+    parser.add_argument("--vaporeon", action="store_true",
+                        help="Use Vaporeon-filtered sprites (narrow color distribution for A/B comparison)")
     args = parser.parse_args()
 
     if args.run_id is None:
@@ -226,18 +228,23 @@ def soft_histogram_loss(img, ref, n_bins=32, sigma=0.05):
 def compute_subspace_mse(ae, codes_adapted, images, grid_shape, decoder_masks, ablation_rate):
     """Compute MSE for joint, wavelet-only, amplitude-only reconstructions."""
     images_f = images.float()
-    with torch.amp.autocast(device_type='cuda', dtype=torch.float32):
-        recon_joint = ae.decode(codes_adapted, grid_shape, decoder_masks).float()
+    # Use bf16 for MoE compatibility, convert to float32 after for MSE
+    with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        recon_joint = ae.decode(codes_adapted, grid_shape, decoder_masks)
         recon_wav = ae.decode_with_ablation(
             codes_adapted, grid_shape,
             ablate_wavelet=0.0, ablate_amplitude=ablation_rate,
             decoder_masks=decoder_masks, deterministic=True
-        ).float()
+        )
         recon_amp = ae.decode_with_ablation(
             codes_adapted, grid_shape,
             ablate_wavelet=ablation_rate, ablate_amplitude=0.0,
             decoder_masks=decoder_masks, deterministic=True
-        ).float()
+        )
+    # Convert to float32 for stable MSE computation
+    recon_joint = recon_joint.float()
+    recon_wav = recon_wav.float()
+    recon_amp = recon_amp.float()
     return {{
         "joint": F.mse_loss(recon_joint, images_f),
         "wav": F.mse_loss(recon_wav, images_f),
@@ -257,29 +264,28 @@ print(f"=== Composite REINFORCE run_id={{run_id}} ===")
 print(f"Log file: {{log_path}}")
 
 # Target modules for LoRA injection (encoder + decoder)
-# Targeting: attention projections, MLP layers, and code projection layers
+# Works with both weight-shared MoE (encoder/decoder) and per-level (encoders/decoders)
 lora_targets = [
-    # Encoder transformers
-    "encoders.0.transformer.layers",
+    # Encoder transformer attention (both variants)
+    "encoder.transformer.layers",   # weight-shared MoE
+    "encoders.0.transformer.layers",  # per-level
     "encoders.1.transformer.layers",
     # Encoder code projections
-    "encoders.0.wav_code_proj",
-    "encoders.0.amp_code_proj",
-    "encoders.1.wav_code_proj",
-    "encoders.1.amp_code_proj",
+    "encoder.wav_code_proj", "encoder.amp_code_proj",
+    "encoders.0.wav_code_proj", "encoders.0.amp_code_proj",
+    "encoders.1.wav_code_proj", "encoders.1.amp_code_proj",
     # Encoder input projections
-    "encoders.0.amplitude_proj",
-    "encoders.0.wavelet_proj",
-    "encoders.1.amplitude_proj",
-    "encoders.1.wavelet_proj",
-    # Decoder transformers
-    "decoders.0.transformer.layers",
+    "encoder.amplitude_proj", "encoder.wavelet_proj",
+    "encoders.0.amplitude_proj", "encoders.0.wavelet_proj",
+    "encoders.1.amplitude_proj", "encoders.1.wavelet_proj",
+    # Decoder transformer attention (both variants)
+    "decoder.transformer.layers",   # weight-shared MoE
+    "decoders.0.transformer.layers",  # per-level
     "decoders.1.transformer.layers",
     # Decoder code embeddings
-    "decoders.0.wav_embed",
-    "decoders.0.amp_embed",
-    "decoders.1.wav_embed",
-    "decoders.1.amp_embed",
+    "decoder.wav_embed", "decoder.amp_embed",
+    "decoders.0.wav_embed", "decoders.0.amp_embed",
+    "decoders.1.wav_embed", "decoders.1.amp_embed",
 ]
 
 print(f"Injecting LoRA (rank={args.lora_rank}) into encoder + decoder modules...")
@@ -309,11 +315,34 @@ baselines = {{"js": None, "joint": None, "wav": None, "amp": None, "recon": None
 ablation_rate = {args.ablation_rate}
 trust_weight = {args.trust_weight}
 
-# === Setup ===
+# === Setup iterator (vaporeon = narrow color distribution for A/B comparison) ===
 batch_size = {args.batch_size}
-if batch_size > 4:
-    # Generate larger batch using generate_from_split (efficient homogeneous batches)
-    blocks = ctx.iterator.generate_from_split('sprite_atlas', count=batch_size, resolution=64)
+vaporeon_mode = {args.vaporeon}
+suffix = "_vaporeon" if vaporeon_mode else ""
+
+if vaporeon_mode:
+    from src.sprite_atlas import SpriteAtlasIterator
+    vaporeon_config = {{
+        "data_dir": "data/infinite_fusion",
+        "sampling_config": {{
+            "split": "all", "mode": "uniform_sprites",
+            "adjustment_mode": "additive", "temperature": 1.0,
+            "adjustments": {{"134": 10.0, "*.134": 10.0}},  # Heavily bias toward Vaporeon
+        }},
+        "render_config": {{"res_scaling": "do_not", "background_mode": "solid_random", "jitter": True}}
+    }}
+    rl_iterator = SpriteAtlasIterator(device, vaporeon_config)
+    print("Using Vaporeon-filtered iterator (narrow blue/cyan distribution)")
+else:
+    rl_iterator = ctx.iterator
+    print("Using default mixed iterator")
+
+# Generate batch
+if batch_size > 4 or vaporeon_mode:
+    if vaporeon_mode:
+        blocks = rl_iterator.generate_batch_list(batch_size=batch_size, resolution=64)
+    else:
+        blocks = ctx.iterator.generate_from_split('sprite_atlas', count=batch_size, resolution=64)
     images = torch.stack([b.content for b in blocks[:batch_size]]).to(device)
     print(f"Generated batch of {{images.shape[0]}} images at 64px")
 else:
@@ -484,7 +513,7 @@ for step in range(n_steps):
 
         plt.suptitle(f"Step {{step}} | JS Δ={{js_div-js_base:+.4f}} | MSE Δ={{mse_joint-mse_base:+.5f}}", fontsize=10)
         plt.tight_layout()
-        plt.savefig(f"{args.output_dir}/composite_{{run_id}}_step{{step:03d}}.png", dpi=150, bbox_inches="tight")
+        plt.savefig(f"{args.output_dir}/composite_{{run_id}}{{suffix}}_step{{step:03d}}.png", dpi=150, bbox_inches="tight")
         plt.close()
 
 # === Final results ===
@@ -561,10 +590,38 @@ axes[2, 1].legend(fontsize=7)
 axes[2, 2].plot(history["step"], history["loss"], "purple", lw=0.8)
 axes[2, 2].set_title("Total Loss")
 
-plt.suptitle(f"Composite REINFORCE ({{run_id}}) - {{n_steps}} steps @ lr={args.lr}", fontsize=12)
+split_label = "Vaporeon" if vaporeon_mode else "Mixed"
+plt.suptitle(f"Composite REINFORCE ({{run_id}}, {{split_label}}) - {{n_steps}} steps @ lr={args.lr}", fontsize=12)
 plt.tight_layout()
-plt.savefig(f"{args.output_dir}/composite_{{run_id}}_curves.png", dpi=150, bbox_inches="tight")
+plt.savefig(f"{args.output_dir}/composite_{{run_id}}{{suffix}}_curves.png", dpi=150, bbox_inches="tight")
 plt.close()
+
+# === Save structured history for cross-run comparison ===
+import json
+history_path = f"{args.output_dir}/composite_{{run_id}}{{suffix}}_history.json"
+with open(history_path, "w") as f:
+    json.dump({{
+        "run_id": run_id,
+        "split": split_label,
+        "config": {{
+            "n_steps": n_steps,
+            "lr": {args.lr},
+            "lora_rank": {args.lora_rank},
+            "vaporeon": vaporeon_mode,
+            "ablation_rate": ablation_rate,
+            "trust_weight": trust_weight,
+            "batch_size": batch_size,
+        }},
+        "baseline": {{
+            "recon_mse": baseline_recon_mse,
+            "js": final_base_js,
+            "mse_joint": final_base_mse_joint,
+            "mse_wav": final_base_mse_wav,
+            "mse_amp": final_base_mse_amp,
+        }},
+        "history": history,
+    }}, f, indent=2)
+print(f"History saved to: {{history_path}}")
 
 # Store results
 ctx._composite_result = {{
@@ -583,8 +640,10 @@ print(f"\\n=== Run complete. Log saved to: {{log_path}} ===")
 _cleanup_tee()
 '''
 
+    split_label = "Vaporeon (narrow)" if args.vaporeon else "Mixed (default)"
     print(f"\nSubmitting {args.steps}-step composite REINFORCE to server...")
     print(f"Run ID: {args.run_id}")
+    print(f"Data split: {split_label}")
     print(f"Reward groups: JS divergence + Joint/Wavelet/Amplitude MSE")
     print(f"Trust region weight: {args.trust_weight}")
     print("(All computation happens server-side)")
@@ -607,9 +666,11 @@ _cleanup_tee()
         print(f"MSE Joint:     {r['mse_joint']['start']:.5f} → {r['mse_joint']['end']:.5f} (Δ {r['mse_joint']['improvement']:+.5f}, base={r['mse_joint']['base']:.5f})")
         print(f"MSE Wavelet:   {r['mse_wav']['start']:.5f} → {r['mse_wav']['end']:.5f} (Δ {r['mse_wav']['improvement']:+.5f}, base={r['mse_wav']['base']:.5f})")
         print(f"MSE Amplitude: {r['mse_amp']['start']:.5f} → {r['mse_amp']['end']:.5f} (Δ {r['mse_amp']['improvement']:+.5f}, base={r['mse_amp']['base']:.5f})")
+        suffix = "_vaporeon" if args.vaporeon else ""
         print(f"\nSaved:")
-        print(f"  {output_dir}/composite_{args.run_id}_curves.png")
-        print(f"  {output_dir}/composite_{args.run_id}_step*.png")
+        print(f"  {output_dir}/composite_{args.run_id}{suffix}_curves.png")
+        print(f"  {output_dir}/composite_{args.run_id}{suffix}_step*.png")
+        print(f"  {output_dir}/composite_{args.run_id}{suffix}_history.json")
 
 
 if __name__ == "__main__":

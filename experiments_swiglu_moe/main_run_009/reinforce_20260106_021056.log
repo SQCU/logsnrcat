@@ -1,0 +1,83 @@
+=== Composite REINFORCE run_id=20260106_021056 ===
+Log file: experiments_swiglu_moe/main_run_009/reinforce_20260106_021056.log
+Injecting LoRA (rank=8) into encoder + decoder modules...
+  LoRA injected: encoder.amplitude_proj.base.base [768x128] rank=8
+  LoRA injected: encoder.wavelet_proj.base.base [768x128] rank=8
+  LoRA injected: encoder.transformer.layers.0.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.0.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.0.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.0.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.0.gate_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.0.mlp.router.base.base [256x16] rank=8
+  LoRA injected: encoder.transformer.layers.1.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.1.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.1.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.1.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.1.gate_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.1.mlp.router.base.base [256x16] rank=8
+  LoRA injected: encoder.transformer.layers.2.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.2.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.2.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.2.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.2.gate_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.2.mlp.router.base.base [256x16] rank=8
+  LoRA injected: encoder.transformer.layers.3.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.3.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.3.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.transformer.layers.3.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.3.gate_proj.base.base [256x256] rank=8
+  LoRA injected: encoder.transformer.layers.3.mlp.router.base.base [256x16] rank=8
+  LoRA injected: encoder.wav_code_proj.base.base [256x64] rank=8
+  LoRA injected: encoder.amp_code_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.wav_embed.base.base [64x128] rank=8
+  LoRA injected: decoder.amp_embed.base.base [64x128] rank=8
+  LoRA injected: decoder.transformer.layers.0.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.0.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.0.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.0.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.0.gate_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.0.mlp.router.base.base [256x16] rank=8
+  LoRA injected: decoder.transformer.layers.1.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.1.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.1.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.1.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.1.gate_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.1.mlp.router.base.base [256x16] rank=8
+  LoRA injected: decoder.transformer.layers.2.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.2.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.2.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.2.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.2.gate_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.2.mlp.router.base.base [256x16] rank=8
+  LoRA injected: decoder.transformer.layers.3.attn.q_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.3.attn.k_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.3.attn.v_proj.base.base [256x64] rank=8
+  LoRA injected: decoder.transformer.layers.3.attn.out_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.3.gate_proj.base.base [256x256] rank=8
+  LoRA injected: decoder.transformer.layers.3.mlp.router.base.base [256x16] rank=8
+Total LoRA modules: 54, params: 179200
+Using default mixed iterator
+Generated batch of 8 images at 64px
+Baseline reconstruction MSE: 0.070296 (trust region anchor)
+Sanity check: LoRA initialized with B=0 (output matches base until first update)
+Subspace dims: wavelet=64, amplitude=64
+Reward groups: JS divergence, Joint MSE, Wavelet-only MSE, Amplitude-only MSE
+Trust region weight: 2.0
+Step   0: JS=0.1770 joint=0.07067 wav=0.07955 amp=0.08069 | adv: js=+0.000 j=+0.0000 w=+0.0000 a=+0.0000
+  [Step 0] vs baseline: JS=0.1770 (base=0.1784, Δ=-0.0014) | MSE=0.07067 (base=0.07137, Δ=-0.00071)
+[eval-server] POST /eval HTTP/1.1
+Step  30: JS=0.1475 joint=0.06816 wav=0.06978 amp=0.07345 | adv: js=+0.006 j=+0.0018 w=+0.0019 a=+0.0005
+  [Step 50] vs baseline: JS=0.1408 (base=0.1776, Δ=-0.0368) | MSE=0.06642 (base=0.06971, Δ=-0.00329)
+Step  60: JS=0.1360 joint=0.06450 wav=0.06699 amp=0.06659 | adv: js=+0.003 j=+0.0016 w=+0.0017 a=+0.0014
+Step  90: JS=0.1326 joint=0.06260 wav=0.06556 amp=0.06358 | adv: js=+0.001 j=+0.0019 w=+0.0018 a=+0.0010
+  [Step 100] vs baseline: JS=0.1320 (base=0.1741, Δ=-0.0422) | MSE=0.06517 (base=0.06863, Δ=-0.00346)
+Step 120: JS=0.1285 joint=0.06320 wav=0.06618 amp=0.06345 | adv: js=+0.002 j=+0.0011 w=+0.0007 a=+0.0004
+
+=== Final Results ===
+JS Divergence: start=0.1770 end=0.1309 base=0.1846 Δ=-0.0537
+MSE Joint:     start=0.07067 end=0.06470 base=0.06928 Δ=-0.00459
+MSE Wavelet:   start=0.07955 end=0.06601 base=0.07927 Δ=-0.01327
+MSE Amplitude: start=0.08069 end=0.06514 base=0.07869 Δ=-0.01356
+History saved to: experiments_swiglu_moe/main_run_009/composite_20260106_021056_history.json
+
+=== Run complete. Log saved to: experiments_swiglu_moe/main_run_009/reinforce_20260106_021056.log ===
