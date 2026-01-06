@@ -185,10 +185,12 @@ double_weight = {cfg.double_weight}
 ablation_robust = {cfg.ablation_robust}
 ablation_weight = {cfg.ablation_weight}
 
-# Get batch
-blocks = ctx._rl_iterator.generate_batch_list(batch_size=batch_size * 4, resolution=resolution)
-matching = [b.content for b in blocks if b.content.shape[-1] == resolution][:batch_size]
-images = torch.stack(matching).to(ctx.device)
+# Get batch - use generate_from_split if available (CompositeIterator), else direct (SpriteAtlasIterator)
+if hasattr(ctx._rl_iterator, 'generate_from_split'):
+    blocks = ctx._rl_iterator.generate_from_split('sprite_atlas', count=batch_size, resolution=resolution)
+else:
+    blocks = ctx._rl_iterator.generate_batch_list(batch_size, resolution=resolution)
+images = torch.stack([b.content for b in blocks[:batch_size]]).to(ctx.device)
 
 ae = model.sparse_ae
 p = ae.patch_size

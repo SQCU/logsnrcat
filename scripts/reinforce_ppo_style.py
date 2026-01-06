@@ -201,10 +201,12 @@ def soft_histogram_loss(img, ref, n_bins=32, sigma=0.05):
 
 # === TRAINING LOOP ===
 for step in range(n_steps):
-    # Get batch
-    blocks = ctx._rl_iterator.generate_batch_list(batch_size=batch_size * 4, resolution=resolution)
-    matching = [b.content for b in blocks if b.content.shape[-1] == resolution][:batch_size]
-    images = torch.stack(matching).to(ctx.device)
+    # Get batch - use generate_from_split if available (CompositeIterator), else direct (SpriteAtlasIterator)
+    if hasattr(ctx._rl_iterator, 'generate_from_split'):
+        blocks = ctx._rl_iterator.generate_from_split('sprite_atlas', count=batch_size, resolution=resolution)
+    else:
+        blocks = ctx._rl_iterator.generate_batch_list(batch_size, resolution=resolution)
+    images = torch.stack([b.content for b in blocks[:batch_size]]).to(ctx.device)
 
     H, W = images.shape[2], images.shape[3]
     grid_shape = (H // p, W // p)
@@ -358,10 +360,12 @@ f"Training complete: {{n_steps}} steps, final reward={{ctx._rl_history['reward']
     compare_code = '''
 import torch
 
-# Get a batch for visualization
-blocks = ctx._rl_iterator.generate_batch_list(batch_size=16, resolution=64)
-matching = [b.content for b in blocks if b.content.shape[-1] == 64][:4]
-images = torch.stack(matching).to(ctx.device)
+# Get a batch for visualization - use generate_from_split if available
+if hasattr(ctx._rl_iterator, 'generate_from_split'):
+    blocks = ctx._rl_iterator.generate_from_split('sprite_atlas', count=4, resolution=64)
+else:
+    blocks = ctx._rl_iterator.generate_batch_list(4, resolution=64)
+images = torch.stack([b.content for b in blocks[:4]]).to(ctx.device)
 
 ae = model.sparse_ae
 p = ae.patch_size

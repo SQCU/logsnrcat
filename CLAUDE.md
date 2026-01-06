@@ -46,11 +46,17 @@ Field diffusion training with heterogeneous optimization, sparse autoencoders, a
 ### Data Pipeline
 | File | Purpose | Key Classes |
 |------|---------|-------------|
-| `src/data_iterator.py` | Unified data iteration | `CompositeIterator`, `FunctionalIterator` |
+| `src/data_iterator.py` | Unified data iteration + async prefetch | `CompositeIterator`, `AsyncPrefetcher`, `MultiResolutionPrefetcher` |
 | `src/data.py` | Dataset implementations | `VideoFolderIterator`, `TorusIterator`, `CheckerboardIterator` |
 | `src/fractal.py` | Fractal generation | `FractalIterator`, `CUDAGraphFractalGenerator` |
 | `src/sprite_atlas.py` | Sprite atlas dataset | `SpriteAtlasIterator`, `SpriteAtlasDataset` |
 | `src/bucket_manager.py` | Resolution bucketing | `BucketManager`, `ResolutionBucket` |
+
+**Async Data Prefetching (default in all training loops):**
+- `AsyncPrefetcher`: Single-resolution background thread with PRNG-seeded generation
+- `MultiResolutionPrefetcher`: One prefetcher per bucket resolution, used by training loops
+- Training loops use `prefetcher.get(resolution)` instead of blocking `iterator.generate_batch_list()`
+- Eliminates ~200ms/step data generation overhead (42% → 0% of step time)
 
 ### Inference & Sampling
 | File | Purpose | Key Classes |
@@ -215,25 +221,39 @@ images = torch.stack([b.content for b in blocks])  # RuntimeError: stack expects
 
 **Correct patterns:**
 
-1. **For training/inference (heterogeneous batches):**
+1. **For training loops (uses async prefetcher - default):**
+   ```python
+   # Training loops automatically use MultiResolutionPrefetcher
+   # Data is pre-generated in background threads, fetching is near-instant
+   clean_blocks = prefetcher.get(curr_res)  # ~0.03ms instead of ~200ms
+   ```
+
+2. **For heterogeneous inference (SpanEmbedder handles grouping):**
    ```python
    # Pass blocks directly to SpanEmbedder - it handles grouping internally
    blocks = iterator.generate_batch_list(batch_size=16)
    embedded, spans, hashes = span_embedder.embed(blocks)
    ```
 
-2. **For eval requiring homogeneous batches:**
+3. **For eval requiring homogeneous batches:**
    ```python
-   # Option A: Use generate_from_split for a single data source
-   blocks = iterator.generate_from_split('fractal', count=16, resolution=64)
+   # CORRECT: Use generate_from_split for a single data source at specific resolution
+   blocks = iterator.generate_from_split('sprite_atlas', count=16, resolution=64)
+   images = torch.stack([b.content for b in blocks])
 
-   # Option B: Filter by shape after generation
+   # Also correct: use fractal_main for arbitrary resolutions (mathematically generated)
+   blocks = iterator.generate_from_split('fractal_main', count=16, resolution=128)
+   ```
+
+   **ANTI-PATTERN (do not use):**
+   ```python
+   # WRONG - wasteful, discards most generated data (e.g., 86% waste when filtering for 64px)
    blocks = iterator.generate_batch_list(batch_size=64)
    matching = [b.content for b in blocks if b.content.shape[-1] == target_res]
    images = torch.stack(matching[:n_samples])
    ```
 
-3. **For iteration/processing:**
+4. **For iteration/processing:**
    ```python
    # Process individually or group by shape yourself
    for block in blocks:

@@ -13,6 +13,14 @@ from typing import Optional, Dict, Any, Tuple
 import triton
 import triton.language as tl
 
+# grouped_gemm for efficient sparse MoE (optional - built separately)
+try:
+    import grouped_gemm
+    HAS_GROUPED_GEMM = True
+except ImportError:
+    grouped_gemm = None
+    HAS_GROUPED_GEMM = False
+
 
 # === Initialization Helpers ===
 
@@ -87,6 +95,10 @@ class SigmoidMoE(nn.Module):
         self.w1 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, dim))
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
 
+        # Pre-allocated pinned memory buffer for expert counts (faster GPU->CPU transfer)
+        # NOT a registered buffer - must stay on CPU as pinned memory
+        self._expert_counts_cpu = torch.empty(num_experts, dtype=torch.int64, pin_memory=True)
+
         self.param_init()
 
     def param_init(self):
@@ -96,6 +108,7 @@ class SigmoidMoE(nn.Module):
             nn.init.xavier_uniform_(self.w1.data[e])
             nn.init.xavier_uniform_(self.w2.data[e])
 
+    @torch._dynamo.disable  # grouped_gemm uses autograd.Function with class state - incompatible with dynamo
     def forward(self, x):
         B, L, D = x.shape
         N = B * L
@@ -110,23 +123,30 @@ class SigmoidMoE(nn.Module):
         scores = torch.sigmoid(router_logits)  # [B, L, E]
         top_k_scores, top_k_indices = torch.topk(scores, K, dim=-1)  # [B, L, K]
 
-        # Normalize weights
+        # Normalize weights - use float32 for grouped_gemm unpermute (avoids internal conversion)
         denom = top_k_scores.sum(dim=-1, keepdim=True) + 1e-6
-        router_weights = (top_k_scores / denom).to(x.dtype)  # [B, L, K]
+        router_weights = (top_k_scores / denom).float()  # [B, L, K] in float32
 
         # 2. Flatten for grouped_gemm ops
         x_flat = x.view(N, D).contiguous()
         indices_flat = top_k_indices.view(N, K).to(torch.int32).contiguous()
-        weights_flat = router_weights.view(N, K).contiguous()
+        weights_flat = router_weights.view(N, K)  # Already contiguous from division
 
         # 3. Permute: sort tokens by expert assignment
         # permuted_x: [N*K, D] - each token appears K times, grouped by expert
         permuted_x, row_id_map = grouped_gemm.ops.permute(x_flat, indices_flat)
 
-        # 4. Compute batch_sizes: tokens per expert
-        expert_counts = torch.zeros(E, dtype=torch.int64, device=x.device)
-        expert_counts.scatter_add_(0, indices_flat.view(-1).long(),
-                                   torch.ones(N * K, dtype=torch.int64, device=x.device))
+        # 4. Compute batch_sizes on GPU, then transfer small [E] tensor to CPU
+        # (grouped_gemm requires CPU tensor for batch_sizes)
+        # Using bincount on GPU is much faster than transferring [N*K] indices to CPU
+        expert_counts_gpu = torch.bincount(indices_flat.view(-1).long(), minlength=E)
+        # Non-blocking copy to pre-allocated pinned buffer (avoids allocation + faster DMA)
+        self._expert_counts_cpu.copy_(expert_counts_gpu, non_blocking=True)
+        # Sync required before gmm since it needs CPU tensor
+        torch.cuda.current_stream().synchronize()
+        # Clone before passing to gmm - grouped_gemm saves batch_sizes for backward,
+        # so we can't reuse the buffer directly (would cause in-place modification error)
+        expert_counts = self._expert_counts_cpu.clone()  # [E] on CPU
 
         # 5. Expert FFN via grouped GEMM
         # x @ w1.T -> [N*K, 2*H]

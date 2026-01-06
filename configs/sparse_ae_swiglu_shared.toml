@@ -345,3 +345,20 @@ jitter = true
 [dataset_mix.sprite_atlas.noise_params]
 min_snr = -4.0
 max_snr = 5.0
+
+# Procedural noise/pattern generator - batched GPU generation with layered composition
+[dataset_mix.procedural]
+type = "procedural"
+ratio = 0.2
+noise_mode = "uniform"
+[dataset_mix.procedural.params]
+seed = 999
+min_layers = 1
+max_layers = 8
+# base_types = ["pink_noise", "gradient", "solid", "fbm"]  # nil = all
+# effect_types = ["moire", "crosshatch", "shapes", "voronoi"]  # nil = all
+# blend_modes = ["overlay", "soft_light", "multiply"]  # nil = all
+bulge_probability = 0.3
+[dataset_mix.procedural.noise_params]
+min_snr = -4.0
+max_snr = 5.0

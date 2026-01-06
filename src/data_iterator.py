@@ -106,6 +106,9 @@ class CompositeIterator:
             elif sType == 'sprite_atlas':
                 from .sprite_atlas import SpriteAtlasIterator
                 iterator = SpriteAtlasIterator(device, params)
+            elif sType == 'procedural':
+                from .procedural import ProceduralIterator
+                iterator = ProceduralIterator(device, params)
 
             if iterator:
                 self.splits.append({
@@ -240,5 +243,380 @@ class CompositeIterator:
  
         for b in blocks:
             b.source = split['name']
- 
+
         return blocks
+
+
+class AsyncPrefetcher:
+    """
+    Async data prefetcher that breaks serial data generation dependency.
+
+    Runs a background thread that proactively generates batches using its own
+    PRNG sequence, filling a buffer queue. Training pulls from the buffer
+    instead of waiting for generation.
+
+    Usage:
+        prefetcher = AsyncPrefetcher(
+            iterator=composite_iterator,
+            split_name='sprite_atlas',
+            count=4,
+            resolution=64,
+            buffer_size=8,
+            seed=42
+        )
+
+        # In training loop:
+        blocks = prefetcher.get()  # Returns instantly if buffer populated
+
+        # When done:
+        prefetcher.stop()
+    """
+
+    def __init__(
+        self,
+        iterator: 'CompositeIterator',
+        split_name: str,
+        count: int,
+        resolution: int = 64,
+        buffer_size: int = 8,
+        seed: int = 42,
+        device: torch.device = None
+    ):
+        import threading
+        import queue
+
+        self.iterator = iterator
+        self.split_name = split_name
+        self.count = count
+        self.resolution = resolution
+        self.device = device or iterator.device
+
+        # Thread-safe buffer queue
+        self.buffer = queue.Queue(maxsize=buffer_size)
+        self.buffer_size = buffer_size
+
+        # PRNG state - we advance our own sequence independently
+        self.seed = seed
+        self.rng = random.Random(seed)
+
+        # Control flags
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._started = False
+
+        # Stats
+        self._generated_count = 0
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def start(self):
+        """Start the background prefetch thread."""
+        import threading
+
+        if self._started:
+            return
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._prefetch_loop, daemon=True)
+        self._thread.start()
+        self._started = True
+
+    def stop(self):
+        """Stop the background thread and drain the buffer."""
+        if not self._started:
+            return
+
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+        self._started = False
+
+        # Drain buffer to free memory
+        while not self.buffer.empty():
+            try:
+                self.buffer.get_nowait()
+            except:
+                break
+
+    def _prefetch_loop(self):
+        """Background loop that generates batches proactively."""
+        # Create a separate CUDA stream for async generation
+        if self.device.type == 'cuda':
+            stream = torch.cuda.Stream(device=self.device)
+        else:
+            stream = None
+
+        while not self._stop_event.is_set():
+            # Don't overfill - wait if buffer is full
+            if self.buffer.full():
+                self._stop_event.wait(timeout=0.01)  # Brief sleep
+                continue
+
+            try:
+                # Generate in separate stream to avoid blocking training
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        blocks = self._generate_batch()
+                        # Sync this stream before putting in queue
+                        stream.synchronize()
+                else:
+                    blocks = self._generate_batch()
+
+                self.buffer.put(blocks, timeout=1.0)
+                self._generated_count += 1
+
+            except Exception as e:
+                # Log but don't crash the thread
+                print(f"[AsyncPrefetcher] Error generating batch: {e}")
+                self._stop_event.wait(timeout=0.1)
+
+    def _generate_batch(self) -> List[ContextBlock]:
+        """Generate one batch using our PRNG sequence."""
+        # Advance our RNG and use it to seed the iterator's generation
+        batch_seed = self.rng.randint(0, 2**31 - 1)
+
+        # Generate from the specified split
+        blocks = self.iterator.generate_from_split(
+            self.split_name,
+            count=self.count,
+            resolution=self.resolution,
+            start_group_id=batch_seed % 10000  # Vary group IDs
+        )
+
+        return blocks
+
+    def get(self, timeout: float = 30.0) -> List[ContextBlock]:
+        """
+        Get a pre-generated batch from the buffer.
+
+        If buffer is empty, blocks until data is available (up to timeout).
+        This should be rare once the prefetcher is warmed up.
+        """
+        if not self._started:
+            self.start()
+
+        try:
+            blocks = self.buffer.get(timeout=timeout)
+            self._cache_hits += 1
+            return blocks
+        except:
+            # Buffer was empty - generate synchronously as fallback
+            self._cache_misses += 1
+            return self._generate_batch()
+
+    def get_nowait(self) -> Optional[List[ContextBlock]]:
+        """Non-blocking get - returns None if buffer empty."""
+        if not self._started:
+            self.start()
+
+        try:
+            blocks = self.buffer.get_nowait()
+            self._cache_hits += 1
+            return blocks
+        except:
+            self._cache_misses += 1
+            return None
+
+    def warmup(self, min_items: int = None):
+        """Block until buffer has at least min_items ready."""
+        if min_items is None:
+            min_items = self.buffer_size // 2
+
+        if not self._started:
+            self.start()
+
+        # Wait for buffer to fill
+        import time
+        while self.buffer.qsize() < min_items:
+            time.sleep(0.05)
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Return prefetcher statistics."""
+        return {
+            'buffer_size': self.buffer_size,
+            'buffer_fill': self.buffer.qsize(),
+            'generated': self._generated_count,
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate': self._cache_hits / max(1, self._cache_hits + self._cache_misses),
+        }
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
+    def __del__(self):
+        self.stop()
+
+
+class MultiResolutionPrefetcher:
+    """
+    Async prefetcher for multi-resolution training with bucketing.
+
+    Maintains separate prefetch buffers per resolution, allowing the training
+    loop to request data at any resolution without blocking. Each resolution
+    has its own background thread generating batches proactively.
+
+    Usage:
+        from src.bucket_manager import build_bucket_manager_from_config
+
+        bucket_mgr = build_bucket_manager_from_config(config, model_stride=4)
+        prefetcher = MultiResolutionPrefetcher(
+            iterator=composite_iterator,
+            bucket_manager=bucket_mgr,
+            split_name='sprite_atlas',
+            count=4,
+            buffer_per_resolution=4,
+            seed=42,
+            device=device
+        )
+
+        # In training loop:
+        bucket = bucket_mgr.sample_bucket()
+        blocks = prefetcher.get(bucket.resolution)  # Near-instant
+
+        # When done:
+        prefetcher.stop()
+    """
+
+    def __init__(
+        self,
+        iterator: 'CompositeIterator',
+        bucket_manager: 'BucketManager',
+        split_name: str,
+        count: int,
+        buffer_per_resolution: int = 4,
+        seed: int = 42,
+        device: torch.device = None
+    ):
+        self.iterator = iterator
+        self.bucket_manager = bucket_manager
+        self.split_name = split_name
+        self.count = count
+        self.device = device or iterator.device
+        self.buffer_per_resolution = buffer_per_resolution
+
+        # Base seed - each resolution gets a deterministic offset
+        self.base_seed = seed
+
+        # Create a prefetcher per resolution bucket
+        self._prefetchers: Dict[int, AsyncPrefetcher] = {}
+        for i, bucket in enumerate(bucket_manager.buckets):
+            res = bucket.resolution
+            # Deterministic seed per resolution for reproducibility
+            res_seed = seed + i * 10000
+            self._prefetchers[res] = AsyncPrefetcher(
+                iterator=iterator,
+                split_name=split_name,
+                count=count,
+                resolution=res,
+                buffer_size=buffer_per_resolution,
+                seed=res_seed,
+                device=self.device
+            )
+
+        self._started = False
+
+    def start(self):
+        """Start all background prefetch threads."""
+        if self._started:
+            return
+        for pf in self._prefetchers.values():
+            pf.start()
+        self._started = True
+
+    def stop(self):
+        """Stop all background threads and drain buffers."""
+        if not self._started:
+            return
+        for pf in self._prefetchers.values():
+            pf.stop()
+        self._started = False
+
+    def warmup(self, min_items_per_resolution: int = None):
+        """
+        Block until all resolution buffers have at least min_items ready.
+
+        Args:
+            min_items_per_resolution: Minimum items per buffer (default: buffer_size // 2)
+        """
+        if min_items_per_resolution is None:
+            min_items_per_resolution = max(1, self.buffer_per_resolution // 2)
+
+        if not self._started:
+            self.start()
+
+        for pf in self._prefetchers.values():
+            pf.warmup(min_items=min_items_per_resolution)
+
+    def get(self, resolution: int, timeout: float = 30.0) -> List[ContextBlock]:
+        """
+        Get a pre-generated batch at the specified resolution.
+
+        If buffer is empty, blocks until data is available (up to timeout).
+        This should be rare once the prefetcher is warmed up.
+
+        Args:
+            resolution: The target resolution (must match a bucket)
+            timeout: Maximum wait time in seconds
+
+        Returns:
+            List of ContextBlocks at the requested resolution
+        """
+        if not self._started:
+            self.start()
+
+        if resolution not in self._prefetchers:
+            # Fallback: generate synchronously for unknown resolutions
+            return self.iterator.generate_from_split(
+                self.split_name, count=self.count, resolution=resolution
+            )
+
+        return self._prefetchers[resolution].get(timeout=timeout)
+
+    def get_nowait(self, resolution: int) -> Optional[List[ContextBlock]]:
+        """Non-blocking get - returns None if buffer empty."""
+        if not self._started:
+            self.start()
+
+        if resolution not in self._prefetchers:
+            return None
+
+        return self._prefetchers[resolution].get_nowait()
+
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """Return aggregate statistics across all resolutions."""
+        total_generated = 0
+        total_hits = 0
+        total_misses = 0
+        per_resolution = {}
+
+        for res, pf in self._prefetchers.items():
+            s = pf.stats
+            total_generated += s['generated']
+            total_hits += s['cache_hits']
+            total_misses += s['cache_misses']
+            per_resolution[res] = s
+
+        return {
+            'total_generated': total_generated,
+            'total_hits': total_hits,
+            'total_misses': total_misses,
+            'hit_rate': total_hits / max(1, total_hits + total_misses),
+            'per_resolution': per_resolution,
+        }
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, *args):
+        self.stop()
+
+    def __del__(self):
+        self.stop()

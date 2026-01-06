@@ -91,7 +91,7 @@ class VideoParams(BaseModel):
 
 
 class DatasetSplit(BaseModel):
-    type: Literal["checkerboard", "torus", "video", "fractal", "sprite_atlas"]
+    type: Literal["checkerboard", "torus", "video", "fractal", "sprite_atlas", "procedural"]
     ratio: float = 1.0
     noise_mode: Literal["uniform", "split"] = "uniform"
     noise_params: NoiseParams = Field(default_factory=NoiseParams)
@@ -421,6 +421,25 @@ class FractalParams(BaseModel):
     zoom_range: Tuple[float, float] = (0.5, 4.0)
     resolution: Optional[int] = None
     text_position: str = "none"
+
+
+class ProceduralParams(BaseModel):
+    """Parameters for procedural noise/pattern generation.
+
+    Generates layered compositions with base generators + effect layers blended
+    using photoshop-style blend modes. All generation is batched on GPU.
+    """
+    seed: int = 42
+    # Layer composition settings
+    min_layers: int = 1  # Minimum effect layers on top of base
+    max_layers: int = 10  # Maximum effect layers
+    # Generator selection (None = use all available)
+    base_types: Optional[List[str]] = None  # e.g. ["pink_noise", "gradient", "solid"]
+    effect_types: Optional[List[str]] = None  # e.g. ["moire", "crosshatch", "shapes"]
+    # Available blend modes: overlay, add, subtract, multiply, screen, hard_light, soft_light, difference, exclusion
+    blend_modes: Optional[List[str]] = None  # None = use all
+    # Distortion
+    bulge_probability: float = 0.3  # Probability of applying bulge distortion per layer
 
 class TrainingConfig(BaseModel):
     ae_steps: int = 500

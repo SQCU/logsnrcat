@@ -13,7 +13,7 @@ from .model import (
     coolerLDTformerZC, SpanEmbedder, SpanUnembedder,
     build_dual_masks, ContextBlock, render_topology_embeddings, PageTable
 )
-from .data_iterator import CompositeIterator
+from .data_iterator import CompositeIterator, MultiResolutionPrefetcher
 from .utils import run_model_forward, predict_velocity_from_blocks
 from .sample import euler_forward_step, euler_reverse_step
 from .config import sanitize_config
@@ -349,6 +349,22 @@ def train_autoembed(components, config, iterator, logger=None):
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
     bucketing_enabled = config['training']['bucketing']['enabled']
 
+    # Build async prefetcher for non-blocking data generation
+    # Gets first split name from iterator (or fallback to 'sprite_atlas')
+    split_names = iterator.get_split_names()
+    primary_split = split_names[0] if split_names else 'sprite_atlas'
+    prefetcher = MultiResolutionPrefetcher(
+        iterator=iterator,
+        bucket_manager=bucket_mgr,
+        split_name=primary_split,
+        count=bs,
+        buffer_per_resolution=4,
+        seed=42,
+        device=device
+    )
+    prefetcher.warmup(min_items_per_resolution=2)
+    print(f"    Prefetcher ready: {len(bucket_mgr.buckets)} resolutions, buffer=4/res")
+
     history = []
     log_interval = config['logging']['log_interval']
 
@@ -366,8 +382,8 @@ def train_autoembed(components, config, iterator, logger=None):
                 curr_res = 64
                 curr_bs = bs
 
-            # Get clean image blocks
-            clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
+            # Get clean image blocks (async prefetch - near-instant)
+            clean_blocks = prefetcher.get(curr_res)
 
             # Group by grid_shape for efficient batched processing
             latent_groups = group_blocks_by_grid(clean_blocks, sparse_ae.patch_size, device)
@@ -486,6 +502,7 @@ def train_autoembed(components, config, iterator, logger=None):
                 postfix['k'] = current_k
             pbar.set_postfix(postfix)
 
+    prefetcher.stop()
     return pd.DataFrame(history)
 
 def train_denoise(components, config, iterator, logger=None):
@@ -518,6 +535,21 @@ def train_denoise(components, config, iterator, logger=None):
     # We explicitly look up the stride from the model instance, or the config dict
     model_stride = model.patch_embedder.stride
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
+
+    # Build async prefetcher for non-blocking data generation
+    split_names = iterator.get_split_names()
+    primary_split = split_names[0] if split_names else 'sprite_atlas'
+    prefetcher = MultiResolutionPrefetcher(
+        iterator=iterator,
+        bucket_manager=bucket_mgr,
+        split_name=primary_split,
+        count=bs,
+        buffer_per_resolution=4,
+        seed=42,
+        device=device
+    )
+    prefetcher.warmup(min_items_per_resolution=2)
+    print(f"    Prefetcher ready: {len(bucket_mgr.buckets)} resolutions, buffer=4/res")
 
     # 4. CUDA Graph Runner (optional)
     # One graph per block layout config. Shape = max_blocks × block_size.
@@ -556,10 +588,10 @@ def train_denoise(components, config, iterator, logger=None):
                 curr_res = 32 # Fallback
                 curr_bs = bs   
             
-            # 2. Generate Data with Dynamic Resolution
-            clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
-            
-            # 2. Noise Injection
+            # 2. Generate Data with Dynamic Resolution (async prefetch - near-instant)
+            clean_blocks = prefetcher.get(curr_res)
+
+            # 3. Noise Injection
             noisy_blocks = []
             targets_v = []
             targets_l = []
@@ -692,6 +724,7 @@ def train_denoise(components, config, iterator, logger=None):
                 'txt': f'{loss_text_accum.item():.3f}'
             })
 
+    prefetcher.stop()
     return pd.DataFrame(history)
 
 
@@ -808,6 +841,21 @@ def train_latent_diffusion(
     bucket_mgr = build_bucket_manager_from_config(config, model_stride=model_stride)
     bucketing_enabled = config['training']['bucketing']['enabled']
 
+    # Build async prefetcher for non-blocking data generation
+    split_names = iterator.get_split_names()
+    primary_split = split_names[0] if split_names else 'sprite_atlas'
+    prefetcher = MultiResolutionPrefetcher(
+        iterator=iterator,
+        bucket_manager=bucket_mgr,
+        split_name=primary_split,
+        count=bs,
+        buffer_per_resolution=4,
+        seed=42,
+        device=device
+    )
+    prefetcher.warmup(min_items_per_resolution=2)
+    print(f"    Prefetcher ready: {len(bucket_mgr.buckets)} resolutions, buffer=4/res")
+
     # Variance tracker
     variance_tracker = build_variance_tracker(config, device)
 
@@ -829,8 +877,8 @@ def train_latent_diffusion(
                 curr_res = 64
                 curr_bs = bs
 
-            # Get clean blocks
-            clean_blocks = iterator.generate_batch_list(curr_bs, resolution=curr_res)
+            # Get clean blocks (async prefetch - near-instant)
+            clean_blocks = prefetcher.get(curr_res)
 
             # Group by grid_shape for batched processing (reuse from losses.py)
             latent_groups = group_blocks_by_grid(clean_blocks, sparse_ae.patch_size, device)
@@ -976,4 +1024,5 @@ def train_latent_diffusion(
                 postfix['r_bce'] = f'{last_recon_stats["bce_weight"]:.2f}'
             pbar.set_postfix(postfix)
 
+    prefetcher.stop()
     return pd.DataFrame(history)

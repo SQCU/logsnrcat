@@ -1235,6 +1235,141 @@ def plot_subspace_contributions(
     logger.save_figure(fig, name)
 
 
+def subspace_sensitivity_sweep(
+    ae,
+    images: "torch.Tensor",
+    ablation_rates: list = None,
+    n_trials: int = 5,
+    grid_shape: tuple = None,
+    encoder_masks: list = None,
+    decoder_masks: list = None
+) -> dict:
+    """
+    Evaluate subspace sensitivity by sweeping ablation rates.
+
+    For each ablation rate, measures reconstruction MSE when:
+    1. Only wavelet is ablated (amplitude intact)
+    2. Only amplitude is ablated (wavelet intact)
+    3. Both ablated at same rate
+
+    This reveals how much each subspace contributes to reconstruction quality.
+
+    Args:
+        ae: Autoencoder with wavelet_gating, encode(), decode(), decode_with_ablation()
+        images: [B, C, H, W] input images
+        ablation_rates: list of ablation fractions to test (default: 0 to 1 in 11 steps)
+        n_trials: number of stochastic trials per rate (averaged)
+        grid_shape: optional (GH, GW)
+        encoder_masks: optional pre-built encoder masks
+        decoder_masks: optional pre-built decoder masks
+
+    Returns:
+        Dict with:
+            'ablation_rates': list of tested rates
+            'mse_baseline': MSE with no ablation
+            'mse_wav_ablated': list of MSE when wav ablated at each rate
+            'mse_amp_ablated': list of MSE when amp ablated at each rate
+            'mse_both_ablated': list of MSE when both ablated at each rate
+            'd_mse_d_wav': gradient of MSE w.r.t. wavelet ablation
+            'd_mse_d_amp': gradient of MSE w.r.t. amplitude ablation
+    """
+    import torch
+    import torch.nn.functional as F
+
+    if not getattr(ae, 'wavelet_gating', False):
+        raise ValueError("Sensitivity sweep requires ae with wavelet_gating=True")
+
+    if ablation_rates is None:
+        ablation_rates = [i / 10.0 for i in range(11)]  # 0.0, 0.1, ..., 1.0
+
+    p = ae.patch_size
+
+    if grid_shape is None:
+        H, W = images.shape[2], images.shape[3]
+        grid_shape = (H // p, W // p)
+
+    device = images.device
+
+    if encoder_masks is None or decoder_masks is None:
+        encoder_masks, decoder_masks = ae.build_masks(grid_shape, device)
+
+    # Encode once (deterministic)
+    codes_list = ae.encode(images, grid_shape=grid_shape,
+                           encoder_masks=encoder_masks, decoder_masks=decoder_masks)
+
+    # Baseline MSE (no ablation)
+    baseline_recon = ae.decode(codes_list, grid_shape, decoder_masks)
+    mse_baseline = F.mse_loss(baseline_recon, images).item()
+
+    mse_wav_ablated = []
+    mse_amp_ablated = []
+    mse_both_ablated = []
+
+    for rate in ablation_rates:
+        if rate == 0.0:
+            # No ablation = baseline
+            mse_wav_ablated.append(mse_baseline)
+            mse_amp_ablated.append(mse_baseline)
+            mse_both_ablated.append(mse_baseline)
+        else:
+            # Average over multiple stochastic trials
+            wav_mses = []
+            amp_mses = []
+            both_mses = []
+
+            for _ in range(n_trials):
+                # Wavelet ablated only
+                recon_wav = ae.decode_with_ablation(
+                    codes_list, grid_shape, ablate_wavelet=rate, ablate_amplitude=0.0,
+                    decoder_masks=decoder_masks, deterministic=False
+                )
+                wav_mses.append(F.mse_loss(recon_wav, images).item())
+
+                # Amplitude ablated only
+                recon_amp = ae.decode_with_ablation(
+                    codes_list, grid_shape, ablate_wavelet=0.0, ablate_amplitude=rate,
+                    decoder_masks=decoder_masks, deterministic=False
+                )
+                amp_mses.append(F.mse_loss(recon_amp, images).item())
+
+                # Both ablated
+                recon_both = ae.decode_with_ablation(
+                    codes_list, grid_shape, ablate_wavelet=rate, ablate_amplitude=rate,
+                    decoder_masks=decoder_masks, deterministic=False
+                )
+                both_mses.append(F.mse_loss(recon_both, images).item())
+
+            mse_wav_ablated.append(sum(wav_mses) / n_trials)
+            mse_amp_ablated.append(sum(amp_mses) / n_trials)
+            mse_both_ablated.append(sum(both_mses) / n_trials)
+
+    # Compute gradients (d_mse / d_ablation_rate) using finite differences
+    def compute_gradient(mse_list, rates):
+        grads = []
+        for i in range(len(rates)):
+            if i == 0:
+                # Forward difference
+                grad = (mse_list[1] - mse_list[0]) / (rates[1] - rates[0]) if len(rates) > 1 else 0
+            elif i == len(rates) - 1:
+                # Backward difference
+                grad = (mse_list[i] - mse_list[i-1]) / (rates[i] - rates[i-1])
+            else:
+                # Central difference
+                grad = (mse_list[i+1] - mse_list[i-1]) / (rates[i+1] - rates[i-1])
+            grads.append(grad)
+        return grads
+
+    return {
+        'ablation_rates': ablation_rates,
+        'mse_baseline': mse_baseline,
+        'mse_wav_ablated': mse_wav_ablated,
+        'mse_amp_ablated': mse_amp_ablated,
+        'mse_both_ablated': mse_both_ablated,
+        'd_mse_d_wav': compute_gradient(mse_wav_ablated, ablation_rates),
+        'd_mse_d_amp': compute_gradient(mse_amp_ablated, ablation_rates),
+    }
+
+
 def plot_subspace_sensitivity(
     sweep_results,#: Dict[str, Any],
     logger,

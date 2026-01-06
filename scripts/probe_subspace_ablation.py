@@ -108,10 +108,9 @@ f"Got {{images.shape[0]}} Vaporeon sprites at {{resolution}}px"
 n_samples = {args.n_samples}
 resolution = {args.resolution}
 
-# Use composite iterator - samples from full dataset mix
-blocks = ctx.iterator.generate_batch_list(batch_size=n_samples * 4, resolution=resolution)
-matching = [b.content for b in blocks if b.content.shape[-1] == resolution][:n_samples]
-images = torch.stack(matching).to(ctx.device)
+# Use generate_from_split for efficient homogeneous batch generation
+blocks = ctx.iterator.generate_from_split('sprite_atlas', count=n_samples, resolution=resolution)
+images = torch.stack([b.content for b in blocks[:n_samples]]).to(ctx.device)
 
 # Store for later use
 ctx._probe_images = images

@@ -549,6 +549,77 @@ class SharedMoEDecoder(nn.Module):
 
         return patches, aux_loss
 
+    def forward_ablated(
+        self,
+        codes: torch.Tensor,
+        level: int,
+        grid_shape: Tuple[int, int],
+        ablate_wavelet: float = 0.0,
+        ablate_amplitude: float = 0.0,
+        block_masks: Optional[List] = None,
+        deterministic: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Decode with stochastic subspace ablation for interpretability.
+
+        Args:
+            codes: [B, N, code_dim] sparse codes
+            level: residual level index
+            grid_shape: (GH, GW) grid dimensions
+            ablate_wavelet: ablation rate [0,1] for wavelet subspace
+            ablate_amplitude: ablation rate [0,1] for amplitude subspace
+            block_masks: optional pre-built decoder masks
+            deterministic: if True, zero fixed fraction; if False, Bernoulli per-element
+
+        Returns:
+            patches: [B, N, patch_dim]
+            aux_loss: MoE load balancing loss
+        """
+        if not self.wavelet_gating:
+            return self.forward(codes, level, grid_shape, block_masks)
+
+        # Split codes into subspaces
+        wav_codes = codes[..., :self.n_wavelet_dims]
+        amp_codes = codes[..., self.n_wavelet_dims:]
+
+        # Apply ablation
+        if ablate_wavelet > 0:
+            if deterministic:
+                # Zero out fixed fraction of dims
+                n_ablate = int(self.n_wavelet_dims * ablate_wavelet)
+                wav_codes = wav_codes.clone()
+                wav_codes[..., :n_ablate] = 0
+            else:
+                # Bernoulli per-element
+                mask = torch.rand_like(wav_codes) > ablate_wavelet
+                wav_codes = wav_codes * mask
+
+        if ablate_amplitude > 0:
+            if deterministic:
+                n_ablate = int(self.n_amplitude_dims * ablate_amplitude)
+                amp_codes = amp_codes.clone()
+                amp_codes[..., :n_ablate] = 0
+            else:
+                mask = torch.rand_like(amp_codes) > ablate_amplitude
+                amp_codes = amp_codes * mask
+
+        # Embed ablated codes
+        h_wav = self.wav_embed(wav_codes)
+        h_amp = self.amp_embed(amp_codes)
+        h = torch.cat([h_wav, h_amp], dim=-1)
+
+        # Shared transformer
+        h, aux_loss = self.transformer(h, grid_shape=grid_shape, block_masks=block_masks)
+        h = self.neighbor_head(h, grid_shape)
+
+        # Output
+        wav_coeffs = self.wav_head(h)
+        amp_pixels = self.amp_head(h)
+        wav_pixels = batch_idwt2d(wav_coeffs, self.patch_size)
+        patches = wav_pixels + amp_pixels
+
+        return patches, aux_loss
+
 
 # =============================================================================
 # Main Autoencoder
@@ -811,6 +882,58 @@ class SwiGLUMoEAutoencoder(nn.Module):
 
         for level, codes in enumerate(codes_list):
             decoded, _ = self.decoder(codes, level, grid_shape, decoder_masks)
+
+            if level > 0:
+                decoded = decoded / self.residual_scale
+
+            if cumulative_recon is None:
+                cumulative_recon = decoded
+            else:
+                cumulative_recon = cumulative_recon + decoded
+
+        return self.unpatchify(cumulative_recon, grid_shape)
+
+    def decode_with_ablation(
+        self,
+        codes_list: List[torch.Tensor],
+        grid_shape: Tuple[int, int],
+        ablate_wavelet: float = 0.0,
+        ablate_amplitude: float = 0.0,
+        decoder_masks: Optional[List] = None,
+        deterministic: bool = False
+    ) -> torch.Tensor:
+        """
+        Decode with stochastic subspace ablation for diagnostic visualization.
+
+        Only works when wavelet_gating=True. For standard decoders, returns normal decode.
+
+        Args:
+            codes_list: list of [B, N, code_dim] sparse codes per level
+            grid_shape: (GH, GW) grid dimensions
+            ablate_wavelet: ablation rate [0,1] for wavelet subspace (0=none, 1=full knockout)
+            ablate_amplitude: ablation rate [0,1] for amplitude subspace
+            decoder_masks: optional pre-built decoder masks
+            deterministic: if True, zero fixed fraction; if False, Bernoulli per-element
+
+        Returns:
+            recon: [B, C, H, W] reconstruction with ablated subspace(s)
+        """
+        if not self.wavelet_gating:
+            return self.decode(codes_list, grid_shape, decoder_masks)
+
+        device = codes_list[0].device
+
+        if decoder_masks is None:
+            decoder_masks = self.decoder.transformer.build_masks(grid_shape, device)
+
+        cumulative_recon = None
+
+        for level, codes in enumerate(codes_list):
+            # Use ablated forward pass
+            decoded, _ = self.decoder.forward_ablated(
+                codes, level, grid_shape, ablate_wavelet, ablate_amplitude,
+                decoder_masks, deterministic
+            )
 
             if level > 0:
                 decoded = decoded / self.residual_scale

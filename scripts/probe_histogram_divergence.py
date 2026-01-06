@@ -105,10 +105,12 @@ n_samples = {args.n_samples}
 resolution = {args.resolution}
 n_bins = {args.n_bins}
 
-# Get images (filter by resolution for composite iterator)
-blocks = ctx._hist_iterator.generate_batch_list(batch_size=n_samples * 4, resolution=resolution)
-matching = [b.content for b in blocks if b.content.shape[-1] == resolution][:n_samples]
-images = torch.stack(matching).to(ctx.device)
+# Get images - use generate_from_split if available, else direct
+if hasattr(ctx._hist_iterator, 'generate_from_split'):
+    blocks = ctx._hist_iterator.generate_from_split('sprite_atlas', count=n_samples, resolution=resolution)
+else:
+    blocks = ctx._hist_iterator.generate_batch_list(n_samples, resolution=resolution)
+images = torch.stack([b.content for b in blocks[:n_samples]]).to(ctx.device)
 
 # Encode/decode
 ae = model.sparse_ae

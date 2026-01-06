@@ -265,14 +265,22 @@ class EvalContext:
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
-    def get_batch(self, resolution: int = 64, batch_size: int = 4) -> torch.Tensor:
-        """Generate a batch of images at specified resolution."""
-        blocks = self.iterator.generate_batch_list(batch_size=batch_size * 4, resolution=resolution)
-        matching = [b.content for b in blocks
-                    if b.content.shape[-1] == resolution and b.content.shape[-2] == resolution]
-        if not matching:
-            raise ValueError(f"No blocks at resolution {resolution}")
-        return torch.stack(matching[:batch_size]).to(self.device)
+    def get_batch(self, resolution: int = 64, batch_size: int = 4, source: str = 'fractal_main') -> torch.Tensor:
+        """Generate a batch of images at specified resolution.
+
+        Uses generate_from_split() to directly request the target resolution,
+        avoiding the wasteful over-generate + filter anti-pattern.
+
+        Args:
+            resolution: Target image resolution (pixels)
+            batch_size: Number of images to generate
+            source: Data source split name. Default 'fractal_main' supports any resolution.
+                   Use 'sprite_atlas' for pixel art, 'checker_baseline' for geometric.
+        """
+        blocks = self.iterator.generate_from_split(source, count=batch_size, resolution=resolution)
+        if len(blocks) < batch_size:
+            raise ValueError(f"Only generated {len(blocks)} blocks (wanted {batch_size}) from {source}")
+        return torch.stack([b.content for b in blocks[:batch_size]]).to(self.device)
 
     def autocast(self):
         """Return autocast context matching training."""

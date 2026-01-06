@@ -53,10 +53,12 @@ def save_ablation_grid(host: str, port: int, step: int, n_samples: int,
 import torch
 import numpy as np
 
-# Get fresh test batch
-blocks = ctx._rl_iterator.generate_batch_list(batch_size={n_samples * 4}, resolution=64)
-matching = [b.content for b in blocks if b.content.shape[-1] == 64][:{n_samples}]
-images = torch.stack(matching).to(ctx.device)
+# Get fresh test batch - use generate_from_split if available
+if hasattr(ctx._rl_iterator, 'generate_from_split'):
+    blocks = ctx._rl_iterator.generate_from_split('sprite_atlas', count={n_samples}, resolution=64)
+else:
+    blocks = ctx._rl_iterator.generate_batch_list({n_samples}, resolution=64)
+images = torch.stack([b.content for b in blocks[:{n_samples}]]).to(ctx.device)
 
 ae = model.sparse_ae
 p = ae.patch_size
@@ -327,10 +329,12 @@ mse_weight = {args.mse_weight}
 ablation_weight = {args.ablation_weight}
 target_subspace = "{args.target_subspace}"
 
-# Get batch
-blocks = ctx._rl_iterator.generate_batch_list(batch_size=batch_size * 4, resolution=resolution)
-matching = [b.content for b in blocks if b.content.shape[-1] == resolution][:batch_size]
-images = torch.stack(matching).to(ctx.device)
+# Get batch - use generate_from_split if available (CompositeIterator), else direct (SpriteAtlasIterator)
+if hasattr(ctx._rl_iterator, 'generate_from_split'):
+    blocks = ctx._rl_iterator.generate_from_split('sprite_atlas', count=batch_size, resolution=resolution)
+else:
+    blocks = ctx._rl_iterator.generate_batch_list(batch_size, resolution=resolution)
+images = torch.stack([b.content for b in blocks[:batch_size]]).to(ctx.device)
 
 ae = model.sparse_ae
 p = ae.patch_size
@@ -516,10 +520,12 @@ ctx._last_step = {{
 import torch
 import numpy as np
 
-# Get test batch
-blocks = ctx._rl_iterator.generate_batch_list(batch_size=16, resolution=64)
-matching = [b.content for b in blocks if b.content.shape[-1] == 64][:4]
-images = torch.stack(matching).to(ctx.device)
+# Get test batch - use generate_from_split if available
+if hasattr(ctx._rl_iterator, 'generate_from_split'):
+    blocks = ctx._rl_iterator.generate_from_split('sprite_atlas', count=4, resolution=64)
+else:
+    blocks = ctx._rl_iterator.generate_batch_list(4, resolution=64)
+images = torch.stack([b.content for b in blocks[:4]]).to(ctx.device)
 
 ae = model.sparse_ae
 p = ae.patch_size

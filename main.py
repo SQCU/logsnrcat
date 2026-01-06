@@ -30,7 +30,7 @@ from src.train import train_autoembed, train_denoise, train_latent_diffusion
 from src.plotting import (
     plot_multimetric_analysis, plot_ae_roundtrip, plot_loss_schedule_analysis,
     plot_subspace_sensitivity, plot_subspace_sensitivity_heatmap,
-    plot_subspace_sensitivity_exemplars, ExperimentLogger
+    plot_subspace_sensitivity_exemplars, subspace_sensitivity_sweep, ExperimentLogger
 )
 import src.sample as sampler
 
@@ -222,27 +222,29 @@ def main():
         if sens_cfg['enabled'] and cfg['training']['sparse_ae'].get('wavelet_gating', False):
             print("\nRunning subspace sensitivity sweep...")
             model = components[0]  # coolerLDTformerZC
-            if hasattr(model, 'sparse_ae') and model.sparse_ae is not None:
+            # Check that sparse_ae exists and has wavelet_gating
+            if (hasattr(model, 'sparse_ae') and model.sparse_ae is not None
+                    and getattr(model.sparse_ae, 'wavelet_gating', False)):
                 results_by_res = {}
                 for res in sens_cfg['resolutions']:
                     print(f"  Sensitivity sweep at resolution {res}...")
-                    # Get batch of images for evaluation
-                    # ContextBlocks are heterogeneous by design - filter to target resolution
-                    blocks = val_iterator.generate_batch_list(
-                        batch_size=sens_cfg['n_samples'] * 4,  # Over-generate to filter
-                        resolution=res
+                    # Get batch of images for evaluation at specific resolution
+                    # Use generate_from_split() with sprite_atlas - the primary use case for wavelet gating
+                    # This avoids the wasteful over-generate + filter anti-pattern
+                    blocks = val_iterator.generate_from_split(
+                        'sprite_atlas',
+                        count=sens_cfg['n_samples'],
+                        resolution=res  # sprite_atlas crops 96px natives to target resolution
                     )
-                    # Filter to blocks matching target resolution and stack
-                    matching = [b.content for b in blocks
-                                if b.content.shape[-1] == res and b.content.shape[-2] == res]
-                    if len(matching) < sens_cfg['n_samples']:
-                        print(f"    Warning: only {len(matching)} blocks at {res}px (wanted {sens_cfg['n_samples']})")
-                    images = torch.stack(matching[:sens_cfg['n_samples']]).to(cfg['device'])
+                    if len(blocks) < sens_cfg['n_samples']:
+                        print(f"    Warning: only {len(blocks)} blocks generated (wanted {sens_cfg['n_samples']})")
+                    images = torch.stack([b.content for b in blocks[:sens_cfg['n_samples']]]).to(cfg['device'])
 
                     # Run sensitivity sweep - must use same autocast as training
                     use_amp = (dtype == torch.bfloat16) or (dtype == torch.float16)
                     with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=dtype, enabled=use_amp):
-                        sweep_results = model.sparse_ae.subspace_sensitivity_sweep(
+                        sweep_results = subspace_sensitivity_sweep(
+                            ae=model.sparse_ae,
                             images=images,
                             ablation_rates=sens_cfg['ablation_rates'],
                             n_trials=sens_cfg['n_trials']
@@ -266,6 +268,8 @@ def main():
                     plot_subspace_sensitivity_heatmap(results_by_res, logger,
                                                       name="subspace_sensitivity_heatmap")
                 print("  Sensitivity sweep complete.")
+            else:
+                print("  Skipped: AE model doesn't have wavelet_gating enabled")
 
     # Select diffusion training function based on config
     # diffusion_space determines where noise is added: "latent" (codes) or "pixel"

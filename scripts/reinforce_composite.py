@@ -312,10 +312,9 @@ trust_weight = {args.trust_weight}
 # === Setup ===
 batch_size = {args.batch_size}
 if batch_size > 4:
-    # Generate larger batch from iterator
-    blocks = ctx.iterator.generate_batch_list(batch_size=batch_size * 2, resolution=64)
-    matching = [b.content for b in blocks if b.content.shape[-1] == 64][:batch_size]
-    images = torch.stack(matching).to(device)
+    # Generate larger batch using generate_from_split (efficient homogeneous batches)
+    blocks = ctx.iterator.generate_from_split('sprite_atlas', count=batch_size, resolution=64)
+    images = torch.stack([b.content for b in blocks[:batch_size]]).to(device)
     print(f"Generated batch of {{images.shape[0]}} images at 64px")
 else:
     images = batch
