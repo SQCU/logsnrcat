@@ -434,8 +434,55 @@ class coolerLDTformerZC(nn.Module):
                       f"sparsity={sparsity_mode}{wavelet_str}, "
                       f"attn={attn_cfg['mode']}")
 
-            else:
-                # Default: sparse_dim variant (3-bit, per-patch sparsity)
+            elif ae_type == 'swiglu_moe':
+                # Weight-shared MoE variant: single encoder/decoder, SigmoidMoE routing
+                from kmaze_ae.model_swiglu_sparser import SwiGLUMoEAutoencoder
+                from kmaze_ae.model_swiglu import (
+                    SwiGLUPatchEmbedder,
+                    SwiGLUPatchUnembedder
+                )
+
+                # Get MoE-specific config
+                moe_cfg = sparse_ae_config.get('moe', {})
+                num_experts = moe_cfg.get('num_experts', 16)
+                num_active = moe_cfg.get('num_active', 3)
+                jitter_noise = moe_cfg.get('jitter_noise', 0.1)
+
+                sparsity_mode = sparse_ae_config['sparsity_mode']
+                wavelet_gating = sparse_ae_config['wavelet_gating']
+                n_wavelet_dims = sparse_ae_config['n_wavelet_dims']
+
+                self.sparse_ae = SwiGLUMoEAutoencoder(
+                    n_levels=sparse_ae_config['n_levels'],
+                    patch_size=sparse_ae_config['patch_size'],
+                    hidden_dim=sparse_ae_config['hidden_dim'],
+                    code_dim=sparse_ae_config['code_dim'],
+                    k_per_patch=sparse_ae_config['k_per_patch'],
+                    residual_scale=sparse_ae_config['residual_scale'],
+                    n_layers=sparse_ae_config['n_layers'],
+                    attn_config=attn_cfg,
+                    sparsity_mode=sparsity_mode,
+                    wavelet_gating=wavelet_gating,
+                    n_wavelet_dims=n_wavelet_dims,
+                    num_experts=num_experts,
+                    num_active=num_active,
+                    jitter_noise=jitter_noise
+                )
+
+                # Reuse SwiGLU embedders - interface is compatible
+                self.patch_embedder = SwiGLUPatchEmbedder(self.sparse_ae, embed_dim=dim)
+                self.patch_unembedder = SwiGLUPatchUnembedder(self.sparse_ae, self.patch_embedder)
+
+                wavelet_str = f", wavelet={n_wavelet_dims or 'half'}" if wavelet_gating else ""
+                print(f"[Model] Using SwiGLU MoE AE: {sparse_ae_config['n_levels']} levels (SHARED), "
+                      f"code_dim={sparse_ae_config['code_dim']}, "
+                      f"k={sparse_ae_config['k_per_patch']}, "
+                      f"sparsity={sparsity_mode}{wavelet_str}, "
+                      f"MoE={num_experts}experts/{num_active}active, "
+                      f"attn={attn_cfg['mode']}")
+
+            elif ae_type == 'sparse_dim':
+                # sparse_dim variant (3-bit, per-patch sparsity)
                 from kmaze_ae.model_sparse_dim import (
                     SparsePerDimFSQAutoencoder,
                     SparseAEPatchEmbedder,
@@ -464,6 +511,14 @@ class coolerLDTformerZC(nn.Module):
                 print(f"[Model] Using SparseAE: {sparse_ae_config['n_levels']} levels, "
                       f"code_dim={sparse_ae_config['code_dim']}, "
                       f"k={sparse_ae_config['k_per_patch']}")
+
+            else:
+                # NO SILENT FALLTHROUGH - unknown ae_type is a configuration error
+                print(f"\n{'='*60}")
+                print(f"FATAL: Unknown ae_type='{ae_type}'")
+                print(f"Valid options: 'swiglu', 'swiglu_moe', 'sparse_dim'")
+                print(f"{'='*60}\n")
+                raise ValueError(f"Unknown ae_type='{ae_type}'. Valid: 'swiglu', 'swiglu_moe', 'sparse_dim'")
         else:
             self.sparse_ae = None
             self.patch_embedder = ContextualPatchEmbedder(

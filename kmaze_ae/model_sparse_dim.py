@@ -568,7 +568,7 @@ class SparseAEPatchEmbedder(nn.Module):
     The main training pipeline expects:
     - .stride attribute
     - .n_attn_layers attribute (signals SpanEmbedder to use batched processing)
-    - forward(x, logsnr_map, block_mask=None) -> (z, (GH, GW))
+    - forward(x, logsnr_map, block_masks=None) -> (z, (GH, GW))
     """
     def __init__(self, ae: SparsePerDimFSQAutoencoder, embed_dim: int = 256):
         super().__init__()
@@ -621,12 +621,12 @@ class SparseAEPatchEmbedder(nn.Module):
             return torch.empty(B, C, gh, gw, p, p, device=x.device)
 
     def forward(self, x: torch.Tensor, logsnr_map: torch.Tensor,
-                block_mask=None, return_codes: bool = False):
+                block_masks=None, return_codes: bool = False):
         """
         Args:
             x: [C, H, W] single image or [B, C, H, W] batched images
             logsnr_map: [1, H, W] or [B, 1, H, W] spatial logsnr field
-            block_mask: Ignored - we use our own cached masks built with correct attn_config
+            block_masks: Ignored - we use our own cached masks built with correct attn_config
             return_codes: if True, also return concatenated codes for sparsity tracking
         Returns:
             z: [L, D] or [B, L, D] patch embeddings
@@ -683,7 +683,7 @@ class SparseAEPatchUnembedder(nn.Module):
 
     The main training pipeline expects:
     - .n_attn_layers attribute (signals SpanUnembedder to use batched processing)
-    - forward(z, shape, block_mask=None) -> [C+1, H, W] or [B, C+1, H, W]
+    - forward(z, shape, block_masks=None) -> [C+1, H, W] or [B, C+1, H, W]
     """
     def __init__(self, ae: SparsePerDimFSQAutoencoder, embedder: SparseAEPatchEmbedder,
                  fourier_dim: int = 16):
@@ -723,12 +723,12 @@ class SparseAEPatchUnembedder(nn.Module):
             self._mask_cache[grid_shape] = decoder_masks
         return self._mask_cache[grid_shape]
 
-    def forward(self, z: torch.Tensor, shape: Tuple, block_mask=None) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, shape: Tuple, block_masks=None) -> torch.Tensor:
         """
         Args:
             z: [L, D] single or [B, L, D] batched patch embeddings
             shape: (GH, GW) grid dimensions
-            block_mask: Ignored - we use our own cached masks built with correct attn_config
+            block_masks: Ignored - we use our own cached masks built with correct attn_config
         Returns:
             output: [C+1, H, W] or [B, C+1, H, W] reconstructed image with logsnr channel
         """
@@ -820,12 +820,12 @@ class SparseAEPatchEmbedderWithLogsnr(nn.Module):
             return torch.empty(B, H // p, W // p, device=x.device)
 
     def forward(self, x: torch.Tensor, logsnr_map: torch.Tensor,
-                block_mask=None) -> dict:
+                block_masks=None) -> dict:
         """
         Args:
             x: [C, H, W] single or [B, C, H, W] batched images
             logsnr_map: [1, H, W] or [B, 1, H, W] spatial logsnr field
-            block_mask: Optional BlockMask (built per grid_shape)
+            block_masks: Ignored - we build our own cached masks with correct attn_config
         Returns:
             dict with 'embeddings', 'grid_shape', 'ae_output' (full AE forward dict)
         """
@@ -840,20 +840,11 @@ class SparseAEPatchEmbedderWithLogsnr(nn.Module):
         grid_shape = (H // p, W // p)
         device = x.device
 
-        # Build masks if not provided
-        if block_mask is None:
-            encoder_masks = [self.ae.encoders[i].transformer.build_masks(grid_shape, device)
-                             for i in range(self.ae.n_levels)]
-            decoder_masks = [self.ae.decoders[i].transformer.build_masks(grid_shape, device)
-                             for i in range(self.ae.n_levels)]
-        else:
-            # Replicate single mask for each layer within each level
-            n_enc_layers = self.ae.encoders[0].transformer.n_layers
-            n_dec_layers = self.ae.decoders[0].transformer.n_layers
-            per_layer_mask_enc = [block_mask] * n_enc_layers
-            per_layer_mask_dec = [block_mask] * n_dec_layers
-            encoder_masks = [per_layer_mask_enc] * self.ae.n_levels
-            decoder_masks = [per_layer_mask_dec] * self.ae.n_levels
+        # Always build our own masks with correct attn_config
+        encoder_masks = [self.ae.encoders[i].transformer.build_masks(grid_shape, device)
+                         for i in range(self.ae.n_levels)]
+        decoder_masks = [self.ae.decoders[i].transformer.build_masks(grid_shape, device)
+                         for i in range(self.ae.n_levels)]
 
         # Full forward pass for all outputs
         ae_out = self.ae(x, logsnr_map,

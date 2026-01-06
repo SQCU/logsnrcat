@@ -30,7 +30,7 @@ enabled = true
 n_kv_heads = 4         # 8 query heads / 2 kv heads = 4x sharing
 
 [training]
-ae_steps = 250
+ae_steps = 1000
 steps = 250
 lambda_coeff = 0.2
 mode = "naive"
@@ -110,13 +110,17 @@ mse_end = 0.95      # 90% MSE at end
 bce_end = 0.05      # 10% BCE at end
 schedule = "linear"
 
-# Attention configuration - sliding window for 3x3 neighborhood
+# Attention configuration - gemma_bigbird for local+global attention
+# Alternates sliding window layers with bigbird layers (local + global registers)
+# Reduces tiling artifacts from pure sliding window while keeping computation efficient
 [training.sparse_ae.attention]
-mode = "sliding"       # <<< Changed: sliding window (3x3 neighborhood)
-window_size = 2        # <<< Changed: Euclidean dist² ≤ 4 covers 3x3
-n_global_tokens = 0    # <<< No registers for pure sliding window
+mode = "gemma_bigbird"  # Alternating local/bigbird per bigbird_layout cycle
+window_size = 2         # Chebyshev distance for local attention (3x3 neighborhood)
+n_global_tokens = 4     # Register tokens for bigbird layers (global memory)
 n_query_heads = 8
 n_kv_heads = 2
+global_layer_interval = 4  # For gemma mode (not used in gemma_bigbird)
+bigbird_layout = [2, 2]    # 2 local layers, then 2 bigbird layers per cycle
 
 # Topology geometry for latent diffusion (R^n embedding + distance metrics)
 # Controls how AE codes are positioned in topology space for RnRoPE and SWA

@@ -1,0 +1,347 @@
+# SwiGLU FSQ Autoencoder - Weight-Shared MoE Variant
+# Single encoder/decoder shared across all residual levels
+# MoE routing learns level-specific behavior from input statistics (no level embeddings)
+# Changes from sparse_ae_swiglu.toml: ae_type, moe config, output_dir
+
+[model]
+dim = 512
+depth = 4
+num_heads = 8
+topo_dim = 3
+mlp_depth = 1
+vocab_size = 151936
+global_layer_interval = 4
+num_experts = 8
+num_active = 3
+rope_base = 500
+mlp_ratio = 4.0
+jitter_noise = 0.1
+window_size = 10.0
+
+[model.patch_embedder]
+input_channels = 3
+fourier_dim = 16
+context_size = 6
+stride = 4
+mlp_depth = 2
+
+# GQA configuration for main transformer
+[model.gqa]
+enabled = true
+n_kv_heads = 4         # 8 query heads / 2 kv heads = 4x sharing
+
+[training]
+ae_steps = 1000
+steps = 250
+lambda_coeff = 0.2
+mode = "naive"
+batch_size = 4
+compile = true
+compile_dynamic = true
+schedule_bounds = [5.0, -4.0]
+precision = "bf16"
+
+# FP8 weight quantization (requires PyTorch 2.1+, best on Hopper/Ada)
+# Set weights = "fp8" to enable fp8 storage with bf16 compute
+[training.precision_config]
+weights = "bf16"         # "bf16" for default - FP8 disabled for debugging
+activations = "bf16"      # activations always bf16 for now
+skip_patterns = ["embed", "head", "norm", "embedder", "unembedder"]  # keep these in bf16
+
+# CUDA Graph capture - mutually exclusive with torch.compile for main model
+# When enabled, main model forward is captured as a CUDA graph (faster replay)
+# torch.compile is automatically skipped for the main model (flex_attention mask conflict)
+# Sparse AE transformers are still compiled separately (they don't use GraphRunner)
+[training.graph_capture]
+enabled = false
+warmup_steps = 20
+capture_after_warmup = true
+use_dedicated_stream = true
+
+# Sparse AE Configuration - WEIGHT-SHARED MOE VARIANT
+# Single encoder/decoder with SigmoidMoE, shared across all residual levels
+# MoE router learns level-appropriate behavior from input statistics alone
+[training.sparse_ae]
+enabled = true
+latent_diffusion = true
+ae_type = "swiglu_moe"    # <<< Weight-shared MoE variant
+n_levels = 7
+patch_size = 16
+hidden_dim = 256
+code_dim = 128
+# Sparsity mode: per_level = same dims active for all patches (stable), per_patch = content-dependent (prone to collapse)
+sparsity_mode = "per_level"  # per_level is more stable than per_patch
+# Wavelet subspace routing: partitions code_dim into wavelet and amplitude subspaces
+# Sparsity pattern across subspaces encodes pathway selection (no sigmoid gating needed)
+wavelet_gating = true  # Enable subspace-routed encoder/decoder
+# n_wavelet_dims = 64  # Wavelet subspace size (default: code_dim // 2 = 64)
+# Entropy regularization to prevent subspace collapse (all codes routing to one subspace)
+# Higher weight = stronger push for balanced subspace usage
+routing_entropy_weight = 0.01  # Gentle regularization (0 = disabled)
+k_per_patch = 9        # Final k: top-6 dims active (~95% sparsity)
+# K-annealing: exponential decay from k_start to k_per_patch over k_anneal_steps
+# Curriculum: start with more active dims (easier task), progressively constrain
+k_start = 32           # Start with 32 active dims (easier reconstruction)
+k_anneal_steps = 250  # Anneal to k_per_patch=6 over 5000 steps
+residual_scale = 2.0
+fourier_dim = 16
+ae_loss_weight = 0.1   # Weight for AE loss in joint training (not used in standalone AE warmup)
+n_layers = 4
+# Loss function: cumulative_mse (reference impl), final_mse, or cumulative_mse_contrib
+loss_type = "final_mse"  # Reference uses final only, cumulative dilutes gradients by 1/n_levels
+
+# MoE configuration for weight-shared encoder/decoder
+# SigmoidMoE uses sigmoid routing (more stable than softmax) with top-k selection
+[training.sparse_ae.moe]
+num_experts = 16       # Total experts in each MoE layer
+num_active = 3         # Active experts per token (routes to top-3)
+jitter_noise = 0.1     # Router noise during training (load balancing)
+
+# Loss schedule: lerp from MSE to BCE over training for sharper reconstructions
+# MSE early: smooth gradients for coarse structure
+# BCE late: pushes for sharp, committed predictions (helps checkerboards, sprites)
+[training.sparse_ae.loss_schedule]
+enabled = true
+mse_start = 1.0    # 100% MSE at start
+bce_start = 0.0    # 0% BCE at start
+mse_end = 0.95      # 10% MSE at end
+bce_end = 0.05      # 90% BCE at end
+schedule = "linear"  # "linear", "cosine", or "step"
+pct_switch = 0.8   # For "step" schedule: switch at this fraction
+
+# Diffusion loss schedule: lerp from MSE to partial BCE for v-field prediction
+# Tests whether BCE gradients on sigmoid(v) find better v-fields than pure MSE
+# Mild intervention: mostly MSE, lerp to small BCE component
+[training.sparse_ae.diffusion_loss_schedule]
+enabled = true
+mse_start = 1.0    # 100% MSE at start
+bce_start = 0.0    # 0% BCE at start
+mse_end = 0.95      # 90% MSE at end
+bce_end = 0.05      # 10% BCE at end
+schedule = "linear"
+
+# Attention configuration - gemma_bigbird for local+global attention
+# Alternates sliding window layers with bigbird layers (local + global registers)
+# Reduces tiling artifacts from pure sliding window while keeping computation efficient
+[training.sparse_ae.attention]
+mode = "gemma_bigbird"  # Alternating local/bigbird per bigbird_layout cycle
+window_size = 2         # Chebyshev distance for local attention (3x3 neighborhood)
+n_global_tokens = 4     # Register tokens for bigbird layers (global memory)
+n_query_heads = 8
+n_kv_heads = 2
+global_layer_interval = 4  # For gemma mode (not used in gemma_bigbird)
+bigbird_layout = [2, 2]    # 2 local layers, then 2 bigbird layers per cycle
+
+# Topology geometry for latent diffusion (R^n embedding + distance metrics)
+# Controls how AE codes are positioned in topology space for RnRoPE and SWA
+# Set diffusion_space = "latent" to enable latent-space diffusion with main LDTformer
+[training.sparse_ae.topology]
+diffusion_space = "latent"        # "pixel" = patch embeddings, "latent" = AE codes
+include_level_dim = true        # Auto-enabled when diffusion_space = "latent"
+level_lambda = 0.5               # Cost of crossing levels: dist² += (lambda * level_dist)²
+level_scale = 1.0                # Scaling for level coords in RoPE frequencies
+vertical_attention_free = true   # Same-position cross-level attention always allowed
+distance_metric = "euclidean"    # "euclidean" or "product_geodesic"
+
+[training.online_variance_correction]
+enabled = true
+num_buckets = 20
+snr_min = -5.0
+snr_max = 5.0
+ema_decay = 0.99
+warmup_steps = 100
+
+[training.bucketing]
+enabled = true
+base_resolution = 64
+base_batch_size = 16
+caching_resolution = 128
+
+[[training.bucketing.image_buckets]]
+resolution = 64
+weight = 1.0
+
+[[training.bucketing.image_buckets]]
+resolution = 128
+weight = 1.0
+
+[[training.bucketing.image_buckets]]
+resolution = 256
+weight = 0.5
+
+# Heterogeneous optimizer: Muon for transformer, AdamW for embeddings/norms
+[training.optimizer]
+type = "adamw"  # "adamw" for single optimizer, "heterogeneous" for Muon+AdamW
+
+# Muon optimizer for transformer layers (momentum-orthogonalized updates)
+# Safe to use bf16 state because Muon has no v accumulator (unlike AdamW)
+[training.optimizer.muon]
+lr = 3e-4
+momentum = 0.95
+nesterov = true
+ns_steps = 5
+state_dtype = "bf16"  # bf16 for momentum buffer (no v term = numerically stable)
+
+# AdamW for embedding/unembedding and norm layers
+# Must use fp32 state - the v accumulator (EMA of squared grads) produces
+# extreme value ranges, and m/sqrt(v) is numerically unstable in lower precision
+[training.optimizer.adamw]
+lr = 3e-4
+weight_decay = 0.1
+max_lr = 3e-4
+betas = [0.9, 0.95]
+# state_dtype = fp32 (always, PyTorch enforces this)
+
+# Scheduler (applied to all optimizer groups)
+[training.optimizer.scheduler]
+type = "onecycle"
+pct_start = 0.1
+div_factor = 10.0
+final_div_factor = 25.0
+
+# Parameter targeting for heterogeneous optimizer
+# Controls which params go to Muon (transformer) vs AdamW (everything else)
+# Priority: embedding > norm > ae > fsq_adjacent > transformer (Muon)
+[training.optimizer.targeting]
+# Embedding layers -> AdamW
+embedding_patterns = ["embed", "head", "lm_head", "wte", "wpe", "embedder", "unembedder"]
+# Norm layers -> AdamW (no weight decay)
+norm_patterns = ["norm", "ln", "layernorm", "rmsnorm"]
+# AE components -> AdamW (heterogeneous gradients from FSQ/sparsity)
+# Note: "encoder" and "decoder" (singular) for weight-shared variant
+ae_patterns = ["sparse_ae", "encoder", "decoder", "level_logsnr"]
+# FSQ-adjacent -> AdamW (sigmoid STE attenuates gradients)
+fsq_patterns = ["code_proj", "code_unproj", "fsq", "sparsity", "dim_logits", "level_values", "attn_gate", "logsnr"]
+# MoE router -> AdamW (sigmoid routing has attenuated gradients like FSQ)
+moe_patterns = ["router", "experts"]
+# Everything else (denoiser.layers + AE transformers) -> Muon
+
+# AE standalone optimizer (simple AdamW, no Muon)
+# Used during AE warmup phase - FSQ gradients are too heterogeneous for Muon
+[training.ae_optimizer]
+lr = 3e-4
+weight_decay = 0.1
+max_lr = 3e-4
+pct_start = 0.1
+
+[sampling]
+num_samples = 8
+steps = 25
+target_logsnr = 10.0
+resolutions = [64, 128, 256]
+enable_sweep = false
+sweep_count = 4
+sweep_length = 4
+sweep_range = [5.0, 1.0]
+
+# Subspace sensitivity sweep: evaluates how much wavelet vs amplitude subspaces
+# contribute to reconstruction quality by stochastically ablating each
+[sampling.subspace_sensitivity]
+enabled = true
+ablation_rates = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+n_trials = 5      # Stochastic trials per rate (averaged)
+n_samples = 16    # Images to evaluate per resolution
+resolutions = [64, 128]  # Resolutions to test
+
+# Page table sized for actual workload:
+# base_cost = (64/4)² × 16 = 4096 tokens/batch
+# blocks_needed = 4096/128 = 32, minimal headroom to fit in 24GB
+[page_table]
+num_blocks = 36
+block_size = 128
+max_batch_size = 16
+max_logical_blocks = 32
+
+[logging]
+output_dir = "./experiments_swiglu_moe"  # <<< Changed for weight-shared MoE experiments
+log_interval = 1
+sample_after_training = true
+
+# Eval server integration - yeet weights at end of training
+[logging.eval_server]
+enabled = true
+url = "http://localhost:8421"
+health_check = true
+
+# Dataset mix - Fractal-heavy for AE warmup (same as sparse_ae_fractal)
+[dataset_mix.fractal_main]
+type = "fractal"
+ratio = 0.2
+noise_mode = "uniform"
+[dataset_mix.fractal_main.params]
+seed = 42
+fractal_types = ["mandelbrot", "julia", "burning_ship"]
+color_palette = "random"
+text_position = "none"
+resolution = 256
+max_iterations = 256
+[dataset_mix.fractal_main.noise_params]
+min_snr = -4.0
+max_snr = 5.0
+
+[dataset_mix.fractal_split]
+type = "fractal"
+ratio = 0.2
+noise_mode = "split"
+[dataset_mix.fractal_split.params]
+seed = 123
+fractal_types = ["julia", "tricorn"]
+color_palette = "fire"
+text_position = "none"
+resolution = 256
+max_iterations = 256
+[dataset_mix.fractal_split.noise_params]
+min_snr = -5.0
+max_snr = 5.0
+angle_range_deg = 45.0
+
+[dataset_mix.checker_baseline]
+type = "checkerboard"
+ratio = 0.2
+noise_mode = "split"
+[dataset_mix.checker_baseline.params]
+seed = 456
+resolution = 64
+text_position = "none"
+[dataset_mix.checker_baseline.noise_params]
+min_snr = -4.0
+max_snr = 5.0
+angle_range_deg = 30.0
+
+[dataset_mix.torus_baseline]
+type = "torus"
+ratio = 0.2
+noise_mode = "split"
+[dataset_mix.torus_baseline.params]
+seed = 789
+resolution = 64
+text_position = "none"
+[dataset_mix.torus_baseline.noise_params]
+min_snr = -4.0
+max_snr = 5.0
+angle_range_deg = 45.0
+
+# Sparse sprite atlas - pixel art with logit-biased sampling
+[dataset_mix.sprite_atlas]
+type = "sprite_atlas"
+ratio = 2.0
+noise_mode = "uniform"
+[dataset_mix.sprite_atlas.params]
+data_dir = "data/infinite_fusion"
+[dataset_mix.sprite_atlas.params.sampling_config]
+split = "all"
+mode = "uniform_sprites"
+adjustment_mode = "additive"
+temperature = 1.0
+seed = 42
+[dataset_mix.sprite_atlas.params.sampling_config.adjustments]
+"134" = 1.1              # Head ID 134 +0.1
+"*.134" = 1.1            # Body ID 134 +0.1
+"procedural:*" = -1.1    # Procedural sprites -0.1 (prefer custom/base)
+[dataset_mix.sprite_atlas.params.render_config]
+res_scaling = "do_not"
+background_mode = "solid_random"  # Uniform color per sample (not noise)
+jitter = true
+[dataset_mix.sprite_atlas.noise_params]
+min_snr = -4.0
+max_snr = 5.0

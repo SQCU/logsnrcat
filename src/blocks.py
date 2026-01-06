@@ -9,6 +9,10 @@ import torch.nn.functional as F
 from torch.nn.attention.flex_attention import flex_attention, BlockMask
 from typing import Optional, Dict, Any, Tuple
 
+# Triton for sparse MoE kernels - JIT compiles to PTX, works cross-platform
+import triton
+import triton.language as tl
+
 
 # === Initialization Helpers ===
 
@@ -61,83 +65,82 @@ class SwiGLU(nn.Module):
 
 class SigmoidMoE(nn.Module):
     """
-    Sigmoid-gated Mixture of Experts.
-    Uses sigmoid routing instead of softmax for more stable gradients.
+    Sigmoid-gated Mixture of Experts with sparse computation via grouped_gemm.
+
+    Uses permute/gmm/unpermute pattern: sort tokens by expert assignment, run each
+    expert on its contiguous slice via grouped GEMM, scatter results back.
+    This is O(k*N) compute for k active experts, not O(E*N).
     """
     def __init__(self, dim, hidden_dim, num_experts=8, num_active=2, jitter_noise=0.1):
         super().__init__()
         self.num_experts = num_experts
         self.num_active = num_active
         self.jitter_noise = jitter_noise
+        self.hidden_dim = hidden_dim
+        self.dim = dim
+
         self.router = nn.Linear(dim, num_experts)
-        nn.init.zeros_(self.router.weight)
-        nn.init.zeros_(self.router.bias)
-        self.experts = nn.ModuleList([SwiGLU(dim, hidden_dim) for _ in range(num_experts)])
+
+        # Stacked expert weights for grouped GEMM
+        # w1: [E, 2*H, D] for gate+up projection
+        # w2: [E, D, H] for down projection
+        self.w1 = nn.Parameter(torch.empty(num_experts, 2 * hidden_dim, dim))
+        self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
+
         self.param_init()
 
     def param_init(self):
         nn.init.zeros_(self.router.weight)
         nn.init.zeros_(self.router.bias)
-        for expert in self.experts:
-            expert.param_init()
+        for e in range(self.num_experts):
+            nn.init.xavier_uniform_(self.w1.data[e])
+            nn.init.xavier_uniform_(self.w2.data[e])
 
     def forward(self, x):
-        # 1. Routing
         B, L, D = x.shape
-        router_logits = self.router(x)
+        N = B * L
+        K = self.num_active
+        E = self.num_experts
+
+        # 1. Routing
+        router_logits = self.router(x)  # [B, L, E]
         if self.training and self.jitter_noise > 0:
             router_logits = router_logits + torch.randn_like(router_logits) * self.jitter_noise
 
-        scores = torch.sigmoid(router_logits)
-        top_k_scores, top_k_indices = torch.topk(scores, self.num_active, dim=-1)
+        scores = torch.sigmoid(router_logits)  # [B, L, E]
+        top_k_scores, top_k_indices = torch.topk(scores, K, dim=-1)  # [B, L, K]
 
         # Normalize weights
-        # Prevent float promotion by casting result back to input dtype
         denom = top_k_scores.sum(dim=-1, keepdim=True) + 1e-6
-        router_weights = top_k_scores / denom
-        router_weights = router_weights.to(x.dtype)
+        router_weights = (top_k_scores / denom).to(x.dtype)  # [B, L, K]
 
-        # 2. Flatten for efficient indexing
-        # Shape: [N, D] where N = B*L
-        x_flat = x.view(-1, D)
-        out_flat = torch.zeros_like(x_flat)
+        # 2. Flatten for grouped_gemm ops
+        x_flat = x.view(N, D).contiguous()
+        indices_flat = top_k_indices.view(N, K).to(torch.int32).contiguous()
+        weights_flat = router_weights.view(N, K).contiguous()
 
-        # Shape: [N, K]
-        indices_flat = top_k_indices.view(-1, self.num_active)
-        weights_flat = router_weights.view(-1, self.num_active)
+        # 3. Permute: sort tokens by expert assignment
+        # permuted_x: [N*K, D] - each token appears K times, grouped by expert
+        permuted_x, row_id_map = grouped_gemm.ops.permute(x_flat, indices_flat)
 
-        # 3. Process Experts (Static Loop for compilation)
-        for e in range(self.num_experts):
-            # A. Identify tokens for this expert
-            # mask: [N, K] bool
-            match_mask = (indices_flat == e)
+        # 4. Compute batch_sizes: tokens per expert
+        expert_counts = torch.zeros(E, dtype=torch.int64, device=x.device)
+        expert_counts.scatter_add_(0, indices_flat.view(-1).long(),
+                                   torch.ones(N * K, dtype=torch.int64, device=x.device))
 
-            # token_mask: [N] bool (True if token picked expert 'e' in ANY slot)
-            token_mask = match_mask.any(dim=-1)
+        # 5. Expert FFN via grouped GEMM
+        # x @ w1.T -> [N*K, 2*H]
+        h = grouped_gemm.ops.gmm(permuted_x, self.w1, expert_counts, trans_b=True)
 
-            # B. Get Indices (Dynamic Shape, but graph-safe)
-            active_indices = torch.nonzero(token_mask).flatten()
+        # SwiGLU activation
+        h1, h2 = h.chunk(2, dim=-1)
+        h = F.silu(h1) * h2  # [N*K, H]
 
-            # C. Gather Weights & Input
-            # Use .to(x.dtype) instead of .float()
-            mask_cast = match_mask.to(x.dtype)
+        # h @ w2.T -> [N*K, D]
+        expert_out = grouped_gemm.ops.gmm(h, self.w2, expert_counts, trans_b=True)
 
-            # Aggregate weight for expert 'e' per token
-            # [N] -> [Num_Selected]
-            active_weights = (weights_flat * mask_cast).sum(dim=-1)[active_indices]
-
-            # Gather inputs: [Num_Selected, D]
-            active_x = x_flat[active_indices].to(x.dtype)
-
-            # D. Compute Expert
-            expert_out = self.experts[e](active_x)
-
-            # E. Scale & Scatter Add
-            # ensure active_weights is [Num_Selected, 1] for broadcasting
-            weighted_out = expert_out * active_weights.unsqueeze(-1).to(x.dtype)
-
-            # weighted_out is now strictly x.dtype (e.g. bf16)
-            out_flat.index_add_(0, active_indices, weighted_out)
+        # 6. Unpermute: scatter back with weights
+        out_flat = grouped_gemm.ops.unpermute(expert_out, row_id_map, weights_flat)
 
         aux_loss = 1e-2 * (router_logits ** 2).mean()
         return out_flat.view(B, L, D), aux_loss

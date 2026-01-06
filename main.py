@@ -89,10 +89,22 @@ def build_components(cfg, device):
     if cfg['training']['compile']:
         # Sparse AE transformers: always safe to compile (masks created inline during forward)
         if model.uses_sparse_ae:
-            for enc in model.sparse_ae.encoders:
-                enc.transformer = torch.compile(enc.transformer)
-            for dec in model.sparse_ae.decoders:
-                dec.transformer = torch.compile(dec.transformer)
+            # Handle both level-specific (plural .encoders/.decoders) and
+            # weight-shared MoE (singular .encoder/.decoder) variants
+            if hasattr(model.sparse_ae, 'encoders'):
+                # Level-specific variant (SwiGLUFSQAutoencoder, SparsePerDimFSQAutoencoder)
+                for enc in model.sparse_ae.encoders:
+                    enc.transformer = torch.compile(enc.transformer, dynamic=True)
+                for dec in model.sparse_ae.decoders:
+                    dec.transformer = torch.compile(dec.transformer, dynamic=True)
+            elif hasattr(model.sparse_ae, 'encoder'):
+                # Weight-shared MoE variant (SwiGLUMoEAutoencoder)
+                model.sparse_ae.encoder.transformer = torch.compile(
+                    model.sparse_ae.encoder.transformer, dynamic=True
+                )
+                model.sparse_ae.decoder.transformer = torch.compile(
+                    model.sparse_ae.decoder.transformer, dynamic=True
+                )
 
         # Main model: only compile if NOT using GraphRunner (which pre-creates masks)
         if not graph_capture_enabled:

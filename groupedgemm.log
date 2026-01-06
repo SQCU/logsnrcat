@@ -1,0 +1,55 @@
+(logsnrcat) PS F:\dox\repos\ai\logsnrcat> python uv_builder.py
+Using uv: C:\Users\neet\AppData\Local\Programs\Python\Python310\Scripts\uv.EXE
+============================================================
+STAGE 1: uv sync (main dependencies)
+============================================================
+
+>>> C:\Users\neet\AppData\Local\Programs\Python\Python310\Scripts\uv.EXE sync
+
+Resolved 127 packages in 1ms
+Audited 94 packages in 0.04ms
+============================================================
+STAGE 1.5: Patch PyTorch headers for MSVC bugs
+============================================================
+  Found PyTorch include: F:\dox\repos\ai\logsnrcat\.venv\Lib\site-packages\torch\include
+  No patches needed (already patched or headers not present)
+  Set CXXFLAGS, CL, NVCC_APPEND_FLAGS for CUTLASS C++17 + conformance fix
+============================================================
+STAGE 2: Post-sync CUDA package builds
+============================================================
+Using MSVC build environment:
+  CXXFLAGS= /std:c++17 /Zc:__cplusplus /DUSE_CUDA /std:c++17 /Zc:__cplu...
+  CL= /std:c++17 /Zc:__cplusplus /DUSE_CUDA /std:c++17 /Zc:__cplu...
+  NVCC_APPEND_FLAGS= -Xcompiler "/std:c++17" -Xcompiler "/Zc:__cplusplus" -Xcomp...
+  DISTUTILS_USE_SDK=1
+  PATH=C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64;...
+
+--- Installing grouped_gemm (Windows patched build) ---
+
+>>> C:\Users\neet\AppData\Local\Programs\Python\Python310\Scripts\uv.EXE pip install F:\dox\repos\ai\logsnrcat\_grouped_gemm_build --no-build-isolation --no-deps   
+
+Resolved 1 package in 2.09s
+      Built nv-grouped-gemm @ file:///F:/dox/repos/ai/logsnrcat/_grouped_gemm_build
+Prepared 1 package in 49.77s
+░░░░░░░░░░░░░░░░░░░░ [0/1] Installing wheels...
+warning: Failed to hardlink files; falling back to full copy. This may lead to degraded performance.
+         If the cache and target directories are on different filesystems, hardlinking may not be supported.
+         If this is intentional, set `export UV_LINK_MODE=copy` or use `--link-mode=copy` to suppress this warning.
+Installed 1 package in 14ms
+ + nv-grouped-gemm==1.1.4.post8 (from file:///F:/dox/repos/ai/logsnrcat/_grouped_gemm_build)
+
+============================================================
+VERIFICATION
+============================================================
+
+>>> F:\dox\repos\ai\logsnrcat\.venv\Scripts\python.exe -c import torch; print(f'torch {torch.__version__}, CUDA: {torch.cuda.is_available()}')
+
+  [OK] torch: torch 2.9.1+cu128, CUDA: True
+
+>>> F:\dox\repos\ai\logsnrcat\.venv\Scripts\python.exe -c import grouped_gemm; print('grouped_gemm OK')
+
+  [OK] grouped_gemm: grouped_gemm OK
+
+============================================================
+DONE
+============================================================

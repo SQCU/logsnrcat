@@ -335,10 +335,19 @@ class DiffusionLossScheduleConfig(BaseModel):
     pct_switch: float = 0.8  # For "step" schedule
 
 
+class SparseAEMoEConfig(BaseModel):
+    """MoE configuration for weight-shared swiglu_moe variant."""
+    num_experts: int = 16  # Total experts in each MoE layer
+    num_active: int = 3    # Active experts per token (routes to top-k)
+    jitter_noise: float = 0.1  # Router noise during training (load balancing)
+
+
 class SparseAEConfig(BaseModel):
     """Configuration for kmaze_ae sparse hierarchical autoencoder."""
     enabled: bool = False
-    ae_type: Literal["sparse_dim", "swiglu"] = "sparse_dim"  # sparse_dim=3-bit, swiglu=binary+2D RoPE
+    ae_type: Literal["sparse_dim", "swiglu", "swiglu_moe"] = "sparse_dim"  # sparse_dim=3-bit, swiglu=binary+2D RoPE, swiglu_moe=weight-shared MoE
+    # MoE configuration (only used when ae_type='swiglu_moe')
+    moe: SparseAEMoEConfig = Field(default_factory=SparseAEMoEConfig)
     n_levels: int = 6
     patch_size: int = 16
     hidden_dim: int = 256

@@ -42,7 +42,6 @@ dependencies = [
     'xxhash',
     "av", #ffmpeg bindings?
     "torchcodec", #better ffmpeg bindings
-
     #pytorch3d is fictional
     #crimes against nature
     "pyzmq",
@@ -58,6 +57,9 @@ cuda = [
     "triton; sys_platform == 'linux'",
     "triton-windows<3.4; sys_platform == 'win32'",
 ]
+# Packages that need CUDA torch at build time - install manually AFTER uv sync:
+#   uv pip install git+https://github.com/fanshiqing/grouped_gemm@main --no-build-isolation
+# (grouped_gemm: sparse MoE kernels SM70-90, NOT the broken PyPI version)
 
 [tool.uv.sources]
 torch = [

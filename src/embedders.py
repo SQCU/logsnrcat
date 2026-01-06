@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from torch.nn.attention.flex_attention import BlockMask
 
 from .blocks import MLPResBlock, EncoderBlock, init_linear, init_layer_norm
@@ -186,7 +186,7 @@ class ContextualPatchEmbedder(nn.Module):
         self,
         x: torch.Tensor,
         logsnr_map: torch.Tensor,
-        block_mask: Optional[BlockMask] = None
+        block_masks: Optional[List[BlockMask]] = None
     ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
         Embed an image with per-patch logsnr conditioning.
@@ -194,7 +194,9 @@ class ContextualPatchEmbedder(nn.Module):
         Args:
             x: [C, H, W] or [B, C, H, W] image tensor
             logsnr_map: [1, H, W] or [B, 1, H, W] spatial logsnr field
-            block_mask: Optional BlockMask for attention (required if n_attn_layers > 0)
+            block_masks: Optional list of BlockMasks, one per attention layer.
+                         Required if n_attn_layers > 0. For alternating patterns
+                         like gemma_bigbird, each layer gets its appropriate mask.
 
         Returns:
             z: [L, D] or [B, L, D] patch embeddings where L = GH * GW
@@ -232,8 +234,9 @@ class ContextualPatchEmbedder(nn.Module):
                 # Add batch dim for attention: [L, D] -> [1, L, D]
                 z = z.unsqueeze(0)
 
-            for layer in self.attn_layers:
-                z = layer(z, block_mask=block_mask)
+            for i, layer in enumerate(self.attn_layers):
+                mask = block_masks[i] if block_masks else None
+                z = layer(z, block_mask=mask)
 
             if not is_batched:
                 # Remove batch dim: [1, L, D] -> [L, D]
@@ -311,7 +314,7 @@ class ContextualPatchUnembedder(nn.Module):
         self,
         z: torch.Tensor,
         shape: Tuple[int, int],
-        block_mask: Optional[BlockMask] = None
+        block_masks: Optional[List[BlockMask]] = None
     ) -> torch.Tensor:
         """
         Convert embeddings back to pixel space.
@@ -319,7 +322,9 @@ class ContextualPatchUnembedder(nn.Module):
         Args:
             z: [L, D] or [B, L, D] patch embeddings
             shape: (GH, GW) grid dimensions
-            block_mask: Optional BlockMask for attention (required if n_attn_layers > 0)
+            block_masks: Optional list of BlockMasks, one per attention layer.
+                         Required if n_attn_layers > 0. For alternating patterns
+                         like gemma_bigbird, each layer gets its appropriate mask.
 
         Returns:
             [C+1, H, W] or [B, C+1, H, W] reconstructed image with logsnr channel appended
@@ -339,8 +344,9 @@ class ContextualPatchUnembedder(nn.Module):
             if not is_batched:
                 z = z.unsqueeze(0)
 
-            for layer in self.attn_layers:
-                z = layer(z, block_mask=block_mask)
+            for i, layer in enumerate(self.attn_layers):
+                mask = block_masks[i] if block_masks else None
+                z = layer(z, block_mask=mask)
 
             if not is_batched:
                 z = z.squeeze(0)

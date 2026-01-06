@@ -107,37 +107,42 @@ class SpanEmbedder:
         """
         Args:
             text_embedder: nn.Embedding or similar, maps token IDs to embeddings
-            patch_embedder: Module with forward(x, logsnr, block_mask) -> (z, grid_shape)
+            patch_embedder: Module with forward(x, logsnr, block_masks) -> (z, grid_shape)
+                where block_masks is Optional[List[BlockMask]], one per attention layer
             attn_config: Optional attention config for encoder masks:
-                - 'mode': 'full', 'local', 'bigbird', etc.
+                - 'mode': 'full', 'local', 'bigbird', 'gemma_bigbird', etc.
                 - 'window_size': Spatial window for local attention
                 - 'n_global_tokens': Number of register tokens
+                - 'bigbird_layout': [n, m] for alternating local/bigbird layers
         """
         self.text_emb = text_embedder
         self.patch_emb = patch_embedder
         self.attn_config = attn_config or {'mode': 'full'}
-        self._mask_cache: Dict[Tuple[int, int], Optional[BlockMask]] = {}
+        self._mask_cache: Dict[Tuple[int, int], List[Optional[BlockMask]]] = {}
 
     def _get_cached_mask(
         self,
         grid_shape: Tuple[int, int],
         device: torch.device
-    ) -> Optional[BlockMask]:
-        """Get or build cached mask for a given grid shape."""
+    ) -> List[Optional[BlockMask]]:
+        """Get or build cached masks for a given grid shape.
+
+        Returns a list of masks, one per attention layer in the patch embedder.
+        For alternating modes (gemma, gemma_bigbird), each layer gets its
+        appropriate mask in the alternation pattern.
+        """
         if grid_shape not in self._mask_cache:
-            # Build mask using the encoder mask infrastructure
-            # Provide defaults for optional keys (full mode doesn't use window_size/n_registers)
-            mode = self.attn_config.get('mode', 'full')
-            # Map config mode names to build_encoder_mask mode names
-            if mode == 'sliding':
-                mode = 'local'
-            self._mask_cache[grid_shape] = build_encoder_mask(
-                grid_shape=grid_shape,
-                window_size=self.attn_config.get('window_size', 4.0),
-                n_registers=self.attn_config.get('n_global_tokens', 0),
-                mode=mode,
-                device=device
-            )
+            n_layers = getattr(self.patch_emb, 'n_attn_layers', 0)
+            if n_layers == 0:
+                # No attention layers, return empty list
+                self._mask_cache[grid_shape] = []
+            else:
+                # Build per-layer masks using the layer-aware function
+                masks = [
+                    get_encoder_mask_for_layer(grid_shape, layer_idx, self.attn_config, device)
+                    for layer_idx in range(n_layers)
+                ]
+                self._mask_cache[grid_shape] = masks
         return self._mask_cache[grid_shape]
 
     def clear_mask_cache(self):
@@ -261,8 +266,8 @@ class SpanEmbedder:
                 orig_idx, block = group[0]
                 img = block.content
                 original_shape = img.shape[-2:]
-                mask = self._get_cached_mask(grid_shape, img.device)
-                emb, actual_grid = self.patch_emb(img, block.logsnr, block_mask=mask)
+                masks = self._get_cached_mask(grid_shape, img.device)
+                emb, actual_grid = self.patch_emb(img, block.logsnr, block_masks=masks)
                 results[orig_idx] = (emb, actual_grid, original_shape, {'type': 'latent', 'shape': actual_grid, 'id': block.id})
             else:
                 # Batch multiple images with same grid_shape
@@ -270,8 +275,8 @@ class SpanEmbedder:
                 imgs = torch.stack([block.content for _, block in group], dim=0)  # [B, C, H, W]
                 logsnrs = torch.stack([block.logsnr for _, block in group], dim=0)  # [B, 1, H, W]
 
-                mask = self._get_cached_mask(grid_shape, imgs.device)
-                embs_batched, actual_grid = self.patch_emb(imgs, logsnrs, block_mask=mask)  # [B, L, D]
+                masks = self._get_cached_mask(grid_shape, imgs.device)
+                embs_batched, actual_grid = self.patch_emb(imgs, logsnrs, block_masks=masks)  # [B, L, D]
 
                 # Scatter results back
                 for batch_idx, (orig_idx, block) in enumerate(group):
@@ -325,33 +330,38 @@ class SpanUnembedder:
         """
         Args:
             text_head: Linear layer mapping embeddings to vocab logits
-            patch_unembedder: Module with forward(z, shape, block_mask) -> [C+1, H, W]
-            attn_config: Optional attention config for encoder masks
+            patch_unembedder: Module with forward(z, shape, block_masks) -> [C+1, H, W]
+                where block_masks is Optional[List[BlockMask]], one per attention layer
+            attn_config: Optional attention config for decoder masks
         """
         self.text_head = text_head
         self.patch_unembed = patch_unembedder
         self.attn_config = attn_config or {'mode': 'full'}
-        self._mask_cache: Dict[Tuple[int, int], Optional[BlockMask]] = {}
+        self._mask_cache: Dict[Tuple[int, int], List[Optional[BlockMask]]] = {}
 
     def _get_cached_mask(
         self,
         grid_shape: Tuple[int, int],
         device: torch.device
-    ) -> Optional[BlockMask]:
-        """Get or build cached mask for a given grid shape."""
+    ) -> List[Optional[BlockMask]]:
+        """Get or build cached masks for a given grid shape.
+
+        Returns a list of masks, one per attention layer in the patch unembedder.
+        For alternating modes (gemma, gemma_bigbird), each layer gets its
+        appropriate mask in the alternation pattern.
+        """
         if grid_shape not in self._mask_cache:
-            # Provide defaults for optional keys (full mode doesn't use window_size/n_registers)
-            mode = self.attn_config.get('mode', 'full')
-            # Map config mode names to build_encoder_mask mode names
-            if mode == 'sliding':
-                mode = 'local'
-            self._mask_cache[grid_shape] = build_encoder_mask(
-                grid_shape=grid_shape,
-                window_size=self.attn_config.get('window_size', 4.0),
-                n_registers=self.attn_config.get('n_global_tokens', 0),
-                mode=mode,
-                device=device
-            )
+            n_layers = getattr(self.patch_unembed, 'n_attn_layers', 0)
+            if n_layers == 0:
+                # No attention layers, return empty list
+                self._mask_cache[grid_shape] = []
+            else:
+                # Build per-layer masks using the layer-aware function
+                masks = [
+                    get_encoder_mask_for_layer(grid_shape, layer_idx, self.attn_config, device)
+                    for layer_idx in range(n_layers)
+                ]
+                self._mask_cache[grid_shape] = masks
         return self._mask_cache[grid_shape]
 
     def clear_mask_cache(self):
@@ -438,9 +448,9 @@ class SpanUnembedder:
                 # Single span, no batching
                 span_idx, span = group[0]
                 z_span = z[span.start_idx:span.end_idx]
-                mask = self._get_cached_mask(grid_shape, device)
+                masks = self._get_cached_mask(grid_shape, device)
                 # Pass full span.shape (may be 2D or 3D) to unembedder
-                reconstruction = self.patch_unembed(z_span, span.shape, block_mask=mask)
+                reconstruction = self.patch_unembed(z_span, span.shape, block_masks=masks)
 
                 if span.original_shape is not None:
                     orig_h, orig_w = span.original_shape
@@ -456,10 +466,10 @@ class SpanUnembedder:
                     span_embeddings.append(z_span)
 
                 z_batch = torch.stack(span_embeddings, dim=0)  # [B, L, D]
-                mask = self._get_cached_mask(grid_shape, device)
+                masks = self._get_cached_mask(grid_shape, device)
                 # Use first span's shape (all have same grid but include n_levels if 3D)
                 batch_shape = group[0][1].shape
-                reconstructions = self.patch_unembed(z_batch, batch_shape, block_mask=mask)  # [B, C+1, H, W]
+                reconstructions = self.patch_unembed(z_batch, batch_shape, block_masks=masks)  # [B, C+1, H, W]
 
                 # Scatter results back
                 for batch_idx, (span_idx, span) in enumerate(group):

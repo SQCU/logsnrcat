@@ -771,6 +771,9 @@ class SubspaceSparsity(nn.Module):
         # Learned logits for dimension selection
         self.dim_logits = nn.Parameter(torch.randn(code_dim))
 
+        # Pre-allocated mask buffer (avoids allocation every forward)
+        self.register_buffer('_mask_buffer', torch.zeros(code_dim), persistent=False)
+
     def forward(
         self,
         codes: torch.Tensor,
@@ -946,7 +949,7 @@ class SwiGLUFSQAutoencoder(nn.Module):
         self.register_buffer("residual_scale", torch.tensor(residual_scale))
         self.register_buffer("one", torch.tensor(1.0))
 
-        # Default attention config
+        # Default attention config - fallback only, prefer TOML config
         if attn_config is None:
             attn_config = {
                 'mode': 'sliding',
@@ -1693,7 +1696,7 @@ class SwiGLUPatchEmbedder(nn.Module):
         self,
         x: torch.Tensor,
         logsnr_map: torch.Tensor = None,
-        block_mask = None
+        block_masks = None
     ) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
         """
         Encode images to latent embeddings for diffusion.
@@ -1701,7 +1704,7 @@ class SwiGLUPatchEmbedder(nn.Module):
         Args:
             x: [C, H, W] or [B, C, H, W] images
             logsnr_map: [1, H, W] or [B, 1, H, W] logsnr field for conditioning
-            block_mask: IGNORED (we use our own cached masks)
+            block_masks: IGNORED (we use our own cached masks)
 
         Returns:
             z: [N*L, D] or [B, N*L, D] embeddings (N patches × L levels)
@@ -1787,7 +1790,7 @@ class SwiGLUPatchUnembedder(nn.Module):
         self,
         z: torch.Tensor,
         shape: Tuple,
-        block_mask = None
+        block_masks = None
     ) -> torch.Tensor:
         """
         Decode latent embeddings to images.
@@ -1795,7 +1798,7 @@ class SwiGLUPatchUnembedder(nn.Module):
         Args:
             z: [N*L, D] or [B, N*L, D] embeddings (N patches × L levels)
             shape: (GH, GW, n_levels) - 3D shape from embedder
-            block_mask: IGNORED
+            block_masks: IGNORED
 
         Returns:
             recon: [C+1, H, W] or [B, C+1, H, W] - RGB + logsnr channel

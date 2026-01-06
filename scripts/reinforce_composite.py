@@ -77,9 +77,8 @@ class LogTee:
     def close(self):
         self.logfile.close()
 
-import tempfile
 import os
-log_path = os.path.join(tempfile.gettempdir(), "reinforce_{args.run_id}.log")
+log_path = "{args.output_dir}/reinforce_{args.run_id}.log"
 _log_tee = LogTee(log_path)
 sys.stdout = _log_tee
 
